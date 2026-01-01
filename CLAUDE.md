@@ -45,6 +45,94 @@ The project is organized into two main modules:
 - Actions: `Open`, `Close`, `Stop`, `ToggleOpen`
 - State endpoint returns `{"open": 1}` or `{"open": 0}`
 
+## Weather Automation
+
+**Automation Script (`awning_automation.py`):**
+- Automatically opens/closes awning based on comprehensive weather and sun conditions
+- Designed to run as a cron job or Kubernetes scheduled job
+- Uses Open-Meteo API (free, no API key required) for weather data
+- Uses pvlib for solar position calculations
+- Imports `awning_controller` for awning control
+
+**Enhanced Decision Logic (ALL 5 conditions must be met):**
+1. **Sunny**: Cloud cover < threshold (configurable, default 30%)
+2. **Calm**: Wind speed < threshold (configurable, default 10 mph)
+3. **No rain**: Precipitation = 0 mm/h (hardcoded)
+4. **Daytime**: Current time between sunrise and sunset (from weather API)
+5. **Sun facing SE**: Sun azimuth 90°-180° (East to South, hardcoded for SE window)
+
+- **Opens awning if**: ALL 5 conditions are True
+- **Closes awning if**: ANY condition is False
+- Checks current awning state before acting (only sends command if state needs to change)
+- Fail-safe: Closes awning if weather API is unavailable
+
+**Configuration (add to .env):**
+- `LATITUDE` - Latitude for weather location (required, e.g., 37.7749)
+- `LONGITUDE` - Longitude for weather location (required, e.g., -122.4194)
+- `CLOUD_COVER_THRESHOLD` - Cloud cover threshold percentage (required, e.g., 30)
+- `WIND_SPEED_THRESHOLD_MPH` - Wind speed threshold in mph (required, e.g., 10)
+
+**Running automation:**
+```bash
+# Via Nix (recommended)
+nix run .#automation
+
+# Dry-run mode (test without controlling awning)
+nix run .#automation -- --dry-run
+
+# Development shell
+nix develop
+python3 awning_automation.py
+python3 awning_automation.py --dry-run
+```
+
+**Example cron job:**
+```bash
+# Run every 15 minutes (automation handles daytime checking internally)
+*/15 * * * * cd /path/to/awning && nix run .#automation >> /var/log/awning-automation.log 2>&1
+
+# Note: No need to restrict cron to daylight hours - the automation
+# checks sunrise/sunset internally and will only act during daytime
+```
+
+**Weather API:**
+- Uses Open-Meteo Forecast API: `https://api.open-meteo.com/v1/forecast`
+- Fetches current: cloud cover (%), wind speed (mph), precipitation (mm/h), is_day indicator
+- Fetches daily: sunrise and sunset times
+- 10-second timeout on requests
+- No API key required for non-commercial use
+
+**Solar Position:**
+- Uses pvlib library with NREL SPA algorithm
+- Calculates sun azimuth and altitude for current location and time
+- Azimuth convention: 0°=North, 90°=East, 180°=South, 270°=West
+- Southeast window requires azimuth 90°-180°
+
+**Error Handling:**
+- Weather API failures: Closes awning as fail-safe
+- Awning API failures: Logs error and exits
+- Missing environment variables: Clear error messages
+- All actions logged to stdout (redirect to file in cron)
+
+**Logging:**
+- INFO level logs to stdout
+- Format: `YYYY-MM-DD HH:MM:SS - LEVEL - Message`
+- Logs all conditions with ✓/✗ symbols
+- Shows: weather, sun position, sunrise/sunset, decision rationale, current state, and actions taken
+- Example output:
+  ```
+  2026-01-01 14:30:00 - INFO - Location: 35.7780, -78.8380
+  2026-01-01 14:30:00 - INFO - Thresholds: Cloud < 30%, Wind < 10 mph, Rain = 0 mm/h, Daytime only, Sun facing SE (90°-180°)
+  2026-01-01 14:30:01 - INFO - Weather: 25% clouds, 8.5 mph wind, 0.0 mm/h rain
+  2026-01-01 14:30:01 - INFO - Sun position: Azimuth 145.2°, Altitude 35.4°
+  2026-01-01 14:30:01 - INFO - Daytime window: Sunrise 07:15, Sunset 17:45
+  2026-01-01 14:30:02 - INFO - Conditions: ✓ Sunny, ✓ Calm, ✓ No rain, ✓ Daytime, ✓ Sun facing SE
+  2026-01-01 14:30:02 - INFO - Decision: All conditions met
+  2026-01-01 14:30:03 - INFO - Current awning state: CLOSED
+  2026-01-01 14:30:04 - INFO - Opening awning...
+  2026-01-01 14:30:05 - INFO - Automation complete
+  ```
+
 ## Development
 
 **Running commands:**
@@ -65,14 +153,23 @@ nix build
 **Available commands:** `open`, `close`, `stop`, `toggle`, `status`, `info`
 
 **Dependencies:**
-- Python 3 with: `requests`, `python-dotenv`, `rich`
+- Python 3 with: `requests`, `python-dotenv`, `rich`, `pvlib`, `pandas`, `pytz`
 - Managed via Nix flake (see `flake.nix`)
+- `pvlib` and `pandas` are used for solar position calculations in automation
 
 **Environment setup (.env file):**
+
+*For basic awning control:*
 - `BOND_TOKEN` - Bond Bridge auth token (required) - get from Bond Home app → Settings
 - `BOND_ID` - Bond ID (e.g., ZZIF27980) for mDNS auto-discovery (recommended)
 - `BOND_HOST` - Bond hostname/IP (alternative to BOND_ID, less resilient to DHCP changes)
 - `DEVICE_ID` - Device ID for the awning (required)
+
+*For weather automation (in addition to above):*
+- `LATITUDE` - Latitude for weather location (required, e.g., 37.7749)
+- `LONGITUDE` - Longitude for weather location (required, e.g., -122.4194)
+- `CLOUD_COVER_THRESHOLD` - Cloud cover threshold percentage (required, e.g., 30)
+- `WIND_SPEED_THRESHOLD_MPH` - Wind speed threshold in mph (required, e.g., 10)
 
 **Using the controller independently (without CLI):**
 ```python

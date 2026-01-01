@@ -15,6 +15,9 @@
           requests
           python-dotenv
           rich
+          pvlib
+          pandas
+          pytz
         ]);
 
         awning = pkgs.writeScriptBin "awning" ''
@@ -22,11 +25,18 @@
           export PYTHONPATH="${./.}:$PYTHONPATH"
           exec ${pythonEnv}/bin/python3 ${./awning.py} "$@"
         '';
+
+        awning-automation = pkgs.writeScriptBin "awning-automation" ''
+          #!${pkgs.bash}/bin/bash
+          export PYTHONPATH="${./.}:$PYTHONPATH"
+          exec ${pythonEnv}/bin/python3 ${./awning_automation.py} "$@"
+        '';
       in
       {
         packages = {
           default = awning;
           awning = awning;
+          automation = awning-automation;
         };
 
         devShells.default = pkgs.mkShell {
@@ -43,9 +53,15 @@
           '';
         };
 
-        apps.default = {
-          type = "app";
-          program = "${awning}/bin/awning";
+        apps = {
+          default = {
+            type = "app";
+            program = "${awning}/bin/awning";
+          };
+          automation = {
+            type = "app";
+            program = "${awning-automation}/bin/awning-automation";
+          };
         };
       }
     );
