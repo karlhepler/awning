@@ -1,0 +1,12 @@
+# Environment variables (contains sensitive token)
+.env
+
+# macOS
+.DS_Store
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
