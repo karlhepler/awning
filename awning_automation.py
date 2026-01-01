@@ -43,9 +43,12 @@ class WeatherAPIError(Exception):
     pass
 
 
-def load_location_config() -> tuple[float, float]:
+def load_location_config(env_file: Optional[Path] = None) -> tuple[float, float]:
     """
     Load location configuration from environment variables.
+
+    Args:
+        env_file: Optional path to .env file
 
     Returns:
         Tuple of (latitude, longitude)
@@ -53,14 +56,20 @@ def load_location_config() -> tuple[float, float]:
     Raises:
         ConfigurationError: If location variables are missing or invalid
     """
-    # Load .env file (same logic as awning_controller)
-    cwd_env_file = Path.cwd() / ".env"
-    script_env_file = Path(__file__).parent / ".env"
+    # Load .env file
+    if env_file:
+        if not env_file.exists():
+            raise ConfigurationError(f".env file not found: {env_file}")
+        load_dotenv(env_file)
+    else:
+        # Search for .env in current working directory first, then script directory
+        cwd_env_file = Path.cwd() / ".env"
+        script_env_file = Path(__file__).parent / ".env"
 
-    if cwd_env_file.exists():
-        load_dotenv(cwd_env_file)
-    elif script_env_file.exists():
-        load_dotenv(script_env_file)
+        if cwd_env_file.exists():
+            load_dotenv(cwd_env_file)
+        elif script_env_file.exists():
+            load_dotenv(script_env_file)
 
     # Get latitude
     lat_str = os.getenv("LATITUDE", "").strip()
@@ -372,15 +381,28 @@ def should_open_awning(
 
 def main() -> None:
     """Main entry point for awning automation."""
-    # Check for dry-run flag
+    # Parse command-line arguments
     dry_run = "--dry-run" in sys.argv
+    env_file = None
+
+    # Look for --env-file argument
+    for i, arg in enumerate(sys.argv):
+        if arg == "--env-file" and i + 1 < len(sys.argv):
+            env_file = Path(sys.argv[i + 1])
+            break
+        elif arg.startswith("--env-file="):
+            env_file = Path(arg.split("=", 1)[1])
+            break
 
     if dry_run:
         logger.info("Running in DRY-RUN mode (no awning control)")
 
+    if env_file:
+        logger.info(f"Using .env file: {env_file}")
+
     try:
         # Load location configuration
-        latitude, longitude = load_location_config()
+        latitude, longitude = load_location_config(env_file)
         logger.info(f"Location: {latitude:.4f}, {longitude:.4f}")
 
         # Get thresholds
@@ -448,7 +470,7 @@ def main() -> None:
             return
 
         # Create controller and get current state
-        controller = create_controller_from_env()
+        controller = create_controller_from_env(env_file)
         current_state = controller.get_state()
 
         # Interpret state (1 = open, 0 = closed)

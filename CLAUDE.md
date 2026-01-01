@@ -80,16 +80,28 @@ nix run .#automation
 # Dry-run mode (test without controlling awning)
 nix run .#automation -- --dry-run
 
+# Specify .env file location (useful for cron jobs)
+nix run .#automation -- --env-file=/path/to/awning/.env
+
+# Both flags together
+nix run .#automation -- --env-file=/path/to/awning/.env --dry-run
+
 # Development shell
 nix develop
 python3 awning_automation.py
 python3 awning_automation.py --dry-run
+python3 awning_automation.py --env-file=/path/to/.env
 ```
 
 **Example cron job:**
 ```bash
-# Run every 15 minutes (automation handles daytime checking internally)
-*/15 * * * * cd /path/to/awning && nix run .#automation >> /var/log/awning-automation.log 2>&1
+# Create logs directory first: mkdir -p ~/logs
+
+# Run every 15 minutes with explicit .env path (recommended for cron)
+*/15 * * * * nix run /Users/YOUR_USERNAME/path/to/awning#automation -- --env-file=/Users/YOUR_USERNAME/path/to/awning/.env >> ~/logs/awning-automation.log 2>&1
+
+# Alternative: Change to project directory first (auto-finds .env)
+*/15 * * * * cd /Users/YOUR_USERNAME/path/to/awning && nix run .#automation >> ~/logs/awning-automation.log 2>&1
 
 # Note: No need to restrict cron to daylight hours - the automation
 # checks sunrise/sunset internally and will only act during daytime
