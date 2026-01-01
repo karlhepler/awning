@@ -147,13 +147,51 @@ class AwningCLI:
         """Execute info command."""
         try:
             info = self.controller.get_info()
-            console.print(
-                Panel.fit(
-                    json.dumps(info, indent=2),
-                    title="[bold cyan]Device Information[/bold cyan]",
-                    border_style="cyan",
-                )
-            )
+
+            # Create a table for device information
+            table = Table(show_header=False, box=None, padding=(0, 2))
+            table.add_column("Property", style="cyan bold", no_wrap=True)
+            table.add_column("Value", style="white")
+
+            # Display common fields in a nice format
+            field_map = {
+                "name": "Name",
+                "type": "Type",
+                "location": "Location",
+                "template": "Template",
+                "addr": "Address",
+                "freq": "Frequency",
+                "actions": "Actions",
+                "properties": "Properties",
+                "commands": "Commands",
+            }
+
+            # Add known fields first
+            for key, label in field_map.items():
+                if key in info:
+                    value = info[key]
+                    # Format lists and dicts nicely
+                    if isinstance(value, (list, dict)):
+                        value = ", ".join(str(v) for v in value) if isinstance(value, list) else str(len(value)) + " items"
+                    table.add_row(label, str(value))
+
+            # Add any remaining fields
+            for key, value in info.items():
+                if key not in field_map:
+                    # Format the key nicely (capitalize, replace underscores)
+                    label = key.replace("_", " ").title()
+                    if isinstance(value, (list, dict)):
+                        value = ", ".join(str(v) for v in value) if isinstance(value, list) else str(len(value)) + " items"
+                    table.add_row(label, str(value))
+
+            console.print()
+            console.print(Panel.fit(
+                table,
+                title="[bold cyan]ℹ️  Device Information[/bold cyan]",
+                border_style="cyan"
+            ))
+            console.print()
+
         except BondAPIError as e:
             console.print(f"[bold red]✗ Error:[/bold red] {e}")
             sys.exit(1)

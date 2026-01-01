@@ -101,6 +101,11 @@ The CLI uses `rich` for colorful, human-friendly output:
 - Color scheme: cyan (actions), green (success), red (errors), yellow (warnings)
 - Custom `show_help()` function (not argparse) displays table of commands
 - Error handling: catch exceptions in CLI, display formatted messages, exit with code 1
+- **Info command:** Controller returns raw JSON dict, CLI formats it as human-readable table
+  - Common fields (name, type, location, etc.) shown first with friendly labels
+  - Lists displayed as comma-separated values
+  - Dicts show item count
+  - Unknown fields auto-formatted with title-cased labels
 
 ## Security
 
