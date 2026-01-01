@@ -10,3 +10,15 @@
 *~
 .vscode/
 .idea/
+
+# Nix
+result
+result-*
+.direnv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
