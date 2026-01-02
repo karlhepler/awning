@@ -59,10 +59,7 @@ def show_help() -> None:
         "  [cyan]BOND_TOKEN[/cyan]  Bond Bridge authentication token [red](required)[/red]"
     )
     console.print(
-        "  [cyan]BOND_HOST[/cyan]   Bond Bridge hostname or IP [dim](e.g., bond-zzif27980.local)[/dim]"
-    )
-    console.print(
-        "  [cyan]BOND_ID[/cyan]     Bond ID for auto-discovery [dim](e.g., ZZIF27980)[/dim]"
+        "  [cyan]BOND_ID[/cyan]     Bond ID for mDNS discovery [red](required)[/red] [dim](e.g., ZZIF27980)[/dim]"
     )
     console.print(
         "  [cyan]DEVICE_ID[/cyan]   Device ID for the awning [red](required)[/red]"

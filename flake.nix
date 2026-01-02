@@ -18,6 +18,7 @@
           pvlib
           pandas
           pytz
+          zeroconf
         ]);
 
         awning = pkgs.writeScriptBin "awning" ''

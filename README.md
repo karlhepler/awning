@@ -1,29 +1,32 @@
 # Awning Control
 
-A simple shell script to control a motorized awning via Bond Bridge.
+Control a motorized awning via Bond Bridge, with optional weather-based automation.
+
+## Requirements
+
+- [Nix](https://nixos.org/download.html) with flakes enabled
+- Bond Bridge on local network
 
 ## Setup
 
-1. Create `.env` with your values:
+1. Copy `.env.example` to `.env` and fill in your values:
+
+```bash
+cp .env.example .env
+```
+
+2. Edit `.env` with your Bond Bridge credentials:
 
 ```bash
 BOND_TOKEN=your_token_here
-BOND_ID=ZZIF27980           # Recommended: auto-discovers hostname
-# BOND_HOST=bond-zzif27980.local  # Alternative: use hostname directly
-# BOND_HOST=192.168.1.246         # Or use IP (less reliable)
-DEVICE_ID=4fdecc733fbbaa4e
-```
-
-2. Make the script executable (already done):
-
-```bash
-chmod +x awning
+BOND_ID=ZZIF27980
+DEVICE_ID=your_device_id_here
 ```
 
 ## Usage
 
 ```bash
-./awning <command>
+nix run . -- <command>
 ```
 
 ### Commands
@@ -39,9 +42,9 @@ chmod +x awning
 ### Examples
 
 ```bash
-./awning open
-./awning close
-./awning status
+nix run . -- open
+nix run . -- close
+nix run . -- status
 ```
 
 ## Environment Variables
@@ -49,24 +52,59 @@ chmod +x awning
 Set these in the `.env` file:
 
 - `BOND_TOKEN` - Bond Bridge authentication token (required)
-- `BOND_ID` - Bond ID (e.g., ZZIF27980) for auto-discovery via mDNS (recommended)
-- `BOND_HOST` - Bond Bridge hostname or IP address (alternative to BOND_ID)
+- `BOND_ID` - Bond ID (e.g., ZZIF27980) for mDNS service discovery (required)
 - `DEVICE_ID` - Device ID for the awning (required)
 
-**Note:** Using `BOND_ID` is recommended because it's resilient to IP address changes from your router's DHCP. The script will automatically resolve it to the hostname using mDNS.
+The Bond Bridge IP is discovered automatically via mDNS service discovery using the `BOND_ID`.
 
-## Getting Your Token
+## Getting Your Credentials
 
-1. Open the Bond Home app on your phone
-2. Go to your Bond's "Settings" screen
-3. Tap the token to copy it to clipboard
+### Bond Token
+1. Open the Bond Home app
+2. Go to Settings → Advanced Settings
+3. Copy the token
 
-## Requirements
+### Bond ID
+1. Open the Bond Home app
+2. Go to Settings → Device Info
+3. Copy the Bond ID (e.g., ZZIF27980)
 
-- `curl` - For HTTP requests
-- `jq` - For JSON parsing
-- Bond Bridge on local network
+### Device ID
+1. Open the Bond Home app
+2. Select your awning device
+3. Go to Settings → Advanced
+4. Copy the Device ID
+
+## Weather Automation
+
+Automatically open/close awning based on weather conditions. See `.env.example` for configuration options.
+
+```bash
+# Run automation
+nix run .#automation
+
+# Dry-run (test without controlling awning)
+nix run .#automation -- --dry-run
+```
+
+The automation opens the awning only when ALL conditions are met:
+1. Sunny (cloud cover below threshold)
+2. Calm (wind speed below threshold)
+3. No rain
+4. Daytime (between sunrise and sunset)
+5. Sun facing SE (azimuth 90°-180°)
+
+## Development
+
+```bash
+# Enter development shell
+nix develop
+
+# Run directly
+python3 awning.py open
+python3 awning_automation.py --dry-run
+```
 
 ## API Documentation
 
-This script uses the Bond Local API v2. For more information, see the [Bond API documentation](https://github.com/bondhome/api-v2).
+This uses the Bond Local API v2. See the [Bond API documentation](https://github.com/bondhome/api-v2).

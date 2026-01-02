@@ -6,11 +6,14 @@ This module can be used independently of the CLI interface.
 """
 
 import os
+import socket
+import threading
 from pathlib import Path
 from typing import Optional
 
 import requests
 from dotenv import load_dotenv
+from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
 
 
 class ConfigurationError(Exception):
@@ -135,17 +138,53 @@ class BondAwningController:
         self._send_action("ToggleOpen")
 
 
-def auto_discover_bond(bond_id: str) -> str:
+def auto_discover_bond(bond_id: str, timeout: float = 10.0) -> str:
     """
-    Auto-discover Bond Bridge hostname using Bond ID.
+    Discover Bond Bridge IP address using mDNS service discovery.
 
     Args:
         bond_id: Bond ID (e.g., "ZZIF27980")
+        timeout: Discovery timeout in seconds
 
     Returns:
-        mDNS hostname for the Bond Bridge
+        IP address of the Bond Bridge
+
+    Raises:
+        ConfigurationError: If Bond Bridge cannot be discovered
     """
-    return f"{bond_id.lower()}.local"
+
+    class BondListener(ServiceListener):
+        def __init__(self, target_id: str):
+            self.target_id = target_id.upper()
+            self.ip_address: Optional[str] = None
+            self.found = threading.Event()
+
+        def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+            info = zc.get_service_info(type_, name)
+            if info and self.target_id in name.upper():
+                if info.addresses:
+                    self.ip_address = socket.inet_ntoa(info.addresses[0])
+                    self.found.set()
+
+        def remove_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+            pass
+
+        def update_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+            pass
+
+    zc = Zeroconf()
+    listener = BondListener(bond_id)
+    browser = ServiceBrowser(zc, "_bond._tcp.local.", listener)
+
+    try:
+        if listener.found.wait(timeout):
+            return listener.ip_address  # type: ignore[return-value]
+        raise ConfigurationError(
+            f"Could not discover Bond Bridge '{bond_id}' via mDNS. "
+            f"Ensure the Bond Bridge is powered on and on the same network."
+        )
+    finally:
+        zc.close()
 
 
 def load_config(env_file: Optional[Path] = None) -> tuple[str, str, str]:
@@ -184,17 +223,14 @@ def load_config(env_file: Optional[Path] = None) -> tuple[str, str, str]:
             "Please set it in .env file or export it."
         )
 
-    # Get BOND_HOST or auto-discover from BOND_ID
-    bond_host = os.getenv("BOND_HOST", "").strip()
-    if not bond_host:
-        bond_id = os.getenv("BOND_ID", "").strip()
-        if bond_id:
-            bond_host = auto_discover_bond(bond_id)
-        else:
-            raise ConfigurationError(
-                "BOND_HOST environment variable is not set. "
-                "Please set BOND_HOST (IP or hostname) or BOND_ID in .env file."
-            )
+    # Get BOND_ID and discover IP via mDNS
+    bond_id = os.getenv("BOND_ID", "").strip()
+    if not bond_id:
+        raise ConfigurationError(
+            "BOND_ID environment variable is not set. "
+            "Please set it in .env file or export it."
+        )
+    bond_host = auto_discover_bond(bond_id)
 
     # Get DEVICE_ID (required)
     device_id = os.getenv("DEVICE_ID", "").strip()
