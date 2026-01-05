@@ -53,16 +53,17 @@ The project is organized into two main modules:
 - Uses pvlib for solar position calculations
 - Imports `awning_controller` for awning control
 
-**Enhanced Decision Logic (ALL 7 conditions must be met):**
+**Enhanced Decision Logic (ALL 8 conditions must be met):**
 1. **Sunny**: Shortwave radiation >= threshold (configurable, default 200 W/m²)
-2. **Calm**: Wind speed < threshold (configurable, default 10 mph)
-3. **No rain**: Precipitation = 0 mm/h (hardcoded)
-4. **Above freezing**: Temperature > 32°F (hardcoded)
-5. **Daytime**: Current time between sunrise and sunset (from weather API)
-6. **Sun high enough**: Sun altitude >= threshold (configurable, default 10°, accounts for trees)
-7. **Sun facing SE**: Sun azimuth 90°-180° (East to South, hardcoded for SE window)
+2. **Clear sky**: Cloud cover <= threshold (configurable, e.g., 5%)
+3. **Calm**: Wind speed < threshold (configurable, default 10 mph)
+4. **No rain**: Precipitation = 0 mm/h (hardcoded)
+5. **Above freezing**: Temperature > 32°F (hardcoded)
+6. **Daytime**: Current time between sunrise and sunset (from weather API)
+7. **Sun high enough**: Sun altitude >= threshold (configurable, default 10°, accounts for trees)
+8. **Sun facing SE**: Sun azimuth 90°-180° (East to South, hardcoded for SE window)
 
-- **Opens awning if**: ALL 7 conditions are True
+- **Opens awning if**: ALL 8 conditions are True
 - **Closes awning if**: ANY condition is False
 - Checks current awning state before acting (only sends command if state needs to change)
 - Fail-safe: Closes awning if weather API is unavailable
@@ -71,6 +72,7 @@ The project is organized into two main modules:
 - `LATITUDE` - Latitude for weather location (required, e.g., 37.7749)
 - `LONGITUDE` - Longitude for weather location (required, e.g., -122.4194)
 - `SHORTWAVE_RADIATION_THRESHOLD` - Minimum solar radiation in W/m² (required, e.g., 120)
+- `MAX_CLOUD_COVER_PERCENT` - Maximum cloud cover percentage for "clear sky" (required, e.g., 5)
 - `MIN_SUN_ALTITUDE_DEG` - Minimum sun altitude in degrees (required, e.g., 10)
 - `WIND_SPEED_THRESHOLD_MPH` - Wind speed threshold in mph (required, e.g., 10)
 
@@ -111,7 +113,7 @@ python3 awning_automation.py --env-file=/path/to/.env
 
 **Weather API:**
 - Uses Open-Meteo Forecast API: `https://api.open-meteo.com/v1/forecast`
-- Fetches current: shortwave radiation (W/m²), wind speed (mph), precipitation (mm/h), temperature, is_day
+- Fetches current: shortwave radiation (W/m²), cloud cover (%), wind speed (mph), precipitation (mm/h), temperature, is_day
 - Fetches daily: sunrise and sunset times
 - 10-second timeout on requests
 - No API key required for non-commercial use
@@ -195,6 +197,7 @@ nix build
 - `LATITUDE` - Latitude for weather location (required, e.g., 37.7749)
 - `LONGITUDE` - Longitude for weather location (required, e.g., -122.4194)
 - `SHORTWAVE_RADIATION_THRESHOLD` - Minimum solar radiation in W/m² (required, e.g., 120)
+- `MAX_CLOUD_COVER_PERCENT` - Maximum cloud cover percentage for "clear sky" (required, e.g., 5)
 - `MIN_SUN_ALTITUDE_DEG` - Minimum sun altitude in degrees (required, e.g., 10)
 - `WIND_SPEED_THRESHOLD_MPH` - Wind speed threshold in mph (required, e.g., 10)
 
