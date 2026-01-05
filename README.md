@@ -19,7 +19,7 @@ cp .env.example .env
 
 ```bash
 BOND_TOKEN=your_token_here
-BOND_ID=ZZIF27980
+BOND_HOST=192.168.1.XXX  # Your Bond Bridge IP (set up DHCP reservation!)
 DEVICE_ID=your_device_id_here
 ```
 
@@ -52,10 +52,10 @@ nix run . -- status
 Set these in the `.env` file:
 
 - `BOND_TOKEN` - Bond Bridge authentication token (required)
-- `BOND_ID` - Bond ID (e.g., ZZIF27980) for mDNS service discovery (required)
+- `BOND_HOST` - Bond Bridge IP address (required) - see below for setup
 - `DEVICE_ID` - Device ID for the awning (required)
 
-The Bond Bridge IP is discovered automatically via mDNS service discovery using the `BOND_ID`.
+**Important:** Set up a DHCP reservation in your router for the Bond Bridge. This ensures it always gets the same IP address. This is best practice for all IoT devices.
 
 ## Getting Your Credentials
 
@@ -64,10 +64,10 @@ The Bond Bridge IP is discovered automatically via mDNS service discovery using 
 2. Go to Settings → Advanced Settings
 3. Copy the token
 
-### Bond ID
-1. Open the Bond Home app
-2. Go to Settings → Device Info
-3. Copy the Bond ID (e.g., ZZIF27980)
+### Bond Host (IP Address)
+1. Set up a DHCP reservation in your router (recommended)
+2. Or find the current IP in your router's connected devices list
+3. You can also find it in Bond Home app → Settings → Device Info
 
 ### Device ID
 1. Open the Bond Home app

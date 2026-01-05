@@ -388,10 +388,10 @@ def main() -> None:
     # Look for --env-file argument
     for i, arg in enumerate(sys.argv):
         if arg == "--env-file" and i + 1 < len(sys.argv):
-            env_file = Path(sys.argv[i + 1])
+            env_file = Path(sys.argv[i + 1]).expanduser()
             break
         elif arg.startswith("--env-file="):
-            env_file = Path(arg.split("=", 1)[1])
+            env_file = Path(arg.split("=", 1)[1]).expanduser()
             break
 
     if dry_run:

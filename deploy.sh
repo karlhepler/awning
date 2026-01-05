@@ -3,15 +3,13 @@
 set -e
 
 SERVER="karlhepler@orangepi3-lts"
-IMAGE="awning-automation"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REMOTE_DIR=".config/awning"
 
 # Get version from git
 VERSION=$(git -C "$SCRIPT_DIR" rev-parse --short HEAD)
 
-# Build Docker image
-echo "Building Docker image (version: $VERSION)..."
-docker build --build-arg VERSION="$VERSION" -t "$IMAGE" "$SCRIPT_DIR"
+echo "Deploying awning automation (version: $VERSION)..."
 
 # Prompt for password
 read -s -p "Enter SSH password for $SERVER: " PASSWORD
@@ -20,26 +18,38 @@ echo
 # Export for sshpass
 export SSHPASS="$PASSWORD"
 
-# Save and copy image
-echo "Copying image to server..."
-sshpass -e ssh "$SERVER" 'rm -f /tmp/awning-automation.tar.gz'
-docker save "$IMAGE" | gzip | sshpass -e ssh "$SERVER" 'cat > /tmp/awning-automation.tar.gz'
+# Ensure python3-venv is installed
+echo "Ensuring python3-venv is installed..."
+sshpass -e ssh "$SERVER" "dpkg -s python3-venv > /dev/null 2>&1 || (echo '$PASSWORD' | sudo -S apt-get update && echo '$PASSWORD' | sudo -S apt-get install -y python3-venv)"
 
-# Copy .env to server
-echo "Copying .env to server..."
-sshpass -e ssh "$SERVER" 'mkdir -p ~/.config/awning'
-sshpass -e scp "$SCRIPT_DIR/.env" "$SERVER:~/.config/awning/.env"
+# Create remote directory and venv (only if venv doesn't exist)
+echo "Setting up remote directory and virtual environment..."
+sshpass -e ssh "$SERVER" "mkdir -p ~/$REMOTE_DIR && [ -d ~/$REMOTE_DIR/venv ] || python3 -m venv ~/$REMOTE_DIR/venv"
 
-# Load image
-echo "Loading image..."
-sshpass -e ssh "$SERVER" 'gunzip -c /tmp/awning-automation.tar.gz | podman load && rm /tmp/awning-automation.tar.gz'
+# Install Python dependencies
+echo "Installing Python dependencies..."
+sshpass -e ssh "$SERVER" "~/$REMOTE_DIR/venv/bin/pip install requests python-dotenv rich pvlib pandas pytz"
 
-# Configure cron (removes existing entry first, so only one ever exists)
+# Copy Python scripts
+echo "Copying scripts..."
+sshpass -e scp "$SCRIPT_DIR/awning_controller.py" "$SCRIPT_DIR/awning_automation.py" "$SERVER:~/$REMOTE_DIR/"
+
+# Copy .env file
+echo "Copying .env..."
+sshpass -e scp "$SCRIPT_DIR/.env" "$SERVER:~/$REMOTE_DIR/.env"
+
+# Remove existing symlink at ~/awning.log if it exists
+echo "Setting up log file..."
+sshpass -e ssh "$SERVER" 'rm -f ~/awning.log'
+
+# Configure cron (removes existing awning entry first)
 echo "Configuring cron job..."
-CRON_CMD='*/15 * * * * XDG_RUNTIME_DIR=/run/user/$(id -u) /usr/bin/podman run --rm --network=host --env-file=$HOME/.config/awning/.env awning-automation >> $HOME/.config/awning/automation.log 2>&1'
-sshpass -e ssh "$SERVER" "(crontab -l 2>/dev/null | grep -v 'awning-automation'; echo '$CRON_CMD') | crontab -"
+CRON_CMD='*/15 * * * * $HOME/.config/awning/venv/bin/python $HOME/.config/awning/awning_automation.py --env-file=$HOME/.config/awning/.env >> $HOME/awning.log 2>&1'
+sshpass -e ssh "$SERVER" "(crontab -l 2>/dev/null | grep -v 'awning_automation'; echo '$CRON_CMD') | crontab -"
 
 # Verify deployment
 echo "Verifying deployment..."
-DEPLOYED_VERSION=$(sshpass -e ssh "$SERVER" 'podman run --rm --network=none awning-automation version')
-echo "Deploy complete! Version: $DEPLOYED_VERSION"
+sshpass -e ssh "$SERVER" "~/$REMOTE_DIR/venv/bin/python ~/$REMOTE_DIR/awning_automation.py --env-file=~/$REMOTE_DIR/.env --dry-run" && echo ""
+
+echo "Deploy complete! Version: $VERSION"
+echo "Logs: ~/awning.log on $SERVER"

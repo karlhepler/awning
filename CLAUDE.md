@@ -14,7 +14,6 @@ The project is organized into two main modules:
 - `BondAwningController` class - Core business logic for awning control
 - `load_config()` - Loads configuration from environment variables
 - `create_controller_from_env()` - Factory function to create controller from env
-- `auto_discover_bond()` - Discovers Bond Bridge IP via mDNS service discovery
 - Custom exceptions: `ConfigurationError`, `BondAPIError`
 - No dependencies on CLI libraries (rich, etc.) - can be used independently
 - All methods raise exceptions instead of printing/exiting
@@ -29,7 +28,7 @@ The project is organized into two main modules:
 **Configuration Loading:**
 - `.env` file is loaded from current working directory first, then falls back to script directory
 - This allows `nix run . -- <command>` to work correctly from the project directory
-- Bond Bridge discovered via mDNS service discovery using `BOND_ID` (uses zeroconf to resolve IP)
+- Bond Bridge IP specified via `BOND_HOST` environment variable (requires DHCP reservation for stability)
 - Configuration errors raise `ConfigurationError` instead of calling `sys.exit()`
 
 **Command Flow:**
@@ -40,7 +39,7 @@ The project is organized into two main modules:
 5. CLI catches exceptions and displays formatted output
 
 **Bond API:**
-- Base URL: `http://{discovered_ip}/v2/devices/{DEVICE_ID}`
+- Base URL: `http://{BOND_HOST}/v2/devices/{DEVICE_ID}`
 - Authentication via `BOND-Token` header
 - Actions: `Open`, `Close`, `Stop`, `ToggleOpen`
 - State endpoint returns `{"open": 1}` or `{"open": 0}`
@@ -165,16 +164,15 @@ nix build
 **Available commands:** `open`, `close`, `stop`, `toggle`, `status`, `info`
 
 **Dependencies:**
-- Python 3 with: `requests`, `python-dotenv`, `rich`, `pvlib`, `pandas`, `pytz`, `zeroconf`
+- Python 3 with: `requests`, `python-dotenv`, `rich`, `pvlib`, `pandas`, `pytz`
 - Managed via Nix flake (see `flake.nix`)
 - `pvlib` and `pandas` are used for solar position calculations in automation
-- `zeroconf` is used for mDNS service discovery to find the Bond Bridge IP
 
 **Environment setup (.env file):**
 
 *For basic awning control:*
 - `BOND_TOKEN` - Bond Bridge auth token (required) - get from Bond Home app → Settings
-- `BOND_ID` - Bond ID (e.g., ZZIF27980) for mDNS service discovery (required)
+- `BOND_HOST` - Bond Bridge IP address (required) - set up DHCP reservation in your router
 - `DEVICE_ID` - Device ID for the awning (required)
 
 *For weather automation (in addition to above):*
