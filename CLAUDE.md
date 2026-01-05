@@ -181,6 +181,12 @@ nix build
 - `CLOUD_COVER_THRESHOLD` - Cloud cover threshold percentage (required, e.g., 30)
 - `WIND_SPEED_THRESHOLD_MPH` - Wind speed threshold in mph (required, e.g., 10)
 
+*For Telegram notifications (optional):*
+- `TELEGRAM_BOT_TOKEN` - Bot token from @BotFather on Telegram
+- `TELEGRAM_CHAT_ID` - Chat ID to send notifications to (get from @userinfobot)
+- Notifications are sent when awning opens/closes or on errors
+- Auto-enabled when both variables are set
+
 **Using the controller independently (without CLI):**
 ```python
 from awning_controller import BondAwningController, create_controller_from_env

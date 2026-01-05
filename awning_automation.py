@@ -157,6 +157,49 @@ def get_thresholds() -> tuple[int, float]:
     return cloud_threshold, wind_threshold
 
 
+def load_telegram_config() -> tuple[Optional[str], Optional[str]]:
+    """
+    Load Telegram configuration from environment variables.
+
+    Returns:
+        Tuple of (bot_token, chat_id) or (None, None) if not configured
+    """
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+    if bot_token and chat_id:
+        return bot_token, chat_id
+    return None, None
+
+
+def send_telegram_notification(
+    bot_token: str, chat_id: str, message: str, timeout: int = 5
+) -> bool:
+    """
+    Send a notification via Telegram Bot API.
+
+    Args:
+        bot_token: Telegram bot token
+        chat_id: Chat ID to send message to
+        message: Message text to send
+        timeout: Request timeout in seconds
+
+    Returns:
+        True if message sent successfully, False otherwise
+    """
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message}
+
+    try:
+        response = requests.post(url, json=payload, timeout=timeout)
+        response.raise_for_status()
+        logger.info("Telegram notification sent")
+        return True
+    except requests.RequestException as e:
+        logger.warning(f"Failed to send Telegram notification: {e}")
+        return False
+
+
 def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
     """
     Fetch current weather and daily data from Open-Meteo API.
@@ -400,6 +443,9 @@ def main() -> None:
     if env_file:
         logger.info(f"Using .env file: {env_file}")
 
+    # Initialize telegram config (will be loaded in try block)
+    telegram_token, telegram_chat_id = None, None
+
     try:
         # Load location configuration
         latitude, longitude = load_location_config(env_file)
@@ -411,6 +457,11 @@ def main() -> None:
             f"Thresholds: Cloud < {cloud_threshold}%, Wind < {wind_threshold} mph, "
             f"Rain = 0 mm/h, Daytime only, Sun facing SE (90°-180°)"
         )
+
+        # Load Telegram config (optional)
+        telegram_token, telegram_chat_id = load_telegram_config()
+        if telegram_token:
+            logger.info("Telegram notifications enabled")
 
         # Fetch current weather
         logger.info("Fetching weather data...")
@@ -482,10 +533,21 @@ def main() -> None:
             logger.info("Opening awning...")
             controller.open()
             logger.info("Awning opened successfully")
+            if telegram_token:
+                msg = (
+                    f"☀️ Awning OPENED\n"
+                    f"Weather: {weather['cloud_cover']}% clouds, "
+                    f"{weather['wind_speed_10m']} mph wind\n"
+                    f"Sun: {sun_position['azimuth']:.0f}° azimuth"
+                )
+                send_telegram_notification(telegram_token, telegram_chat_id, msg)
         elif not should_open and is_open:
             logger.info("Closing awning...")
             controller.close()
             logger.info("Awning closed successfully")
+            if telegram_token:
+                msg = f"🌙 Awning CLOSED\nReason: {reason}"
+                send_telegram_notification(telegram_token, telegram_chat_id, msg)
         else:
             logger.info(
                 f"No action needed - awning already {'OPEN' if is_open else 'CLOSED'}"
@@ -507,13 +569,22 @@ def main() -> None:
                 if state == 1:  # If open
                     controller.close()
                     logger.info("Awning closed as fail-safe")
+                    if telegram_token:
+                        msg = f"⚠️ Awning CLOSED (fail-safe)\nWeather API error: {e}"
+                        send_telegram_notification(telegram_token, telegram_chat_id, msg)
                 else:
                     logger.info("Awning already closed")
             except Exception as fail_safe_error:
                 logger.error(f"Fail-safe close failed: {fail_safe_error}")
+                if telegram_token:
+                    msg = f"🚨 ALERT: Weather API failed AND fail-safe close failed!\n{fail_safe_error}"
+                    send_telegram_notification(telegram_token, telegram_chat_id, msg)
         sys.exit(1)
     except BondAPIError as e:
         logger.error(f"Bond API error: {e}")
+        if telegram_token:
+            msg = f"🚨 Bond API error: {e}"
+            send_telegram_notification(telegram_token, telegram_chat_id, msg)
         sys.exit(1)
     except Exception as e:
         logger.error(f"Unexpected error: {e}")

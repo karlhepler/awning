@@ -9,6 +9,20 @@ REMOTE_DIR=".config/awning"
 # Get version from git
 VERSION=$(git -C "$SCRIPT_DIR" rev-parse --short HEAD)
 
+# Load Telegram config from .env
+TELEGRAM_BOT_TOKEN=$(grep '^TELEGRAM_BOT_TOKEN=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 || echo "")
+TELEGRAM_CHAT_ID=$(grep '^TELEGRAM_CHAT_ID=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 || echo "")
+
+# Function to send Telegram notification
+send_telegram() {
+    local message="$1"
+    if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"${message}\"}" > /dev/null
+    fi
+}
+
 # Discover Bond Bridge IP via mDNS
 echo "Discovering Bond Bridge IP via mDNS..."
 BOND_ID=$(grep '^BOND_ID=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 || echo "")
@@ -49,6 +63,9 @@ echo
 # Export for sshpass
 export SSHPASS="$PASSWORD"
 
+# Send deploy start notification
+send_telegram "🚀 Deploying awning automation (${VERSION})..."
+
 # Ensure python3-venv is installed
 echo "Ensuring python3-venv is installed..."
 sshpass -e ssh "$SERVER" "dpkg -s python3-venv > /dev/null 2>&1 || (echo '$PASSWORD' | sudo -S apt-get update && echo '$PASSWORD' | sudo -S apt-get install -y python3-venv)"
@@ -81,6 +98,9 @@ sshpass -e ssh "$SERVER" "(crontab -l 2>/dev/null | grep -v 'awning_automation';
 # Verify deployment
 echo "Verifying deployment..."
 sshpass -e ssh "$SERVER" "~/$REMOTE_DIR/venv/bin/python ~/$REMOTE_DIR/awning_automation.py --env-file=~/$REMOTE_DIR/.env --dry-run" && echo ""
+
+# Send deploy complete notification
+send_telegram "✅ Deploy complete! Version: ${VERSION}"
 
 echo "Deploy complete! Version: $VERSION"
 echo "Logs: ~/awning.log on $SERVER"
