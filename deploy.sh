@@ -9,6 +9,37 @@ REMOTE_DIR=".config/awning"
 # Get version from git
 VERSION=$(git -C "$SCRIPT_DIR" rev-parse --short HEAD)
 
+# Discover Bond Bridge IP via mDNS
+echo "Discovering Bond Bridge IP via mDNS..."
+BOND_ID=$(grep '^BOND_ID=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 || echo "")
+if [ -z "$BOND_ID" ]; then
+    # Fall back to extracting from BOND_HOST if it's a hostname
+    BOND_HOST=$(grep '^BOND_HOST=' "$SCRIPT_DIR/.env" | cut -d= -f2)
+    if [[ "$BOND_HOST" =~ ^[A-Za-z] ]]; then
+        BOND_ID=$(echo "$BOND_HOST" | sed 's/^bond-//' | sed 's/\..*$//' | tr '[:lower:]' '[:upper:]')
+    fi
+fi
+
+if [ -n "$BOND_ID" ]; then
+    MDNS_OUTPUT=$(mktemp)
+    dns-sd -G v4 "${BOND_ID}.local" > "$MDNS_OUTPUT" 2>&1 &
+    DNS_PID=$!
+    sleep 3
+    kill $DNS_PID 2>/dev/null || true
+    BOND_IP=$(grep -oE '192\.168\.[0-9]+\.[0-9]+' "$MDNS_OUTPUT" | head -1)
+    rm -f "$MDNS_OUTPUT"
+
+    if [ -n "$BOND_IP" ]; then
+        echo "Found Bond Bridge at $BOND_IP"
+        sed -i.bak "s/^BOND_HOST=.*/BOND_HOST=$BOND_IP/" "$SCRIPT_DIR/.env"
+        rm -f "$SCRIPT_DIR/.env.bak"
+    else
+        echo "Warning: Could not discover Bond Bridge IP, using existing BOND_HOST"
+    fi
+else
+    echo "Warning: No BOND_ID found, using existing BOND_HOST"
+fi
+
 echo "Deploying awning automation (version: $VERSION)..."
 
 # Prompt for password

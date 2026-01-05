@@ -464,11 +464,6 @@ def main() -> None:
         logger.info(f"Conditions: {check_str}")
         logger.info(f"Decision: {reason}")
 
-        if dry_run:
-            logger.info(f"Would set awning to: {'OPEN' if should_open else 'CLOSED'}")
-            logger.info("Dry-run complete (no action taken)")
-            return
-
         # Create controller and get current state
         controller = create_controller_from_env(env_file)
         current_state = controller.get_state()
@@ -476,6 +471,11 @@ def main() -> None:
         # Interpret state (1 = open, 0 = closed)
         is_open = current_state == 1
         logger.info(f"Current awning state: {'OPEN' if is_open else 'CLOSED'}")
+
+        if dry_run:
+            logger.info(f"Would set awning to: {'OPEN' if should_open else 'CLOSED'}")
+            logger.info("Dry-run complete (no action taken)")
+            return
 
         # Take action ONLY if state needs to change (CRITICAL)
         if should_open and not is_open:
