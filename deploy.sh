@@ -86,9 +86,9 @@ sshpass -e scp "$SCRIPT_DIR/awning_controller.py" "$SCRIPT_DIR/awning_automation
 echo "Copying .env..."
 sshpass -e scp "$SCRIPT_DIR/.env" "$SERVER:~/$REMOTE_DIR/.env"
 
-# Remove existing symlink at ~/awning.log if it exists
-echo "Setting up log file..."
-sshpass -e ssh "$SERVER" 'rm -f ~/awning.log'
+# Log deploy start to remote log file
+echo "Logging deploy start..."
+sshpass -e ssh "$SERVER" "echo '' >> ~/awning.log && echo '$(date '+%Y-%m-%d %H:%M:%S') - INFO - 🚀 Deploy started (version: $VERSION)' >> ~/awning.log"
 
 # Configure cron (removes existing awning entry first)
 echo "Configuring cron job..."
@@ -98,6 +98,9 @@ sshpass -e ssh "$SERVER" "(crontab -l 2>/dev/null | grep -v 'awning_automation';
 # Verify deployment
 echo "Verifying deployment..."
 sshpass -e ssh "$SERVER" "~/$REMOTE_DIR/venv/bin/python ~/$REMOTE_DIR/awning_automation.py --env-file=~/$REMOTE_DIR/.env --dry-run" && echo ""
+
+# Log deploy complete to remote log file
+sshpass -e ssh "$SERVER" "echo '$(date '+%Y-%m-%d %H:%M:%S') - INFO - ✅ Deploy complete (version: $VERSION)' >> ~/awning.log && echo '' >> ~/awning.log"
 
 # Send deploy complete notification
 send_telegram "✅ Deploy complete! Version: ${VERSION}"
