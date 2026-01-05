@@ -219,9 +219,10 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
     params = {
         "latitude": lat,
         "longitude": lon,
-        "current": "cloud_cover,wind_speed_10m,precipitation,is_day",
+        "current": "cloud_cover,wind_speed_10m,precipitation,is_day,temperature_2m",
         "daily": "sunrise,sunset",
         "wind_speed_unit": "mph",
+        "temperature_unit": "fahrenheit",
         "timezone": "auto",
         "forecast_days": 1,
     }
@@ -236,7 +237,7 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
             raise WeatherAPIError("Weather API response missing 'current' field")
 
         current = data["current"]
-        required_fields = ["cloud_cover", "wind_speed_10m", "precipitation"]
+        required_fields = ["cloud_cover", "wind_speed_10m", "precipitation", "temperature_2m"]
         for field in required_fields:
             if field not in current:
                 raise WeatherAPIError(
@@ -257,6 +258,7 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
             "cloud_cover": current["cloud_cover"],
             "wind_speed_10m": current["wind_speed_10m"],
             "precipitation": current["precipitation"],
+            "temperature": current["temperature_2m"],
             "is_day": current.get("is_day", 1),
             "time": current.get("time", "unknown"),
             "sunrise": daily["sunrise"][0],
@@ -370,6 +372,7 @@ def should_open_awning(
     cloud_cover = weather["cloud_cover"]
     wind_speed = weather["wind_speed_10m"]
     precipitation = weather["precipitation"]
+    temperature = weather["temperature"]
     sunrise = weather["sunrise"]
     sunset = weather["sunset"]
 
@@ -381,6 +384,7 @@ def should_open_awning(
     is_sunny = cloud_cover < cloud_threshold
     is_calm = wind_speed < wind_threshold
     no_rain = precipitation == 0
+    above_freezing = temperature > 32
     is_day = is_daytime(current_time, sunrise, sunset)
     sun_facing_se = is_sun_facing_southeast(azimuth)
 
@@ -389,6 +393,7 @@ def should_open_awning(
         "sunny": is_sunny,
         "calm": is_calm,
         "no_rain": no_rain,
+        "above_freezing": above_freezing,
         "daytime": is_day,
         "sun_facing_se": sun_facing_se,
     }
@@ -404,6 +409,8 @@ def should_open_awning(
         reasons.append(f"Too windy ({wind_speed} >= {wind_threshold} mph)")
     if not no_rain:
         reasons.append(f"Raining ({precipitation} mm/h)")
+    if not above_freezing:
+        reasons.append(f"Too cold ({temperature}°F <= 32°F)")
     if not is_day:
         reasons.append(
             f"Nighttime (sunrise {sunrise[11:16]}, sunset {sunset[11:16]})"
@@ -414,7 +421,7 @@ def should_open_awning(
     if should_open:
         reason = (
             f"All conditions met: {cloud_cover}% clouds, {wind_speed} mph wind, "
-            f"{precipitation} mm/h rain, sun azimuth {azimuth:.1f}° (altitude {altitude:.1f}°)"
+            f"{precipitation} mm/h rain, {temperature}°F, sun azimuth {azimuth:.1f}° (altitude {altitude:.1f}°)"
         )
     else:
         reason = ", ".join(reasons)
@@ -455,7 +462,7 @@ def main() -> None:
         cloud_threshold, wind_threshold = get_thresholds()
         logger.info(
             f"Thresholds: Cloud < {cloud_threshold}%, Wind < {wind_threshold} mph, "
-            f"Rain = 0 mm/h, Daytime only, Sun facing SE (90°-180°)"
+            f"Rain = 0 mm/h, Temp > 32°F, Daytime only, Sun facing SE (90°-180°)"
         )
 
         # Load Telegram config (optional)
@@ -469,7 +476,8 @@ def main() -> None:
         logger.info(
             f"Weather: {weather['cloud_cover']}% clouds, "
             f"{weather['wind_speed_10m']} mph wind, "
-            f"{weather['precipitation']} mm/h rain (at {weather['time']})"
+            f"{weather['precipitation']} mm/h rain, "
+            f"{weather['temperature']}°F (at {weather['time']})"
         )
 
         # Get current time from weather API (same timezone as sunrise/sunset)
@@ -506,6 +514,7 @@ def main() -> None:
             "sunny": "Sunny" if conditions["sunny"] else "Cloudy",
             "calm": "Calm" if conditions["calm"] else "Windy",
             "no_rain": "No rain" if conditions["no_rain"] else "Rain",
+            "above_freezing": "Above freezing" if conditions["above_freezing"] else "Freezing",
             "daytime": "Daytime" if conditions["daytime"] else "Nighttime",
             "sun_facing_se": "Sun facing SE" if conditions["sun_facing_se"] else "Sun not facing SE",
         }
