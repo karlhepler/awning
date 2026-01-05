@@ -36,7 +36,7 @@ sshpass -e ssh "$SERVER" 'gunzip -c /tmp/awning-automation.tar.gz | podman load 
 
 # Configure cron (removes existing entry first, so only one ever exists)
 echo "Configuring cron job..."
-CRON_CMD='*/15 * * * * podman run --rm --network=host --env-file=$HOME/.config/awning/.env awning-automation >> $HOME/.config/awning/automation.log 2>&1'
+CRON_CMD='*/15 * * * * XDG_RUNTIME_DIR=/run/user/$(id -u) /usr/bin/podman run --rm --network=host --env-file=$HOME/.config/awning/.env awning-automation >> $HOME/.config/awning/automation.log 2>&1'
 sshpass -e ssh "$SERVER" "(crontab -l 2>/dev/null | grep -v 'awning-automation'; echo '$CRON_CMD') | crontab -"
 
 # Verify deployment
