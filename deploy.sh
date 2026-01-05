@@ -41,5 +41,5 @@ sshpass -e ssh "$SERVER" "(crontab -l 2>/dev/null | grep -v 'awning-automation';
 
 # Verify deployment
 echo "Verifying deployment..."
-DEPLOYED_VERSION=$(sshpass -e ssh "$SERVER" 'podman run --rm awning-automation version')
+DEPLOYED_VERSION=$(sshpass -e ssh "$SERVER" 'podman run --rm --network=none awning-automation version')
 echo "Deploy complete! Version: $DEPLOYED_VERSION"
