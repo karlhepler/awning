@@ -133,19 +133,32 @@ python3 awning_automation.py --env-file=/path/to/.env
 - Format: `YYYY-MM-DD HH:MM:SS - LEVEL - Message`
 - Logs all conditions with ✓/✗ symbols
 - Shows: weather, sun position, sunrise/sunset, decision rationale, current state, and actions taken
-- Example output:
-  ```
-  2026-01-01 14:30:00 - INFO - Location: 35.7780, -78.8380
-  2026-01-01 14:30:00 - INFO - Thresholds: Cloud < 30%, Wind < 10 mph, Rain = 0 mm/h, Daytime only, Sun facing SE (90°-180°)
-  2026-01-01 14:30:01 - INFO - Weather: 25% clouds, 8.5 mph wind, 0.0 mm/h rain
-  2026-01-01 14:30:01 - INFO - Sun position: Azimuth 145.2°, Altitude 35.4°
-  2026-01-01 14:30:01 - INFO - Daytime window: Sunrise 07:15, Sunset 17:45
-  2026-01-01 14:30:02 - INFO - Conditions: ✓ Sunny, ✓ Calm, ✓ No rain, ✓ Daytime, ✓ Sun facing SE
-  2026-01-01 14:30:02 - INFO - Decision: All conditions met
-  2026-01-01 14:30:03 - INFO - Current awning state: CLOSED
-  2026-01-01 14:30:04 - INFO - Opening awning...
-  2026-01-01 14:30:05 - INFO - Automation complete
-  ```
+
+## Deployment
+
+**Target:** Orange Pi 3 LTS running Debian (user: `karlhepler@orangepi3-lts`)
+
+**Deploy script (`deploy.sh`):**
+```bash
+./deploy.sh
+```
+
+This script:
+1. Discovers Bond Bridge IP via mDNS (using `BOND_ID` from `.env`)
+2. Updates `BOND_HOST` in local `.env` if discovered
+3. Sends Telegram notification (deploy start)
+4. Creates Python venv on remote if needed
+5. Installs dependencies via pip
+6. Copies scripts and `.env` to `~/.config/awning/`
+7. Configures cron job (every 15 minutes)
+8. Runs dry-run verification
+9. Sends Telegram notification (deploy complete with version SHA)
+
+**Remote structure:**
+- Scripts: `~/.config/awning/awning_automation.py`, `awning_controller.py`
+- Config: `~/.config/awning/.env`
+- Venv: `~/.config/awning/venv/`
+- Logs: `~/awning.log`
 
 ## Development
 
