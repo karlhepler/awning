@@ -515,43 +515,45 @@ def main() -> None:
         logger.info(f"Conditions: {check_str}")
         logger.info(f"Decision: {reason}")
 
-        # Create controller and get current state
+        # Create controller
         controller = create_controller_from_env(env_file)
-        current_state = controller.get_state()
-
-        # Interpret state (1 = open, 0 = closed)
-        is_open = current_state == 1
-        logger.info(f"Current awning state: {'OPEN' if is_open else 'CLOSED'}")
 
         if dry_run:
+            # Only check state in dry-run mode (for reporting)
+            current_state = controller.get_state()
+            is_open = current_state == 1
+            logger.info(f"Current awning state: {'OPEN' if is_open else 'CLOSED'}")
             logger.info(f"Would set awning to: {'OPEN' if should_open else 'CLOSED'}")
             logger.info("Dry-run complete (no action taken)")
             return
 
-        # Take action ONLY if state needs to change (CRITICAL)
-        if should_open and not is_open:
+        # Get state before action
+        state_before = controller.get_state()
+
+        # Always send command based on weather decision
+        # This is more reliable than state-based logic, since Bond state can be out of sync
+        if should_open:
             logger.info("Opening awning...")
             controller.open()
-            logger.info("Awning opened successfully")
-            if telegram_token:
+            logger.info("Awning set to OPEN")
+        else:
+            logger.info("Closing awning...")
+            controller.close()
+            logger.info("Awning set to CLOSED")
+
+        # Get state after action and notify only if it changed
+        state_after = controller.get_state()
+        if telegram_token and state_before != state_after:
+            if should_open:
                 msg = (
                     f"☀️ Awning OPENED\n"
                     f"Weather: {weather['cloud_cover']}% clouds, "
                     f"{weather['wind_speed_10m']} mph wind\n"
                     f"Sun: {sun_position['azimuth']:.0f}° azimuth"
                 )
-                send_telegram_notification(telegram_token, telegram_chat_id, msg)
-        elif not should_open and is_open:
-            logger.info("Closing awning...")
-            controller.close()
-            logger.info("Awning closed successfully")
-            if telegram_token:
+            else:
                 msg = f"🌙 Awning CLOSED\nReason: {reason}"
-                send_telegram_notification(telegram_token, telegram_chat_id, msg)
-        else:
-            logger.info(
-                f"No action needed - awning already {'OPEN' if is_open else 'CLOSED'}"
-            )
+            send_telegram_notification(telegram_token, telegram_chat_id, msg)
 
         logger.info("Automation complete")
 
