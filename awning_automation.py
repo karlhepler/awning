@@ -3,7 +3,7 @@
 Awning Weather Automation
 
 Automatically opens/closes awning based on weather conditions.
-- Opens awning if: sunny (cloud cover < 30%) AND calm (wind < 10 mph)
+- Opens awning if: sunny (shortwave radiation >= threshold) AND calm (wind < threshold)
 - Closes awning otherwise
 
 Designed to run as a cron job or Kubernetes scheduled job.
@@ -109,22 +109,22 @@ def load_location_config(env_file: Optional[Path] = None) -> tuple[float, float]
     return latitude, longitude
 
 
-def get_thresholds() -> tuple[int, float]:
+def get_thresholds() -> tuple[float, float, float]:
     """
     Get weather thresholds from environment variables.
 
     Returns:
-        Tuple of (cloud_cover_threshold, wind_speed_threshold_mph)
+        Tuple of (shortwave_radiation_threshold, wind_speed_threshold_mph, min_sun_altitude)
 
     Raises:
         ConfigurationError: If threshold variables are missing or invalid
     """
-    # Get cloud cover threshold
-    cloud_str = os.getenv("CLOUD_COVER_THRESHOLD", "").strip()
-    if not cloud_str:
+    # Get shortwave radiation threshold (W/m²)
+    radiation_str = os.getenv("SHORTWAVE_RADIATION_THRESHOLD", "").strip()
+    if not radiation_str:
         raise ConfigurationError(
-            "CLOUD_COVER_THRESHOLD environment variable is not set. "
-            "Please add it to your .env file (e.g., CLOUD_COVER_THRESHOLD=30)"
+            "SHORTWAVE_RADIATION_THRESHOLD environment variable is not set. "
+            "Please add it to your .env file (e.g., SHORTWAVE_RADIATION_THRESHOLD=120)"
         )
 
     # Get wind speed threshold
@@ -135,26 +135,39 @@ def get_thresholds() -> tuple[int, float]:
             "Please add it to your .env file (e.g., WIND_SPEED_THRESHOLD_MPH=10)"
         )
 
+    # Get minimum sun altitude threshold
+    altitude_str = os.getenv("MIN_SUN_ALTITUDE_DEG", "").strip()
+    if not altitude_str:
+        raise ConfigurationError(
+            "MIN_SUN_ALTITUDE_DEG environment variable is not set. "
+            "Please add it to your .env file (e.g., MIN_SUN_ALTITUDE_DEG=20)"
+        )
+
     # Parse as numbers
     try:
-        cloud_threshold = int(cloud_str)
+        radiation_threshold = float(radiation_str)
         wind_threshold = float(wind_str)
+        altitude_threshold = float(altitude_str)
     except ValueError as e:
         raise ConfigurationError(
             f"Invalid threshold format: {e}. Must be numbers."
         ) from e
 
     # Validate ranges
-    if not (0 <= cloud_threshold <= 100):
+    if radiation_threshold < 0:
         raise ConfigurationError(
-            f"CLOUD_COVER_THRESHOLD must be between 0 and 100, got: {cloud_threshold}"
+            f"SHORTWAVE_RADIATION_THRESHOLD must be positive, got: {radiation_threshold}"
         )
     if wind_threshold < 0:
         raise ConfigurationError(
             f"WIND_SPEED_THRESHOLD_MPH must be positive, got: {wind_threshold}"
         )
+    if not (0 <= altitude_threshold <= 90):
+        raise ConfigurationError(
+            f"MIN_SUN_ALTITUDE_DEG must be between 0 and 90, got: {altitude_threshold}"
+        )
 
-    return cloud_threshold, wind_threshold
+    return radiation_threshold, wind_threshold, altitude_threshold
 
 
 def load_telegram_config() -> tuple[Optional[str], Optional[str]]:
@@ -219,7 +232,7 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
     params = {
         "latitude": lat,
         "longitude": lon,
-        "current": "cloud_cover,wind_speed_10m,precipitation,is_day,temperature_2m",
+        "current": "shortwave_radiation,wind_speed_10m,precipitation,is_day,temperature_2m",
         "daily": "sunrise,sunset",
         "wind_speed_unit": "mph",
         "temperature_unit": "fahrenheit",
@@ -237,7 +250,7 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
             raise WeatherAPIError("Weather API response missing 'current' field")
 
         current = data["current"]
-        required_fields = ["cloud_cover", "wind_speed_10m", "precipitation", "temperature_2m"]
+        required_fields = ["shortwave_radiation", "wind_speed_10m", "precipitation", "temperature_2m"]
         for field in required_fields:
             if field not in current:
                 raise WeatherAPIError(
@@ -255,7 +268,7 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
             )
 
         return {
-            "cloud_cover": current["cloud_cover"],
+            "shortwave_radiation": current["shortwave_radiation"],
             "wind_speed_10m": current["wind_speed_10m"],
             "precipitation": current["precipitation"],
             "temperature": current["temperature_2m"],
@@ -350,8 +363,9 @@ def should_open_awning(
     current_time: datetime,
     latitude: float,
     longitude: float,
-    cloud_threshold: int,
+    radiation_threshold: float,
     wind_threshold: float,
+    altitude_threshold: float,
 ) -> tuple[bool, str, dict]:
     """
     Determine if awning should be open based on ALL conditions.
@@ -362,14 +376,15 @@ def should_open_awning(
         current_time: Current datetime
         latitude: Location latitude
         longitude: Location longitude
-        cloud_threshold: Maximum cloud cover percentage for "sunny"
+        radiation_threshold: Minimum shortwave radiation (W/m²) for "sunny"
         wind_threshold: Maximum wind speed (mph) for "calm"
+        altitude_threshold: Minimum sun altitude (degrees) above horizon
 
     Returns:
         Tuple of (should_open, reason, conditions_dict)
     """
     # Extract weather data
-    cloud_cover = weather["cloud_cover"]
+    shortwave_radiation = weather["shortwave_radiation"]
     wind_speed = weather["wind_speed_10m"]
     precipitation = weather["precipitation"]
     temperature = weather["temperature"]
@@ -381,11 +396,12 @@ def should_open_awning(
     altitude = sun_position["altitude"]
 
     # Evaluate each condition
-    is_sunny = cloud_cover < cloud_threshold
+    is_sunny = shortwave_radiation >= radiation_threshold
     is_calm = wind_speed < wind_threshold
     no_rain = precipitation == 0
     above_freezing = temperature > 32
     is_day = is_daytime(current_time, sunrise, sunset)
+    sun_high_enough = altitude >= altitude_threshold
     sun_facing_se = is_sun_facing_southeast(azimuth)
 
     # Build conditions dict for logging
@@ -395,6 +411,7 @@ def should_open_awning(
         "no_rain": no_rain,
         "above_freezing": above_freezing,
         "daytime": is_day,
+        "sun_high": sun_high_enough,
         "sun_facing_se": sun_facing_se,
     }
 
@@ -404,7 +421,7 @@ def should_open_awning(
     # Build detailed reason string
     reasons = []
     if not is_sunny:
-        reasons.append(f"Too cloudy ({cloud_cover}% >= {cloud_threshold}%)")
+        reasons.append(f"Low radiation ({shortwave_radiation} < {radiation_threshold} W/m²)")
     if not is_calm:
         reasons.append(f"Too windy ({wind_speed} >= {wind_threshold} mph)")
     if not no_rain:
@@ -415,12 +432,14 @@ def should_open_awning(
         reasons.append(
             f"Nighttime (sunrise {sunrise[11:16]}, sunset {sunset[11:16]})"
         )
+    if not sun_high_enough:
+        reasons.append(f"Sun too low ({altitude:.1f}° < {altitude_threshold}°)")
     if not sun_facing_se:
         reasons.append(f"Sun not facing SE (azimuth {azimuth:.1f}°, need 90°-180°)")
 
     if should_open:
         reason = (
-            f"All conditions met: {cloud_cover}% clouds, {wind_speed} mph wind, "
+            f"All conditions met: {shortwave_radiation} W/m², {wind_speed} mph wind, "
             f"{precipitation} mm/h rain, {temperature}°F, sun azimuth {azimuth:.1f}° (altitude {altitude:.1f}°)"
         )
     else:
@@ -459,10 +478,10 @@ def main() -> None:
         logger.info(f"Location: {latitude:.4f}, {longitude:.4f}")
 
         # Get thresholds
-        cloud_threshold, wind_threshold = get_thresholds()
+        radiation_threshold, wind_threshold, altitude_threshold = get_thresholds()
         logger.info(
-            f"Thresholds: Cloud < {cloud_threshold}%, Wind < {wind_threshold} mph, "
-            f"Rain = 0 mm/h, Temp > 32°F, Daytime only, Sun facing SE (90°-180°)"
+            f"Thresholds: Solar >= {radiation_threshold} W/m², Wind < {wind_threshold} mph, "
+            f"Rain = 0 mm/h, Temp > 32°F, Sun altitude >= {altitude_threshold}°, Sun facing SE (90°-180°)"
         )
 
         # Load Telegram config (optional)
@@ -474,7 +493,7 @@ def main() -> None:
         logger.info("Fetching weather data...")
         weather = fetch_weather(latitude, longitude)
         logger.info(
-            f"Weather: {weather['cloud_cover']}% clouds, "
+            f"Weather: {weather['shortwave_radiation']} W/m² solar, "
             f"{weather['wind_speed_10m']} mph wind, "
             f"{weather['precipitation']} mm/h rain, "
             f"{weather['temperature']}°F (at {weather['time']})"
@@ -505,8 +524,9 @@ def main() -> None:
             current_time,
             latitude,
             longitude,
-            cloud_threshold,
+            radiation_threshold,
             wind_threshold,
+            altitude_threshold,
         )
 
         # Log conditions with checkmarks/crosses
@@ -516,6 +536,7 @@ def main() -> None:
             "no_rain": "No rain" if conditions["no_rain"] else "Rain",
             "above_freezing": "Above freezing" if conditions["above_freezing"] else "Freezing",
             "daytime": "Daytime" if conditions["daytime"] else "Nighttime",
+            "sun_high": "Sun high" if conditions["sun_high"] else "Sun low",
             "sun_facing_se": "Sun facing SE" if conditions["sun_facing_se"] else "Sun not facing SE",
         }
         check_str = ", ".join(
@@ -556,7 +577,7 @@ def main() -> None:
             if should_open:
                 msg = (
                     f"☀️ Awning OPENED\n"
-                    f"Weather: {weather['cloud_cover']}% clouds, "
+                    f"Weather: {weather['shortwave_radiation']} W/m² solar, "
                     f"{weather['wind_speed_10m']} mph wind\n"
                     f"Sun: {sun_position['azimuth']:.0f}° azimuth"
                 )

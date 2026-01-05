@@ -53,14 +53,16 @@ The project is organized into two main modules:
 - Uses pvlib for solar position calculations
 - Imports `awning_controller` for awning control
 
-**Enhanced Decision Logic (ALL 5 conditions must be met):**
-1. **Sunny**: Cloud cover < threshold (configurable, default 30%)
+**Enhanced Decision Logic (ALL 7 conditions must be met):**
+1. **Sunny**: Shortwave radiation >= threshold (configurable, default 200 W/m²)
 2. **Calm**: Wind speed < threshold (configurable, default 10 mph)
 3. **No rain**: Precipitation = 0 mm/h (hardcoded)
-4. **Daytime**: Current time between sunrise and sunset (from weather API)
-5. **Sun facing SE**: Sun azimuth 90°-180° (East to South, hardcoded for SE window)
+4. **Above freezing**: Temperature > 32°F (hardcoded)
+5. **Daytime**: Current time between sunrise and sunset (from weather API)
+6. **Sun high enough**: Sun altitude >= threshold (configurable, default 10°, accounts for trees)
+7. **Sun facing SE**: Sun azimuth 90°-180° (East to South, hardcoded for SE window)
 
-- **Opens awning if**: ALL 5 conditions are True
+- **Opens awning if**: ALL 7 conditions are True
 - **Closes awning if**: ANY condition is False
 - Checks current awning state before acting (only sends command if state needs to change)
 - Fail-safe: Closes awning if weather API is unavailable
@@ -68,7 +70,8 @@ The project is organized into two main modules:
 **Configuration (add to .env):**
 - `LATITUDE` - Latitude for weather location (required, e.g., 37.7749)
 - `LONGITUDE` - Longitude for weather location (required, e.g., -122.4194)
-- `CLOUD_COVER_THRESHOLD` - Cloud cover threshold percentage (required, e.g., 30)
+- `SHORTWAVE_RADIATION_THRESHOLD` - Minimum solar radiation in W/m² (required, e.g., 120)
+- `MIN_SUN_ALTITUDE_DEG` - Minimum sun altitude in degrees (required, e.g., 10)
 - `WIND_SPEED_THRESHOLD_MPH` - Wind speed threshold in mph (required, e.g., 10)
 
 **Running automation:**
@@ -108,7 +111,7 @@ python3 awning_automation.py --env-file=/path/to/.env
 
 **Weather API:**
 - Uses Open-Meteo Forecast API: `https://api.open-meteo.com/v1/forecast`
-- Fetches current: cloud cover (%), wind speed (mph), precipitation (mm/h), is_day indicator
+- Fetches current: shortwave radiation (W/m²), wind speed (mph), precipitation (mm/h), temperature, is_day
 - Fetches daily: sunrise and sunset times
 - 10-second timeout on requests
 - No API key required for non-commercial use
@@ -178,7 +181,8 @@ nix build
 *For weather automation (in addition to above):*
 - `LATITUDE` - Latitude for weather location (required, e.g., 37.7749)
 - `LONGITUDE` - Longitude for weather location (required, e.g., -122.4194)
-- `CLOUD_COVER_THRESHOLD` - Cloud cover threshold percentage (required, e.g., 30)
+- `SHORTWAVE_RADIATION_THRESHOLD` - Minimum solar radiation in W/m² (required, e.g., 120)
+- `MIN_SUN_ALTITUDE_DEG` - Minimum sun altitude in degrees (required, e.g., 10)
 - `WIND_SPEED_THRESHOLD_MPH` - Wind speed threshold in mph (required, e.g., 10)
 
 *For Telegram notifications (optional):*
