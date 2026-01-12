@@ -5,12 +5,39 @@ Core domain logic for controlling an awning device through the Bond Bridge API.
 This module can be used independently of the CLI interface.
 """
 
+import logging
 import os
 from pathlib import Path
 from typing import Optional
 
 import requests
 from dotenv import load_dotenv
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+logger = logging.getLogger(__name__)
+
+# Retry configuration for Bond API
+# Retries transient network errors with exponential backoff (1s, 2s, 4s)
+# Does NOT retry on HTTP 4xx errors (those raise HTTPError after raise_for_status)
+BOND_RETRY_CONFIG = {
+    "stop": stop_after_attempt(3),
+    "wait": wait_exponential(multiplier=1, min=1, max=10),
+    "retry": retry_if_exception_type(
+        (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ChunkedEncodingError,
+        )
+    ),
+    "reraise": True,
+    "before_sleep": before_sleep_log(logger, logging.WARNING),
+}
 
 
 class ConfigurationError(Exception):
@@ -57,8 +84,7 @@ class BondAwningController:
         """
         url = f"{self.base_url}/actions/{action}"
         try:
-            response = requests.put(url, headers=self.headers, json={}, timeout=self.timeout)
-            response.raise_for_status()
+            self._put_request(url)
         except requests.RequestException as e:
             raise BondAPIError(f"Failed to send action '{action}': {e}") from e
 
@@ -74,9 +100,7 @@ class BondAwningController:
         """
         url = f"{self.base_url}/state"
         try:
-            response = requests.get(url, headers=self.headers, timeout=self.timeout)
-            response.raise_for_status()
-            data = response.json()
+            data = self._get_request(url)
             return data.get("open")
         except requests.RequestException as e:
             raise BondAPIError(f"Failed to get state: {e}") from e
@@ -92,11 +116,22 @@ class BondAwningController:
             BondAPIError: If the API request fails
         """
         try:
-            response = requests.get(self.base_url, headers=self.headers, timeout=self.timeout)
-            response.raise_for_status()
-            return response.json()
+            return self._get_request(self.base_url)
         except requests.RequestException as e:
             raise BondAPIError(f"Failed to get device info: {e}") from e
+
+    @retry(**BOND_RETRY_CONFIG)
+    def _get_request(self, url: str) -> dict:
+        """Make a GET request with retry logic."""
+        response = requests.get(url, headers=self.headers, timeout=self.timeout)
+        response.raise_for_status()
+        return response.json()
+
+    @retry(**BOND_RETRY_CONFIG)
+    def _put_request(self, url: str) -> None:
+        """Make a PUT request with retry logic."""
+        response = requests.put(url, headers=self.headers, json={}, timeout=self.timeout)
+        response.raise_for_status()
 
     def open(self) -> None:
         """

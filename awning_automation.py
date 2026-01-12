@@ -20,6 +20,13 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 from pvlib import solarposition
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from awning_controller import (
     BondAPIError,
@@ -35,6 +42,36 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+# Retry configuration for Weather API
+# Retries transient network errors with exponential backoff (2s, 4s, 8s)
+WEATHER_RETRY_CONFIG = {
+    "stop": stop_after_attempt(3),
+    "wait": wait_exponential(multiplier=2, min=2, max=30),
+    "retry": retry_if_exception_type(
+        (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ChunkedEncodingError,
+        )
+    ),
+    "reraise": True,
+    "before_sleep": before_sleep_log(logger, logging.WARNING),
+}
+
+# Retry configuration for Telegram API (best-effort, shorter waits)
+TELEGRAM_RETRY_CONFIG = {
+    "stop": stop_after_attempt(2),
+    "wait": wait_exponential(multiplier=1, min=1, max=5),
+    "retry": retry_if_exception_type(
+        (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        )
+    ),
+    "reraise": True,
+    "before_sleep": before_sleep_log(logger, logging.WARNING),
+}
 
 
 class WeatherAPIError(Exception):
@@ -204,13 +241,19 @@ def send_telegram_notification(
     payload = {"chat_id": chat_id, "text": message}
 
     try:
-        response = requests.post(url, json=payload, timeout=timeout)
-        response.raise_for_status()
+        _send_telegram_request(url, payload, timeout)
         logger.info("Telegram notification sent")
         return True
     except requests.RequestException as e:
         logger.warning(f"Failed to send Telegram notification: {e}")
         return False
+
+
+@retry(**TELEGRAM_RETRY_CONFIG)
+def _send_telegram_request(url: str, payload: dict, timeout: int) -> None:
+    """Make a POST request to Telegram API with retry logic."""
+    response = requests.post(url, json=payload, timeout=timeout)
+    response.raise_for_status()
 
 
 def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
@@ -241,9 +284,7 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
     }
 
     try:
-        response = requests.get(url, params=params, timeout=timeout)
-        response.raise_for_status()
-        data = response.json()
+        data = _fetch_weather_request(url, params, timeout)
 
         # Extract current weather
         if "current" not in data:
@@ -280,6 +321,14 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
 
     except requests.RequestException as e:
         raise WeatherAPIError(f"Failed to fetch weather data: {e}") from e
+
+
+@retry(**WEATHER_RETRY_CONFIG)
+def _fetch_weather_request(url: str, params: dict, timeout: int) -> dict:
+    """Make a GET request to weather API with retry logic."""
+    response = requests.get(url, params=params, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
 
 
 def calculate_sun_position(lat: float, lon: float, dt: datetime) -> dict:

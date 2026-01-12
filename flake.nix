@@ -18,6 +18,7 @@
           pvlib
           pandas
           pytz
+          tenacity
         ]);
 
         awning = pkgs.writeScriptBin "awning" ''

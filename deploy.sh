@@ -76,7 +76,7 @@ sshpass -e ssh "$SERVER" "mkdir -p ~/$REMOTE_DIR && [ -d ~/$REMOTE_DIR/venv ] ||
 
 # Install Python dependencies
 echo "Installing Python dependencies..."
-sshpass -e ssh "$SERVER" "~/$REMOTE_DIR/venv/bin/pip install requests python-dotenv rich pvlib pandas pytz"
+sshpass -e ssh "$SERVER" "~/$REMOTE_DIR/venv/bin/pip install requests python-dotenv rich pvlib pandas pytz tenacity"
 
 # Copy Python scripts
 echo "Copying scripts..."
