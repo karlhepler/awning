@@ -12,7 +12,7 @@ Designed to run as a cron job or Kubernetes scheduled job.
 import logging
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -35,13 +35,107 @@ from awning_controller import (
     create_controller_from_env,
 )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+# Logger instance (configured by setup_logging())
 logger = logging.getLogger(__name__)
+
+
+def setup_logging(env_file: Optional[Path] = None) -> Path:
+    """
+    Configure logging with daily file rotation and symlink.
+
+    Creates log files in a 'logs' directory with daily rotation.
+    Also creates a symlink at ~/awning.log pointing to today's log.
+
+    Args:
+        env_file: Optional path to .env file (used to determine log directory)
+
+    Returns:
+        Path to today's log file
+    """
+    # Determine log directory (relative to env_file or .env location)
+    if env_file and env_file.exists():
+        base_dir = env_file.parent
+    else:
+        # When env_file not specified, search for .env in cwd then script dir
+        # Use the directory where .env is found for logs
+        cwd_env = Path.cwd() / ".env"
+        script_env = Path(__file__).parent / ".env"
+        if cwd_env.exists():
+            base_dir = Path.cwd()
+        elif script_env.exists():
+            base_dir = Path(__file__).parent
+        else:
+            # No .env found, default to cwd (avoids writing to Nix store)
+            base_dir = Path.cwd()
+
+    log_dir = base_dir / "logs"
+
+    # Create logs directory if needed
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate today's log filename
+    today = date.today().isoformat()  # YYYY-MM-DD, uses system timezone
+    log_filename = f"awning-{today}.log"
+    log_path = log_dir / log_filename
+
+    # Configure logging with both file and stdout handlers
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.FileHandler(log_path, encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
+
+    # Create/update symlink at ~/awning.log
+    symlink_path = Path.home() / "awning.log"
+    try:
+        if symlink_path.is_symlink():
+            # Existing symlink (possibly broken) - remove it
+            symlink_path.unlink()
+        elif symlink_path.exists():
+            # Regular file exists (first migration)
+            # Append existing content to today's log, then remove
+            with open(symlink_path, "r") as old, open(log_path, "a") as new:
+                content = old.read()
+                if content.strip():
+                    new.write(content)
+                    if not content.endswith("\n"):
+                        new.write("\n")
+            symlink_path.unlink()
+
+        # Create symlink pointing to today's log
+        symlink_path.symlink_to(log_path)
+    except OSError as e:
+        # Permission denied or other OS error - log warning but continue
+        logging.warning(f"Could not create symlink at ~/awning.log: {e}")
+
+    return log_path
+
+
+def cleanup_old_logs(log_dir: Path, retention_days: int = 30) -> None:
+    """
+    Delete log files older than retention_days.
+
+    Args:
+        log_dir: Directory containing log files
+        retention_days: Number of days to keep log files (default: 30)
+    """
+    cutoff = date.today() - timedelta(days=retention_days)
+
+    for log_file in log_dir.glob("awning-*.log"):
+        try:
+            # Extract date from filename: awning-YYYY-MM-DD.log
+            date_str = log_file.stem.replace("awning-", "")
+            log_date = date.fromisoformat(date_str)
+            if log_date < cutoff:
+                log_file.unlink()
+                logging.info(f"Deleted old log: {log_file.name}")
+        except (ValueError, OSError):
+            # Invalid filename format or permission error - skip
+            pass
 
 # Retry configuration for Weather API
 # Retries transient network errors with exponential backoff (2s, 4s, 8s)
@@ -508,6 +602,9 @@ def main() -> None:
             env_file = Path(arg.split("=", 1)[1]).expanduser()
             break
 
+    # Setup logging with daily rotation (must happen before any logger calls)
+    log_path = setup_logging(env_file)
+
     if dry_run:
         logger.info("Running in DRY-RUN mode (no awning control)")
 
@@ -626,6 +723,10 @@ def main() -> None:
             send_telegram_notification(telegram_token, telegram_chat_id, msg)
 
         logger.info("Automation complete")
+
+        # Cleanup old log files
+        retention_days = int(os.environ.get("LOG_RETENTION_DAYS", "30"))
+        cleanup_old_logs(log_path.parent, retention_days)
 
     except ConfigurationError as e:
         logger.error(f"Configuration error: {e}")

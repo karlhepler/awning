@@ -129,10 +129,25 @@ python3 awning_automation.py --env-file=/path/to/.env
 - All actions logged to stdout (redirect to file in cron)
 
 **Logging:**
-- INFO level logs to stdout
+- INFO level logs to both file and stdout
 - Format: `YYYY-MM-DD HH:MM:SS - LEVEL - Message`
 - Logs all conditions with ✓/✗ symbols
 - Shows: weather, sun position, sunrise/sunset, decision rationale, current state, and actions taken
+- **Daily log rotation**: Logs stored in `logs/` directory as `awning-YYYY-MM-DD.log`
+- **Symlink**: `~/awning.log` always points to today's log file
+- **Auto-cleanup**: Old logs deleted after 30 days (configurable via `LOG_RETENTION_DAYS`)
+
+**Viewing logs:**
+```bash
+# View today's log (via symlink)
+tail -f ~/awning.log
+
+# View specific date's log
+cat ~/.config/awning/logs/awning-2026-01-18.log
+
+# List all log files
+ls -la ~/.config/awning/logs/
+```
 
 ## Deployment
 
@@ -158,7 +173,8 @@ This script:
 - Scripts: `~/.config/awning/awning_automation.py`, `awning_controller.py`
 - Config: `~/.config/awning/.env`
 - Venv: `~/.config/awning/venv/`
-- Logs: `~/awning.log`
+- Logs: `~/.config/awning/logs/awning-YYYY-MM-DD.log` (daily files)
+- Symlink: `~/awning.log` -> today's log file
 
 ## Development
 
@@ -203,6 +219,9 @@ nix build
 - `TELEGRAM_CHAT_ID` - Chat ID to send notifications to (get from @userinfobot)
 - Notifications are sent when awning opens/closes or on errors
 - Auto-enabled when both variables are set
+
+*For logging (optional):*
+- `LOG_RETENTION_DAYS` - Number of days to keep log files (default: 30)
 
 **Using the controller independently (without CLI):**
 ```python

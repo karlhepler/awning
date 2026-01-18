@@ -22,3 +22,6 @@ __pycache__/
 *$py.class
 *.so
 .Python
+
+# Logs
+logs/
