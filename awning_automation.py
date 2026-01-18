@@ -79,15 +79,28 @@ def setup_logging(env_file: Optional[Path] = None) -> Path:
     log_path = log_dir / log_filename
 
     # Configure logging with both file and stdout handlers
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
+    # Explicitly configure root logger to prevent duplicate handlers
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    # Clear any existing handlers to prevent duplicates
+    root_logger.handlers.clear()
+
+    # Create formatter
+    formatter = logging.Formatter(
+        fmt="%(asctime)s - %(levelname)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[
-            logging.FileHandler(log_path, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
     )
+
+    # Add file handler
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
+
+    # Add stdout handler
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    root_logger.addHandler(stream_handler)
 
     # Create/update symlink at ~/awning.log
     symlink_path = Path.home() / "awning.log"
