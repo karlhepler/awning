@@ -2,39 +2,57 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Quick Reference
+
+```bash
+# CLI commands
+nix run . -- open|close|stop|toggle|status|info
+
+# Weather automation
+nix run .#automation -- --dry-run
+nix run .#automation -- --env-file=/path/to/.env
+
+# Development shell
+nix develop
+python3 awning.py open
+python3 awning_automation.py --dry-run
+
+# Deploy to Orange Pi
+./deploy.sh
+```
+
 ## Project Overview
 
 Bond Bridge awning controller - sends HTTP commands to control a motorized awning via the Bond Local API v2. Written in Python 3 with Nix flakes for reproducible dependency management.
 
 ## Architecture
 
-The project is organized into two main modules:
-
 **Core Domain (`awning_controller.py`):**
 - `BondAwningController` class - Core business logic for awning control
-- `load_config()` - Loads configuration from environment variables
 - `create_controller_from_env()` - Factory function to create controller from env
 - Custom exceptions: `ConfigurationError`, `BondAPIError`
-- No dependencies on CLI libraries (rich, etc.) - can be used independently
+- No dependencies on CLI libraries - can be used independently
 - All methods raise exceptions instead of printing/exiting
 
 **CLI Interface (`awning.py`):**
 - `AwningCLI` class - Handles user-facing command execution
-- `show_help()` - Displays rich-formatted help
-- `main()` - Entry point with argument parsing
-- Catches exceptions from controller and displays user-friendly error messages
 - Uses `rich` library for colorful output
+- Catches exceptions from controller and displays user-friendly error messages
+
+**Weather Automation (`awning_automation.py`):**
+- Automatically opens/closes awning based on weather and sun conditions
+- Uses Open-Meteo API (free, no API key) for weather data
+- Uses pvlib for solar position calculations (NREL SPA algorithm)
+- Imports `awning_controller` for awning control
 
 **Configuration Loading:**
-- `.env` file is loaded from current working directory first, then falls back to script directory
+- `.env` file loaded from current working directory first, then script directory
 - This allows `nix run . -- <command>` to work correctly from the project directory
-- Bond Bridge IP specified via `BOND_HOST` environment variable (requires DHCP reservation for stability)
-- Configuration errors raise `ConfigurationError` instead of calling `sys.exit()`
 
 **Command Flow:**
-1. CLI parses command-line arguments (simple manual parsing, no argparse)
-2. Create controller via `create_controller_from_env()` (handles config loading)
-3. CLI calls controller method (open/close/stop/toggle/get_state/get_info)
+1. CLI parses arguments (simple manual parsing, no argparse)
+2. Create controller via `create_controller_from_env()`
+3. CLI calls controller method
 4. Controller sends HTTP request to Bond API
 5. CLI catches exceptions and displays formatted output
 
@@ -46,219 +64,64 @@ The project is organized into two main modules:
 
 ## Weather Automation
 
-**Automation Script (`awning_automation.py`):**
-- Automatically opens/closes awning based on comprehensive weather and sun conditions
-- Designed to run as a cron job or Kubernetes scheduled job
-- Uses Open-Meteo API (free, no API key required) for weather data
-- Uses pvlib for solar position calculations
-- Imports `awning_controller` for awning control
+**Decision Logic (ALL 7 conditions must be met to open):**
+1. **Clear sky**: Cloud cover <= `MAX_CLOUD_COVER_PERCENT`
+2. **Calm**: Wind speed < `WIND_SPEED_THRESHOLD_MPH`
+3. **No rain**: Precipitation = 0 mm/h
+4. **Above freezing**: Temperature > 32°F
+5. **Daytime**: Between sunrise and sunset
+6. **Sun high enough**: Altitude >= `MIN_SUN_ALTITUDE_DEG`
+7. **Sun facing SE**: Azimuth 90°-180° (hardcoded for SE window)
 
-**Decision Logic (ALL 7 conditions must be met):**
-1. **Clear sky**: Cloud cover <= threshold (configurable, e.g., 10%)
-2. **Calm**: Wind speed < threshold (configurable, default 10 mph)
-3. **No rain**: Precipitation = 0 mm/h (hardcoded)
-4. **Above freezing**: Temperature > 32°F (hardcoded)
-5. **Daytime**: Current time between sunrise and sunset (from weather API)
-6. **Sun high enough**: Sun altitude >= threshold (configurable, default 15°, accounts for trees)
-7. **Sun facing SE**: Sun azimuth 90°-180° (East to South, hardcoded for SE window)
-
-- **Opens awning if**: ALL 7 conditions are True
-- **Closes awning if**: ANY condition is False
-- Checks current awning state before acting (only sends command if state needs to change)
-- Fail-safe: Closes awning if weather API is unavailable
-
-**Configuration (add to .env):**
-- `LATITUDE` - Latitude for weather location (required, e.g., 37.7749)
-- `LONGITUDE` - Longitude for weather location (required, e.g., -122.4194)
-- `MAX_CLOUD_COVER_PERCENT` - Maximum cloud cover percentage for "clear sky" (required, e.g., 10)
-- `MIN_SUN_ALTITUDE_DEG` - Minimum sun altitude in degrees (required, e.g., 15)
-- `WIND_SPEED_THRESHOLD_MPH` - Wind speed threshold in mph (required, e.g., 10)
-
-**Running automation:**
-```bash
-# Via Nix (recommended)
-nix run .#automation
-
-# Dry-run mode (test without controlling awning)
-nix run .#automation -- --dry-run
-
-# Specify .env file location (useful for cron jobs)
-nix run .#automation -- --env-file=/path/to/awning/.env
-
-# Both flags together
-nix run .#automation -- --env-file=/path/to/awning/.env --dry-run
-
-# Development shell
-nix develop
-python3 awning_automation.py
-python3 awning_automation.py --dry-run
-python3 awning_automation.py --env-file=/path/to/.env
-```
-
-**Example cron job:**
-```bash
-# Create logs directory first: mkdir -p ~/logs
-
-# Run every 15 minutes with explicit .env path (recommended for cron)
-*/15 * * * * nix run /Users/YOUR_USERNAME/path/to/awning#automation -- --env-file=/Users/YOUR_USERNAME/path/to/awning/.env >> ~/logs/awning-automation.log 2>&1
-
-# Alternative: Change to project directory first (auto-finds .env)
-*/15 * * * * cd /Users/YOUR_USERNAME/path/to/awning && nix run .#automation >> ~/logs/awning-automation.log 2>&1
-
-# Note: No need to restrict cron to daylight hours - the automation
-# checks sunrise/sunset internally and will only act during daytime
-```
-
-**Weather API:**
-- Uses Open-Meteo Forecast API: `https://api.open-meteo.com/v1/forecast`
-- Fetches current: cloud cover (%), wind speed (mph), precipitation (mm/h), temperature, is_day
-- Fetches daily: sunrise and sunset times
-- 10-second timeout on requests
-- No API key required for non-commercial use
-
-**Solar Position:**
-- Uses pvlib library with NREL SPA algorithm
-- Calculates sun azimuth and altitude for current location and time
-- Azimuth convention: 0°=North, 90°=East, 180°=South, 270°=West
-- Southeast window requires azimuth 90°-180°
-
-**Error Handling:**
-- Weather API failures: Closes awning as fail-safe
-- Awning API failures: Logs error and exits
-- Missing environment variables: Clear error messages
-- All actions logged to stdout (redirect to file in cron)
+If ANY condition fails, the awning closes. Fail-safe: closes awning if weather API is unavailable.
 
 **Logging:**
-- INFO level logs to both file and stdout
-- Format: `YYYY-MM-DD HH:MM:SS - LEVEL - Message`
-- Logs all conditions with ✓/✗ symbols
-- Shows: weather, sun position, sunrise/sunset, decision rationale, current state, and actions taken
-- **Daily log rotation**: Logs stored in `logs/` directory as `awning-YYYY-MM-DD.log`
-- **Symlink**: `~/awning.log` always points to today's log file
-- **Auto-cleanup**: Old logs deleted after 30 days (configurable via `LOG_RETENTION_DAYS`)
-
-**Viewing logs:**
-```bash
-# View today's log (via symlink)
-tail -f ~/awning.log
-
-# View specific date's log
-cat ~/.config/awning/logs/awning-2026-01-18.log
-
-# List all log files
-ls -la ~/.config/awning/logs/
-```
+- Daily log rotation in `logs/` directory as `awning-YYYY-MM-DD.log`
+- Symlink at `~/awning.log` always points to today's log
+- Auto-cleanup after 30 days (configurable via `LOG_RETENTION_DAYS`)
+- View logs: `tail -f ~/awning.log`
 
 ## Deployment
 
-**Target:** Orange Pi 3 LTS running Debian (user: `karlhepler@orangepi3-lts`)
+**Target:** Orange Pi 3 LTS running Debian (`karlhepler@orangepi3-lts`)
 
 **Deploy script (`deploy.sh`):**
-```bash
-./deploy.sh
-```
-
-This script:
 1. Discovers Bond Bridge IP via mDNS (using `BOND_ID` from `.env`)
-2. Updates `BOND_HOST` in local `.env` if discovered
-3. Sends Telegram notification (deploy start)
-4. Creates Python venv on remote if needed
-5. Installs dependencies via pip
-6. Copies scripts and `.env` to `~/.config/awning/`
-7. Configures cron job (every 15 minutes)
-8. Runs dry-run verification
-9. Sends Telegram notification (deploy complete with version SHA)
+2. Sends Telegram notification (deploy start)
+3. Creates Python venv on remote if needed
+4. Installs dependencies via pip
+5. Copies scripts and `.env` to `~/.config/awning/`
+6. Configures cron job (every 15 minutes)
+7. Runs dry-run verification
+8. Sends Telegram notification (deploy complete)
 
 **Remote structure:**
 - Scripts: `~/.config/awning/awning_automation.py`, `awning_controller.py`
 - Config: `~/.config/awning/.env`
 - Venv: `~/.config/awning/venv/`
-- Logs: `~/.config/awning/logs/awning-YYYY-MM-DD.log` (daily files)
+- Logs: `~/.config/awning/logs/awning-YYYY-MM-DD.log`
 - Symlink: `~/awning.log` -> today's log file
 
-## Development
+## Environment Variables
 
-**Running commands:**
-```bash
-# Via Nix (recommended)
-nix run . -- open
-nix run . -- status
+See `.env.example` for full documentation. Key variables:
 
-# Development shell
-nix develop
-python3 awning.py open
+**Required for CLI:**
+- `BOND_TOKEN` - Bond Bridge auth token
+- `BOND_HOST` - Bond Bridge IP address (set up DHCP reservation)
+- `DEVICE_ID` - Device ID for the awning
 
-# Build and install
-nix build
-./result/bin/awning status
-```
+**Required for automation:**
+- `LATITUDE`, `LONGITUDE` - Location for weather/sun calculations
+- `MAX_CLOUD_COVER_PERCENT`, `MIN_SUN_ALTITUDE_DEG`, `WIND_SPEED_THRESHOLD_MPH`
 
-**Available commands:** `open`, `close`, `stop`, `toggle`, `status`, `info`
-
-**Dependencies:**
-- Python 3 with: `requests`, `python-dotenv`, `rich`, `pvlib`, `pandas`, `pytz`
-- Managed via Nix flake (see `flake.nix`)
-- `pvlib` and `pandas` are used for solar position calculations in automation
-
-**Environment setup (.env file):**
-
-*For basic awning control:*
-- `BOND_TOKEN` - Bond Bridge auth token (required) - get from Bond Home app → Settings
-- `BOND_HOST` - Bond Bridge IP address (required) - set up DHCP reservation in your router
-- `DEVICE_ID` - Device ID for the awning (required)
-
-*For weather automation (in addition to above):*
-- `LATITUDE` - Latitude for weather location (required, e.g., 37.7749)
-- `LONGITUDE` - Longitude for weather location (required, e.g., -122.4194)
-- `MAX_CLOUD_COVER_PERCENT` - Maximum cloud cover percentage for "clear sky" (required, e.g., 10)
-- `MIN_SUN_ALTITUDE_DEG` - Minimum sun altitude in degrees (required, e.g., 15)
-- `WIND_SPEED_THRESHOLD_MPH` - Wind speed threshold in mph (required, e.g., 10)
-
-*For Telegram notifications (optional):*
-- `TELEGRAM_BOT_TOKEN` - Bot token from @BotFather on Telegram
-- `TELEGRAM_CHAT_ID` - Chat ID to send notifications to (get from @userinfobot)
-- Notifications are sent when awning opens/closes or on errors
-- Auto-enabled when both variables are set
-
-*For logging (optional):*
-- `LOG_RETENTION_DAYS` - Number of days to keep log files (default: 30)
-
-**Using the controller independently (without CLI):**
-```python
-from awning_controller import BondAwningController, create_controller_from_env
-
-# Option 1: Create from environment variables
-controller = create_controller_from_env()
-
-# Option 2: Create manually (with IP address)
-controller = BondAwningController(
-    bond_host="192.168.1.100",
-    bond_token="your_token",
-    device_id="device_id_here"
-)
-
-# Use the controller
-controller.open()
-state = controller.get_state()  # Returns 1 (open) or 0 (closed)
-info = controller.get_info()    # Returns dict with device info
-```
+**Optional:**
+- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` - For notifications
+- `LOG_RETENTION_DAYS` - Days to keep logs (default: 30)
+- `BOND_ID` - For mDNS discovery in deploy.sh
 
 ## UI/UX Guidelines
 
-The CLI uses `rich` for colorful, human-friendly output:
 - Emojis inline with text (not in separate table columns - avoids alignment issues)
 - Color scheme: cyan (actions), green (success), red (errors), yellow (warnings)
-- Custom `show_help()` function (not argparse) displays table of commands
-- Error handling: catch exceptions in CLI, display formatted messages, exit with code 1
-- **Info command:** Controller returns raw JSON dict, CLI formats it as human-readable table
-  - Common fields (name, type, location, etc.) shown first with friendly labels
-  - Lists displayed as comma-separated values
-  - Dicts show item count
-  - Unknown fields auto-formatted with title-cased labels
-
-## Security
-
-- Never log or print `BOND_TOKEN`
-- HTTP requests have 10-second timeouts
-- All environment variables are stripped of whitespace
-- Input validation on commands (limited to predefined set)
+- Controller returns raw data, CLI formats it for display

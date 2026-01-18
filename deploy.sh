@@ -103,10 +103,11 @@ LOG_FILE="\$HOME/.config/awning/logs/awning-$TODAY.log"
 sshpass -e ssh "$SERVER" "echo '' >> $LOG_FILE && echo '$(date '+%Y-%m-%d %H:%M:%S') - INFO - 🚀 Deploy started (version: $VERSION)' >> $LOG_FILE"
 
 # Configure cron (removes existing awning entry first)
-# Output redirected to dated log file; Python also writes to same file via FileHandler
+# Python FileHandler writes to log file directly; discard stdout to avoid duplicates
+# Only capture stderr for Python startup errors
 # Note: % in cron must be escaped as \%
 echo "Configuring cron job..."
-CRON_CMD='*/15 * * * * $HOME/.config/awning/venv/bin/python $HOME/.config/awning/awning_automation.py --env-file=$HOME/.config/awning/.env >> $HOME/.config/awning/logs/awning-$(date +\%Y-\%m-\%d).log 2>&1'
+CRON_CMD='*/15 * * * * $HOME/.config/awning/venv/bin/python $HOME/.config/awning/awning_automation.py --env-file=$HOME/.config/awning/.env >/dev/null 2>> $HOME/.config/awning/logs/awning-$(date +\%Y-\%m-\%d).log'
 sshpass -e ssh "$SERVER" "(crontab -l 2>/dev/null | grep -v 'awning_automation'; echo '$CRON_CMD') | crontab -"
 
 # Verify deployment
