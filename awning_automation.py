@@ -78,27 +78,18 @@ def setup_logging(env_file: Optional[Path] = None) -> Path:
     log_filename = f"awning-{today}.log"
     log_path = log_dir / log_filename
 
-    # Configure logging with both file and stdout handlers
-    # Explicitly configure root logger to prevent duplicate handlers
+    # Configure logging to stderr only (cron redirects to file)
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
-
-    # Clear any existing handlers to prevent duplicates
     root_logger.handlers.clear()
 
-    # Create formatter
     formatter = logging.Formatter(
         fmt="%(asctime)s - %(levelname)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # Add file handler
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    root_logger.addHandler(file_handler)
-
-    # Add stdout handler
-    stream_handler = logging.StreamHandler()
+    # Only stderr handler - cron redirects to log file
+    stream_handler = logging.StreamHandler()  # defaults to stderr
     stream_handler.setFormatter(formatter)
     root_logger.addHandler(stream_handler)
 
