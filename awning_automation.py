@@ -249,7 +249,7 @@ def get_thresholds() -> tuple[float, float, float]:
     Get weather thresholds from environment variables.
 
     Returns:
-        Tuple of (wind_speed_threshold_mph, min_sun_altitude, max_cloud_cover)
+        Tuple of (wind_speed_threshold_mph, min_sun_altitude, min_dni)
 
     Raises:
         ConfigurationError: If threshold variables are missing or invalid
@@ -270,19 +270,19 @@ def get_thresholds() -> tuple[float, float, float]:
             "Please add it to your .env file (e.g., MIN_SUN_ALTITUDE_DEG=20)"
         )
 
-    # Get maximum cloud cover threshold
-    cloud_str = os.getenv("MAX_CLOUD_COVER_PERCENT", "").strip()
-    if not cloud_str:
+    # Get minimum direct normal irradiance threshold
+    dni_str = os.getenv("MIN_DIRECT_IRRADIANCE_WM2", "").strip()
+    if not dni_str:
         raise ConfigurationError(
-            "MAX_CLOUD_COVER_PERCENT environment variable is not set. "
-            "Please add it to your .env file (e.g., MAX_CLOUD_COVER_PERCENT=5)"
+            "MIN_DIRECT_IRRADIANCE_WM2 environment variable is not set. "
+            "Please add it to your .env file (e.g., MIN_DIRECT_IRRADIANCE_WM2=300)"
         )
 
     # Parse as numbers
     try:
         wind_threshold = float(wind_str)
         altitude_threshold = float(altitude_str)
-        cloud_threshold = float(cloud_str)
+        dni_threshold = float(dni_str)
     except ValueError as e:
         raise ConfigurationError(
             f"Invalid threshold format: {e}. Must be numbers."
@@ -297,12 +297,12 @@ def get_thresholds() -> tuple[float, float, float]:
         raise ConfigurationError(
             f"MIN_SUN_ALTITUDE_DEG must be between 0 and 90, got: {altitude_threshold}"
         )
-    if not (0 <= cloud_threshold <= 100):
+    if dni_threshold < 0:
         raise ConfigurationError(
-            f"MAX_CLOUD_COVER_PERCENT must be between 0 and 100, got: {cloud_threshold}"
+            f"MIN_DIRECT_IRRADIANCE_WM2 must be non-negative, got: {dni_threshold}"
         )
 
-    return wind_threshold, altitude_threshold, cloud_threshold
+    return wind_threshold, altitude_threshold, dni_threshold
 
 
 def load_telegram_config() -> tuple[Optional[str], Optional[str]]:
@@ -373,7 +373,7 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
     params = {
         "latitude": lat,
         "longitude": lon,
-        "current": "wind_speed_10m,precipitation,is_day,temperature_2m,cloud_cover",
+        "current": "wind_speed_10m,precipitation,is_day,temperature_2m,direct_normal_irradiance,cloud_cover_low,cloud_cover_mid,cloud_cover_high",
         "daily": "sunrise,sunset",
         "wind_speed_unit": "mph",
         "temperature_unit": "fahrenheit",
@@ -389,7 +389,7 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
             raise WeatherAPIError("Weather API response missing 'current' field")
 
         current = data["current"]
-        required_fields = ["wind_speed_10m", "precipitation", "temperature_2m", "cloud_cover"]
+        required_fields = ["wind_speed_10m", "precipitation", "temperature_2m", "direct_normal_irradiance"]
         for field in required_fields:
             if field not in current:
                 raise WeatherAPIError(
@@ -410,7 +410,10 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
             "wind_speed_10m": current["wind_speed_10m"],
             "precipitation": current["precipitation"],
             "temperature": current["temperature_2m"],
-            "cloud_cover": current["cloud_cover"],
+            "dni": current["direct_normal_irradiance"],
+            "cloud_cover_low": current.get("cloud_cover_low", 0),
+            "cloud_cover_mid": current.get("cloud_cover_mid", 0),
+            "cloud_cover_high": current.get("cloud_cover_high", 0),
             "is_day": current.get("is_day", 1),
             "time": current.get("time", "unknown"),
             "sunrise": daily["sunrise"][0],
@@ -510,7 +513,7 @@ def should_open_awning(
     current_time: datetime,
     wind_threshold: float,
     altitude_threshold: float,
-    cloud_threshold: float,
+    dni_threshold: float,
 ) -> tuple[bool, str, dict]:
     """
     Determine if awning should be open based on ALL conditions.
@@ -521,7 +524,7 @@ def should_open_awning(
         current_time: Current datetime
         wind_threshold: Maximum wind speed (mph) for "calm"
         altitude_threshold: Minimum sun altitude (degrees) above horizon
-        cloud_threshold: Maximum cloud cover percentage for "clear"
+        dni_threshold: Minimum direct normal irradiance (W/m²) for "sunny"
 
     Returns:
         Tuple of (should_open, reason, conditions_dict)
@@ -530,7 +533,7 @@ def should_open_awning(
     wind_speed = weather["wind_speed_10m"]
     precipitation = weather["precipitation"]
     temperature = weather["temperature"]
-    cloud_cover = weather["cloud_cover"]
+    dni = weather["dni"]
     sunrise = weather["sunrise"]
     sunset = weather["sunset"]
 
@@ -539,7 +542,7 @@ def should_open_awning(
     altitude = sun_position["altitude"]
 
     # Evaluate each condition
-    is_clear = cloud_cover <= cloud_threshold
+    is_sunny = dni >= dni_threshold
     is_calm = wind_speed < wind_threshold
     no_rain = precipitation == 0
     above_freezing = temperature > 32
@@ -549,7 +552,7 @@ def should_open_awning(
 
     # Build conditions dict for logging
     conditions = {
-        "clear": is_clear,
+        "sunny": is_sunny,
         "calm": is_calm,
         "no_rain": no_rain,
         "above_freezing": above_freezing,
@@ -563,8 +566,8 @@ def should_open_awning(
 
     # Build detailed reason string
     reasons = []
-    if not is_clear:
-        reasons.append(f"Too cloudy ({cloud_cover}% > {cloud_threshold}%)")
+    if not is_sunny:
+        reasons.append(f"Not sunny (DNI {dni:.0f} < {dni_threshold:.0f} W/m²)")
     if not is_calm:
         reasons.append(f"Too windy ({wind_speed} >= {wind_threshold} mph)")
     if not no_rain:
@@ -582,7 +585,7 @@ def should_open_awning(
 
     if should_open:
         reason = (
-            f"All conditions met: {cloud_cover}% clouds, {wind_speed} mph wind, "
+            f"All conditions met: DNI {dni:.0f} W/m², {wind_speed} mph wind, "
             f"{precipitation} mm/h rain, {temperature}°F, sun azimuth {azimuth:.1f}° (altitude {altitude:.1f}°)"
         )
     else:
@@ -624,9 +627,9 @@ def main() -> None:
         logger.info(f"Location: {latitude:.4f}, {longitude:.4f}")
 
         # Get thresholds
-        wind_threshold, altitude_threshold, cloud_threshold = get_thresholds()
+        wind_threshold, altitude_threshold, dni_threshold = get_thresholds()
         logger.info(
-            f"Thresholds: Clouds <= {cloud_threshold}%, Wind < {wind_threshold} mph, "
+            f"Thresholds: DNI >= {dni_threshold:.0f} W/m², Wind < {wind_threshold} mph, "
             f"Rain = 0 mm/h, Temp > 32°F, Sun altitude >= {altitude_threshold}°, Sun facing SE (90°-180°)"
         )
 
@@ -639,8 +642,12 @@ def main() -> None:
         logger.info("Fetching weather data...")
         weather = fetch_weather(latitude, longitude)
         logger.info(
-            f"Weather: {weather['cloud_cover']}% clouds, {weather['wind_speed_10m']} mph wind, "
+            f"Weather: DNI {weather['dni']:.0f} W/m², {weather['wind_speed_10m']} mph wind, "
             f"{weather['precipitation']} mm/h rain, {weather['temperature']}°F (at {weather['time']})"
+        )
+        logger.info(
+            f"Cloud layers: Low {weather['cloud_cover_low']}%, Mid {weather['cloud_cover_mid']}%, "
+            f"High {weather['cloud_cover_high']}%"
         )
 
         # Get current time from weather API (same timezone as sunrise/sunset)
@@ -668,12 +675,12 @@ def main() -> None:
             current_time,
             wind_threshold,
             altitude_threshold,
-            cloud_threshold,
+            dni_threshold,
         )
 
         # Log conditions with checkmarks/crosses
         condition_symbols = {
-            "clear": "Clear" if conditions["clear"] else "Cloudy",
+            "sunny": "Sunny" if conditions["sunny"] else "Not sunny",
             "calm": "Calm" if conditions["calm"] else "Windy",
             "no_rain": "No rain" if conditions["no_rain"] else "Rain",
             "above_freezing": "Above freezing" if conditions["above_freezing"] else "Freezing",
@@ -719,7 +726,7 @@ def main() -> None:
             if should_open:
                 msg = (
                     f"☀️ Awning OPENED\n"
-                    f"Weather: {weather['cloud_cover']}% clouds, {weather['wind_speed_10m']} mph wind\n"
+                    f"Weather: DNI {weather['dni']:.0f} W/m², {weather['wind_speed_10m']} mph wind\n"
                     f"Sun: {sun_position['azimuth']:.0f}° azimuth, {sun_position['altitude']:.0f}° altitude"
                 )
             else:

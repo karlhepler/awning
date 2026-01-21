@@ -65,7 +65,7 @@ Bond Bridge awning controller - sends HTTP commands to control a motorized awnin
 ## Weather Automation
 
 **Decision Logic (ALL 7 conditions must be met to open):**
-1. **Clear sky**: Cloud cover <= `MAX_CLOUD_COVER_PERCENT`
+1. **Sunny**: DNI >= `MIN_DIRECT_IRRADIANCE_WM2` (direct normal irradiance in W/m²)
 2. **Calm**: Wind speed < `WIND_SPEED_THRESHOLD_MPH`
 3. **No rain**: Precipitation = 0 mm/h
 4. **Above freezing**: Temperature > 32°F
@@ -113,7 +113,7 @@ See `.env.example` for full documentation. Key variables:
 
 **Required for automation:**
 - `LATITUDE`, `LONGITUDE` - Location for weather/sun calculations
-- `MAX_CLOUD_COVER_PERCENT`, `MIN_SUN_ALTITUDE_DEG`, `WIND_SPEED_THRESHOLD_MPH`
+- `MIN_DIRECT_IRRADIANCE_WM2`, `MIN_SUN_ALTITUDE_DEG`, `WIND_SPEED_THRESHOLD_MPH`
 
 **Optional:**
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` - For notifications
