@@ -244,12 +244,12 @@ def load_location_config(env_file: Optional[Path] = None) -> tuple[float, float]
     return latitude, longitude
 
 
-def get_thresholds() -> tuple[float, float, float]:
+def get_thresholds() -> tuple[float, float, float, float]:
     """
     Get weather thresholds from environment variables.
 
     Returns:
-        Tuple of (wind_speed_threshold_mph, min_sun_altitude, min_dni)
+        Tuple of (wind_speed_threshold_mph, min_sun_altitude, min_dni, max_cloud_cover)
 
     Raises:
         ConfigurationError: If threshold variables are missing or invalid
@@ -302,7 +302,20 @@ def get_thresholds() -> tuple[float, float, float]:
             f"MIN_DIRECT_IRRADIANCE_WM2 must be non-negative, got: {dni_threshold}"
         )
 
-    return wind_threshold, altitude_threshold, dni_threshold
+    # Get maximum cloud cover threshold (optional, defaults to 50%)
+    cloud_str = os.getenv("MAX_CLOUD_COVER_PERCENT", "50").strip()
+    try:
+        cloud_threshold = float(cloud_str)
+    except ValueError as e:
+        raise ConfigurationError(
+            f"Invalid MAX_CLOUD_COVER_PERCENT format: {e}. Must be a number."
+        ) from e
+    if not (0 <= cloud_threshold <= 100):
+        raise ConfigurationError(
+            f"MAX_CLOUD_COVER_PERCENT must be between 0 and 100, got: {cloud_threshold}"
+        )
+
+    return wind_threshold, altitude_threshold, dni_threshold, cloud_threshold
 
 
 def load_telegram_config() -> tuple[Optional[str], Optional[str]]:
@@ -514,6 +527,7 @@ def should_open_awning(
     wind_threshold: float,
     altitude_threshold: float,
     dni_threshold: float,
+    cloud_threshold: float,
 ) -> tuple[bool, str, dict]:
     """
     Determine if awning should be open based on ALL conditions.
@@ -525,6 +539,7 @@ def should_open_awning(
         wind_threshold: Maximum wind speed (mph) for "calm"
         altitude_threshold: Minimum sun altitude (degrees) above horizon
         dni_threshold: Minimum direct normal irradiance (W/m²) for "sunny"
+        cloud_threshold: Maximum low cloud cover (%) for "sunny"
 
     Returns:
         Tuple of (should_open, reason, conditions_dict)
@@ -534,6 +549,7 @@ def should_open_awning(
     precipitation = weather["precipitation"]
     temperature = weather["temperature"]
     dni = weather["dni"]
+    cloud_cover_low = weather["cloud_cover_low"]
     sunrise = weather["sunrise"]
     sunset = weather["sunset"]
 
@@ -542,7 +558,8 @@ def should_open_awning(
     altitude = sun_position["altitude"]
 
     # Evaluate each condition
-    is_sunny = dni >= dni_threshold
+    # Sunny requires BOTH high DNI AND low cloud cover (sanity check for unreliable DNI)
+    is_sunny = dni >= dni_threshold and cloud_cover_low < cloud_threshold
     is_calm = wind_speed < wind_threshold
     no_rain = precipitation == 0
     above_freezing = temperature > 32
@@ -567,7 +584,10 @@ def should_open_awning(
     # Build detailed reason string
     reasons = []
     if not is_sunny:
-        reasons.append(f"Not sunny (DNI {dni:.0f} < {dni_threshold:.0f} W/m²)")
+        if dni < dni_threshold:
+            reasons.append(f"Not sunny (DNI {dni:.0f} < {dni_threshold:.0f} W/m²)")
+        if cloud_cover_low >= cloud_threshold:
+            reasons.append(f"Too cloudy ({cloud_cover_low:.0f}% >= {cloud_threshold:.0f}% clouds)")
     if not is_calm:
         reasons.append(f"Too windy ({wind_speed} >= {wind_threshold} mph)")
     if not no_rain:
@@ -585,13 +605,67 @@ def should_open_awning(
 
     if should_open:
         reason = (
-            f"All conditions met: DNI {dni:.0f} W/m², {wind_speed} mph wind, "
+            f"All conditions met: DNI {dni:.0f} W/m², low clouds {cloud_cover_low:.0f}%, {wind_speed} mph wind, "
             f"{precipitation} mm/h rain, {temperature}°F, sun azimuth {azimuth:.1f}° (altitude {altitude:.1f}°)"
         )
     else:
         reason = ", ".join(reasons)
 
     return should_open, reason, conditions
+
+
+def _format_friendly_telegram_message(
+    should_open: bool,
+    conditions: dict,
+    wind_speed: float,
+    precipitation: float,
+    temperature: float,
+) -> str:
+    """
+    Format a human-friendly Telegram notification message.
+
+    Args:
+        should_open: Whether awning should be open
+        conditions: Dictionary of condition flags
+        wind_speed: Wind speed in mph
+        precipitation: Precipitation in mm/h
+        temperature: Temperature in F
+
+    Returns:
+        Friendly message string with appropriate emoji
+    """
+    if should_open:
+        # Opening message - simple and positive
+        temp_f = int(round(temperature))
+        wind_mph = int(round(wind_speed))
+        return f"☀️ Awning opened - sunny & calm ({temp_f}°F, {wind_mph} mph wind)"
+
+    # Closing message - determine primary reason and emoji
+    # Priority: rain > wind > cold > cloudy > nighttime > sun position
+
+    if not conditions["no_rain"]:
+        precip = round(precipitation, 1)
+        return f"🌧️ Awning closed: Rain starting ({precip} mm/h)"
+
+    if not conditions["calm"]:
+        wind_mph = int(round(wind_speed))
+        return f"💨 Awning closed: Too windy ({wind_mph} mph)"
+
+    if not conditions["above_freezing"]:
+        temp_f = int(round(temperature))
+        return f"❄️ Awning closed: Too cold ({temp_f}°F)"
+
+    if not conditions["sunny"]:
+        return "☁️ Awning closed: Cloudy"
+
+    if not conditions["daytime"]:
+        return "🌙 Awning closed: Nighttime"
+
+    if not conditions["sun_high"] or not conditions["sun_facing_se"]:
+        return "🌅 Awning closed: Sun moved past window"
+
+    # Fallback (shouldn't happen)
+    return "🌙 Awning closed: Conditions changed"
 
 
 def main() -> None:
@@ -627,10 +701,11 @@ def main() -> None:
         logger.info(f"Location: {latitude:.4f}, {longitude:.4f}")
 
         # Get thresholds
-        wind_threshold, altitude_threshold, dni_threshold = get_thresholds()
+        wind_threshold, altitude_threshold, dni_threshold, cloud_threshold = get_thresholds()
         logger.info(
-            f"Thresholds: DNI >= {dni_threshold:.0f} W/m², Wind < {wind_threshold} mph, "
-            f"Rain = 0 mm/h, Temp > 32°F, Sun altitude >= {altitude_threshold}°, Sun facing SE (90°-180°)"
+            f"Thresholds: DNI >= {dni_threshold:.0f} W/m², Clouds < {cloud_threshold:.0f}%, "
+            f"Wind < {wind_threshold} mph, Rain = 0 mm/h, Temp > 32°F, "
+            f"Sun altitude >= {altitude_threshold}°, Sun facing SE (90°-180°)"
         )
 
         # Load Telegram config (optional)
@@ -676,6 +751,7 @@ def main() -> None:
             wind_threshold,
             altitude_threshold,
             dni_threshold,
+            cloud_threshold,
         )
 
         # Log conditions with checkmarks/crosses
@@ -723,14 +799,13 @@ def main() -> None:
         # Get state after action and notify only if it changed
         state_after = controller.get_state()
         if telegram_token and state_before != state_after:
-            if should_open:
-                msg = (
-                    f"☀️ Awning OPENED\n"
-                    f"Weather: DNI {weather['dni']:.0f} W/m², {weather['wind_speed_10m']} mph wind\n"
-                    f"Sun: {sun_position['azimuth']:.0f}° azimuth, {sun_position['altitude']:.0f}° altitude"
-                )
-            else:
-                msg = f"🌙 Awning CLOSED\nReason: {reason}"
+            msg = _format_friendly_telegram_message(
+                should_open,
+                conditions,
+                weather["wind_speed_10m"],
+                weather["precipitation"],
+                weather["temperature"],
+            )
             send_telegram_notification(telegram_token, telegram_chat_id, msg)
 
         logger.info("Automation complete")
