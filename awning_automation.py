@@ -386,7 +386,7 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
     params = {
         "latitude": lat,
         "longitude": lon,
-        "current": "wind_speed_10m,precipitation,is_day,temperature_2m,direct_normal_irradiance,cloud_cover_low,cloud_cover_mid,cloud_cover_high",
+        "current": "wind_speed_10m,precipitation,is_day,temperature_2m,direct_normal_irradiance,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high",
         "daily": "sunrise,sunset",
         "wind_speed_unit": "mph",
         "temperature_unit": "fahrenheit",
@@ -424,9 +424,10 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
             "precipitation": current["precipitation"],
             "temperature": current["temperature_2m"],
             "dni": current["direct_normal_irradiance"],
-            "cloud_cover_low": current.get("cloud_cover_low", 0),
-            "cloud_cover_mid": current.get("cloud_cover_mid", 0),
-            "cloud_cover_high": current.get("cloud_cover_high", 0),
+            "cloud_cover": current.get("cloud_cover", 100),
+            "cloud_cover_low": current.get("cloud_cover_low", 100),
+            "cloud_cover_mid": current.get("cloud_cover_mid", 100),
+            "cloud_cover_high": current.get("cloud_cover_high", 100),
             "is_day": current.get("is_day", 1),
             "time": current.get("time", "unknown"),
             "sunrise": daily["sunrise"][0],
@@ -539,7 +540,7 @@ def should_open_awning(
         wind_threshold: Maximum wind speed (mph) for "calm"
         altitude_threshold: Minimum sun altitude (degrees) above horizon
         dni_threshold: Minimum direct normal irradiance (W/m²) for "sunny"
-        cloud_threshold: Maximum low cloud cover (%) for "sunny"
+        cloud_threshold: Maximum cloud cover (%) for "sunny"
 
     Returns:
         Tuple of (should_open, reason, conditions_dict)
@@ -549,6 +550,7 @@ def should_open_awning(
     precipitation = weather["precipitation"]
     temperature = weather["temperature"]
     dni = weather["dni"]
+    cloud_cover = weather["cloud_cover"]
     cloud_cover_low = weather["cloud_cover_low"]
     sunrise = weather["sunrise"]
     sunset = weather["sunset"]
@@ -558,8 +560,13 @@ def should_open_awning(
     altitude = sun_position["altitude"]
 
     # Evaluate each condition
-    # Sunny requires BOTH high DNI AND low cloud cover (sanity check for unreliable DNI)
-    is_sunny = dni >= dni_threshold and cloud_cover_low < cloud_threshold
+    # Sunny requires BOTH high DNI AND low cloud cover
+    # Conservative: Check BOTH total cloud_cover AND cloud_cover_low - if EITHER is too high, treat as cloudy
+    is_sunny = (
+        dni >= dni_threshold
+        and cloud_cover < cloud_threshold
+        and cloud_cover_low < cloud_threshold
+    )
     is_calm = wind_speed < wind_threshold
     no_rain = precipitation == 0
     above_freezing = temperature > 32
@@ -586,8 +593,10 @@ def should_open_awning(
     if not is_sunny:
         if dni < dni_threshold:
             reasons.append(f"Not sunny (DNI {dni:.0f} < {dni_threshold:.0f} W/m²)")
+        if cloud_cover >= cloud_threshold:
+            reasons.append(f"Too cloudy (total {cloud_cover:.0f}% >= {cloud_threshold:.0f}%)")
         if cloud_cover_low >= cloud_threshold:
-            reasons.append(f"Too cloudy ({cloud_cover_low:.0f}% >= {cloud_threshold:.0f}% clouds)")
+            reasons.append(f"Too cloudy (low {cloud_cover_low:.0f}% >= {cloud_threshold:.0f}%)")
     if not is_calm:
         reasons.append(f"Too windy ({wind_speed} >= {wind_threshold} mph)")
     if not no_rain:
@@ -605,8 +614,9 @@ def should_open_awning(
 
     if should_open:
         reason = (
-            f"All conditions met: DNI {dni:.0f} W/m², low clouds {cloud_cover_low:.0f}%, {wind_speed} mph wind, "
-            f"{precipitation} mm/h rain, {temperature}°F, sun azimuth {azimuth:.1f}° (altitude {altitude:.1f}°)"
+            f"All conditions met: DNI {dni:.0f} W/m², clouds {cloud_cover:.0f}% total/{cloud_cover_low:.0f}% low, "
+            f"{wind_speed} mph wind, {precipitation} mm/h rain, {temperature}°F, "
+            f"sun azimuth {azimuth:.1f}° (altitude {altitude:.1f}°)"
         )
     else:
         reason = ", ".join(reasons)
@@ -620,6 +630,8 @@ def _format_friendly_telegram_message(
     wind_speed: float,
     precipitation: float,
     temperature: float,
+    cloud_cover: float,
+    cloud_cover_low: float,
 ) -> str:
     """
     Format a human-friendly Telegram notification message.
@@ -630,6 +642,8 @@ def _format_friendly_telegram_message(
         wind_speed: Wind speed in mph
         precipitation: Precipitation in mm/h
         temperature: Temperature in F
+        cloud_cover: Total cloud cover percentage
+        cloud_cover_low: Low cloud cover percentage
 
     Returns:
         Friendly message string with appropriate emoji
@@ -656,7 +670,10 @@ def _format_friendly_telegram_message(
         return f"❄️ Awning closed: Too cold ({temp_f}°F)"
 
     if not conditions["sunny"]:
-        return "☁️ Awning closed: Cloudy"
+        # Include cloud cover details for cloudy closures
+        clouds_total = int(round(cloud_cover))
+        clouds_low = int(round(cloud_cover_low))
+        return f"☁️ Awning closed: Cloudy ({clouds_total}% total, {clouds_low}% low)"
 
     if not conditions["daytime"]:
         return "🌙 Awning closed: Nighttime"
@@ -721,8 +738,8 @@ def main() -> None:
             f"{weather['precipitation']} mm/h rain, {weather['temperature']}°F (at {weather['time']})"
         )
         logger.info(
-            f"Cloud layers: Low {weather['cloud_cover_low']}%, Mid {weather['cloud_cover_mid']}%, "
-            f"High {weather['cloud_cover_high']}%"
+            f"Cloud cover: Total {weather['cloud_cover']}%, Low {weather['cloud_cover_low']}%, "
+            f"Mid {weather['cloud_cover_mid']}%, High {weather['cloud_cover_high']}%"
         )
 
         # Get current time from weather API (same timezone as sunrise/sunset)
@@ -805,6 +822,8 @@ def main() -> None:
                 weather["wind_speed_10m"],
                 weather["precipitation"],
                 weather["temperature"],
+                weather["cloud_cover"],
+                weather["cloud_cover_low"],
             )
             send_telegram_notification(telegram_token, telegram_chat_id, msg)
 
