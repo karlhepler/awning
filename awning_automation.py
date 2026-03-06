@@ -3,7 +3,7 @@
 Awning Weather Automation
 
 Automatically opens/closes awning based on weather conditions.
-- Opens awning if: clear sky (cloud cover <= threshold) AND calm (wind < threshold) AND sun facing SE
+- Opens awning if: clear sky (cloud cover <= threshold) AND calm (wind < threshold) AND sun facing window (90°-220°)
 - Closes awning otherwise
 
 Designed to run as a cron job or Kubernetes scheduled job.
@@ -474,17 +474,17 @@ def calculate_sun_position(lat: float, lon: float, dt: datetime) -> dict:
     }
 
 
-def is_sun_facing_southeast(azimuth: float) -> bool:
+def is_sun_facing_window(azimuth: float) -> bool:
     """
-    Check if sun is facing southeast (between East and South).
+    Check if sun is facing the window (between East and Southwest).
 
     Args:
         azimuth: Sun azimuth in degrees (0=North, 90=East, 180=South, 270=West)
 
     Returns:
-        True if azimuth is between 90° (East) and 180° (South)
+        True if azimuth is between 90° (East) and 220° (Southwest)
     """
-    return 90 <= azimuth <= 180
+    return 90 <= azimuth <= 220
 
 
 def is_daytime(current_time: datetime, sunrise_str: str, sunset_str: str) -> bool:
@@ -572,7 +572,7 @@ def should_open_awning(
     above_freezing = temperature > 32
     is_day = is_daytime(current_time, sunrise, sunset)
     sun_high_enough = altitude >= altitude_threshold
-    sun_facing_se = is_sun_facing_southeast(azimuth)
+    sun_facing_se = is_sun_facing_window(azimuth)
 
     # Build conditions dict for logging
     conditions = {
@@ -582,7 +582,7 @@ def should_open_awning(
         "above_freezing": above_freezing,
         "daytime": is_day,
         "sun_high": sun_high_enough,
-        "sun_facing_se": sun_facing_se,
+        "sun_facing_window": sun_facing_se,
     }
 
     # All conditions must be True to open awning
@@ -610,7 +610,7 @@ def should_open_awning(
     if not sun_high_enough:
         reasons.append(f"Sun too low ({altitude:.1f}° < {altitude_threshold}°)")
     if not sun_facing_se:
-        reasons.append(f"Sun not facing SE (azimuth {azimuth:.1f}°, need 90°-180°)")
+        reasons.append(f"Sun not facing window (azimuth {azimuth:.1f}°, need 90°-220°)")
 
     if should_open:
         reason = (
@@ -678,7 +678,7 @@ def _format_friendly_telegram_message(
     if not conditions["daytime"]:
         return "🌙 Awning closed: Nighttime"
 
-    if not conditions["sun_high"] or not conditions["sun_facing_se"]:
+    if not conditions["sun_high"] or not conditions["sun_facing_window"]:
         return "🌅 Awning closed: Sun moved past window"
 
     # Fallback (shouldn't happen)
@@ -722,7 +722,7 @@ def main() -> None:
         logger.info(
             f"Thresholds: DNI >= {dni_threshold:.0f} W/m², Clouds < {cloud_threshold:.0f}%, "
             f"Wind < {wind_threshold} mph, Rain = 0 mm/h, Temp > 32°F, "
-            f"Sun altitude >= {altitude_threshold}°, Sun facing SE (90°-180°)"
+            f"Sun altitude >= {altitude_threshold}°, Sun facing window (90°-220°)"
         )
 
         # Load Telegram config (optional)
@@ -779,7 +779,7 @@ def main() -> None:
             "above_freezing": "Above freezing" if conditions["above_freezing"] else "Freezing",
             "daytime": "Daytime" if conditions["daytime"] else "Nighttime",
             "sun_high": "Sun high" if conditions["sun_high"] else "Sun low",
-            "sun_facing_se": "Sun facing SE" if conditions["sun_facing_se"] else "Sun not facing SE",
+            "sun_facing_window": "Sun facing window" if conditions["sun_facing_window"] else "Sun not facing window",
         }
         check_str = ", ".join(
             [f"{'✓' if v else '✗'} {condition_symbols[k]}" for k, v in conditions.items()]
