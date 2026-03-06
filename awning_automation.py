@@ -3,8 +3,15 @@
 Awning Weather Automation
 
 Automatically opens/closes awning based on weather conditions.
-- Opens awning if: clear sky (cloud cover <= threshold) AND calm (wind < threshold) AND sun facing window (90°-220°)
-- Closes awning otherwise
+- Opens awning if ALL 7 conditions are met: sunny, calm, no rain, above freezing,
+  daytime, sun high enough, and sun facing window (90°-220°)
+- Closes awning if ANY condition fails
+
+Sunshine detection uses cirrus-aware logic:
+- Normal mode: DNI >= MIN_DIRECT_IRRADIANCE_WM2 AND low clouds < MAX_LOW_CLOUD_PERCENT
+- Cirrus mode: When high clouds dominate (cloud_cover_high > CIRRUS_HIGH_CLOUD_THRESHOLD)
+  and low/mid clouds are minimal, a lower DNI threshold (MIN_DNI_CIRRUS_WM2) is used
+  so the awning stays open on thin high-cloud days but closes on genuinely overcast days.
 
 Designed to run as a cron job or Kubernetes scheduled job.
 """
@@ -244,12 +251,13 @@ def load_location_config(env_file: Optional[Path] = None) -> tuple[float, float]
     return latitude, longitude
 
 
-def get_thresholds() -> tuple[float, float, float, float]:
+def get_thresholds() -> tuple[float, float, float, float, float, float, float]:
     """
     Get weather thresholds from environment variables.
 
     Returns:
-        Tuple of (wind_speed_threshold_mph, min_sun_altitude, min_dni, max_cloud_cover)
+        Tuple of (wind_speed_threshold_mph, min_sun_altitude, min_dni,
+                  max_low_cloud, max_mid_cloud, cirrus_high_threshold, min_dni_cirrus)
 
     Raises:
         ConfigurationError: If threshold variables are missing or invalid
@@ -278,7 +286,7 @@ def get_thresholds() -> tuple[float, float, float, float]:
             "Please add it to your .env file (e.g., MIN_DIRECT_IRRADIANCE_WM2=300)"
         )
 
-    # Parse as numbers
+    # Parse required thresholds
     try:
         wind_threshold = float(wind_str)
         altitude_threshold = float(altitude_str)
@@ -288,7 +296,7 @@ def get_thresholds() -> tuple[float, float, float, float]:
             f"Invalid threshold format: {e}. Must be numbers."
         ) from e
 
-    # Validate ranges
+    # Validate required thresholds
     if wind_threshold < 0:
         raise ConfigurationError(
             f"WIND_SPEED_THRESHOLD_MPH must be positive, got: {wind_threshold}"
@@ -302,20 +310,59 @@ def get_thresholds() -> tuple[float, float, float, float]:
             f"MIN_DIRECT_IRRADIANCE_WM2 must be non-negative, got: {dni_threshold}"
         )
 
-    # Get maximum cloud cover threshold (optional, defaults to 50%)
-    cloud_str = os.getenv("MAX_CLOUD_COVER_PERCENT", "50").strip()
+    # Get low cloud cover threshold (optional, defaults to 40%)
+    max_low_cloud_str = os.getenv("MAX_LOW_CLOUD_PERCENT", "40").strip()
     try:
-        cloud_threshold = float(cloud_str)
+        max_low_cloud = float(max_low_cloud_str)
     except ValueError as e:
         raise ConfigurationError(
-            f"Invalid MAX_CLOUD_COVER_PERCENT format: {e}. Must be a number."
+            f"Invalid MAX_LOW_CLOUD_PERCENT format: {e}. Must be a number."
         ) from e
-    if not (0 <= cloud_threshold <= 100):
+    if not (0 <= max_low_cloud <= 100):
         raise ConfigurationError(
-            f"MAX_CLOUD_COVER_PERCENT must be between 0 and 100, got: {cloud_threshold}"
+            f"MAX_LOW_CLOUD_PERCENT must be between 0 and 100, got: {max_low_cloud}"
         )
 
-    return wind_threshold, altitude_threshold, dni_threshold, cloud_threshold
+    # Get mid cloud cover threshold for cirrus classification (optional, defaults to 20%)
+    max_mid_cloud_str = os.getenv("MAX_MID_CLOUD_PERCENT", "20").strip()
+    try:
+        max_mid_cloud = float(max_mid_cloud_str)
+    except ValueError as e:
+        raise ConfigurationError(
+            f"Invalid MAX_MID_CLOUD_PERCENT format: {e}. Must be a number."
+        ) from e
+    if not (0 <= max_mid_cloud <= 100):
+        raise ConfigurationError(
+            f"MAX_MID_CLOUD_PERCENT must be between 0 and 100, got: {max_mid_cloud}"
+        )
+
+    # Get high cloud cover threshold to classify as cirrus-dominated (optional, defaults to 60%)
+    cirrus_high_str = os.getenv("CIRRUS_HIGH_CLOUD_THRESHOLD", "60").strip()
+    try:
+        cirrus_high_threshold = float(cirrus_high_str)
+    except ValueError as e:
+        raise ConfigurationError(
+            f"Invalid CIRRUS_HIGH_CLOUD_THRESHOLD format: {e}. Must be a number."
+        ) from e
+    if not (0 <= cirrus_high_threshold <= 100):
+        raise ConfigurationError(
+            f"CIRRUS_HIGH_CLOUD_THRESHOLD must be between 0 and 100, got: {cirrus_high_threshold}"
+        )
+
+    # Get lower DNI threshold used when cirrus-dominated (optional, defaults to 30 W/m²)
+    min_dni_cirrus_str = os.getenv("MIN_DNI_CIRRUS_WM2", "30").strip()
+    try:
+        min_dni_cirrus = float(min_dni_cirrus_str)
+    except ValueError as e:
+        raise ConfigurationError(
+            f"Invalid MIN_DNI_CIRRUS_WM2 format: {e}. Must be a number."
+        ) from e
+    if min_dni_cirrus < 0:
+        raise ConfigurationError(
+            f"MIN_DNI_CIRRUS_WM2 must be non-negative, got: {min_dni_cirrus}"
+        )
+
+    return wind_threshold, altitude_threshold, dni_threshold, max_low_cloud, max_mid_cloud, cirrus_high_threshold, min_dni_cirrus
 
 
 def load_telegram_config() -> tuple[Optional[str], Optional[str]]:
@@ -528,10 +575,20 @@ def should_open_awning(
     wind_threshold: float,
     altitude_threshold: float,
     dni_threshold: float,
-    cloud_threshold: float,
+    max_low_cloud: float,
+    max_mid_cloud: float,
+    cirrus_high_threshold: float,
+    min_dni_cirrus: float,
 ) -> tuple[bool, str, dict]:
     """
     Determine if awning should be open based on ALL conditions.
+
+    Sunshine detection is cirrus-aware:
+    - Cirrus-dominated: cloud_cover_high > cirrus_high_threshold AND
+      cloud_cover_low < max_low_cloud AND cloud_cover_mid < max_mid_cloud
+    - When cirrus-dominated, uses min_dni_cirrus as the DNI threshold (lower bar)
+    - Otherwise uses dni_threshold as the DNI threshold
+    - Cloud cover gating is based on low clouds only (cloud_cover_low)
 
     Args:
         weather: Weather data from fetch_weather()
@@ -539,8 +596,11 @@ def should_open_awning(
         current_time: Current datetime
         wind_threshold: Maximum wind speed (mph) for "calm"
         altitude_threshold: Minimum sun altitude (degrees) above horizon
-        dni_threshold: Minimum direct normal irradiance (W/m²) for "sunny"
-        cloud_threshold: Maximum cloud cover (%) for "sunny"
+        dni_threshold: Minimum direct normal irradiance (W/m²) for "sunny" (normal mode)
+        max_low_cloud: Maximum low cloud cover (%) allowed to open awning
+        max_mid_cloud: Maximum mid cloud cover (%) for cirrus classification
+        cirrus_high_threshold: Minimum high cloud cover (%) to classify as cirrus-dominated
+        min_dni_cirrus: Lower DNI threshold (W/m²) used when cirrus-dominated
 
     Returns:
         Tuple of (should_open, reason, conditions_dict)
@@ -550,8 +610,9 @@ def should_open_awning(
     precipitation = weather["precipitation"]
     temperature = weather["temperature"]
     dni = weather["dni"]
-    cloud_cover = weather["cloud_cover"]
     cloud_cover_low = weather["cloud_cover_low"]
+    cloud_cover_mid = weather["cloud_cover_mid"]
+    cloud_cover_high = weather["cloud_cover_high"]
     sunrise = weather["sunrise"]
     sunset = weather["sunset"]
 
@@ -559,14 +620,21 @@ def should_open_awning(
     azimuth = sun_position["azimuth"]
     altitude = sun_position["altitude"]
 
-    # Evaluate each condition
-    # Sunny requires BOTH high DNI AND low cloud cover
-    # Conservative: Check BOTH total cloud_cover AND cloud_cover_low - if EITHER is too high, treat as cloudy
-    is_sunny = (
-        dni >= dni_threshold
-        and cloud_cover < cloud_threshold
-        and cloud_cover_low < cloud_threshold
+    # Determine if sky is cirrus-dominated (high thin clouds, low/mid clouds minimal)
+    cirrus_dominated = (
+        cloud_cover_high > cirrus_high_threshold
+        and cloud_cover_low < max_low_cloud
+        and cloud_cover_mid < max_mid_cloud
     )
+
+    # Select effective DNI threshold based on cirrus classification
+    effective_dni_threshold = min_dni_cirrus if cirrus_dominated else dni_threshold
+
+    # Evaluate sunny condition:
+    # - DNI must meet the effective threshold (lower if cirrus-dominated)
+    # - Low clouds must be below max_low_cloud (high clouds handled by cirrus logic)
+    is_sunny = dni >= effective_dni_threshold and cloud_cover_low < max_low_cloud
+
     is_calm = wind_speed < wind_threshold
     no_rain = precipitation == 0
     above_freezing = temperature > 32
@@ -583,20 +651,23 @@ def should_open_awning(
         "daytime": is_day,
         "sun_high": sun_high_enough,
         "sun_facing_window": sun_facing_se,
+        "cirrus_dominated": cirrus_dominated,
     }
 
-    # All conditions must be True to open awning
-    should_open = all(conditions.values())
+    # All primary conditions must be True to open awning (cirrus_dominated is informational)
+    primary_conditions = {k: v for k, v in conditions.items() if k != "cirrus_dominated"}
+    should_open = all(primary_conditions.values())
 
     # Build detailed reason string
+    cirrus_label = f" [cirrus override, threshold={effective_dni_threshold:.0f} W/m²]" if cirrus_dominated else ""
     reasons = []
     if not is_sunny:
-        if dni < dni_threshold:
-            reasons.append(f"Not sunny (DNI {dni:.0f} < {dni_threshold:.0f} W/m²)")
-        if cloud_cover >= cloud_threshold:
-            reasons.append(f"Too cloudy (total {cloud_cover:.0f}% >= {cloud_threshold:.0f}%)")
-        if cloud_cover_low >= cloud_threshold:
-            reasons.append(f"Too cloudy (low {cloud_cover_low:.0f}% >= {cloud_threshold:.0f}%)")
+        if dni < effective_dni_threshold:
+            reasons.append(
+                f"Not sunny (DNI {dni:.0f} < {effective_dni_threshold:.0f} W/m²{cirrus_label})"
+            )
+        if cloud_cover_low >= max_low_cloud:
+            reasons.append(f"Too cloudy (low clouds {cloud_cover_low:.0f}% >= {max_low_cloud:.0f}%)")
     if not is_calm:
         reasons.append(f"Too windy ({wind_speed} >= {wind_threshold} mph)")
     if not no_rain:
@@ -613,8 +684,10 @@ def should_open_awning(
         reasons.append(f"Sun not facing window (azimuth {azimuth:.1f}°, need 90°-220°)")
 
     if should_open:
+        cirrus_note = f" (cirrus override, threshold={effective_dni_threshold:.0f} W/m²)" if cirrus_dominated else ""
         reason = (
-            f"All conditions met: DNI {dni:.0f} W/m², clouds {cloud_cover:.0f}% total/{cloud_cover_low:.0f}% low, "
+            f"All conditions met: DNI {dni:.0f} W/m²{cirrus_note}, low clouds {cloud_cover_low:.0f}%, "
+            f"mid {cloud_cover_mid:.0f}%, high {cloud_cover_high:.0f}%, "
             f"{wind_speed} mph wind, {precipitation} mm/h rain, {temperature}°F, "
             f"sun azimuth {azimuth:.1f}° (altitude {altitude:.1f}°)"
         )
@@ -630,20 +703,20 @@ def _format_friendly_telegram_message(
     wind_speed: float,
     precipitation: float,
     temperature: float,
-    cloud_cover: float,
     cloud_cover_low: float,
+    cloud_cover_high: float,
 ) -> str:
     """
     Format a human-friendly Telegram notification message.
 
     Args:
         should_open: Whether awning should be open
-        conditions: Dictionary of condition flags
+        conditions: Dictionary of condition flags (may include cirrus_dominated)
         wind_speed: Wind speed in mph
         precipitation: Precipitation in mm/h
         temperature: Temperature in F
-        cloud_cover: Total cloud cover percentage
         cloud_cover_low: Low cloud cover percentage
+        cloud_cover_high: High cloud cover percentage
 
     Returns:
         Friendly message string with appropriate emoji
@@ -652,7 +725,8 @@ def _format_friendly_telegram_message(
         # Opening message - simple and positive
         temp_f = int(round(temperature))
         wind_mph = int(round(wind_speed))
-        return f"☀️ Awning opened - sunny & calm ({temp_f}°F, {wind_mph} mph wind)"
+        cirrus_note = " (cirrus)" if conditions.get("cirrus_dominated") else ""
+        return f"☀️ Awning opened - sunny{cirrus_note} & calm ({temp_f}°F, {wind_mph} mph wind)"
 
     # Closing message - determine primary reason and emoji
     # Priority: rain > wind > cold > cloudy > nighttime > sun position
@@ -671,9 +745,9 @@ def _format_friendly_telegram_message(
 
     if not conditions["sunny"]:
         # Include cloud cover details for cloudy closures
-        clouds_total = int(round(cloud_cover))
         clouds_low = int(round(cloud_cover_low))
-        return f"☁️ Awning closed: Cloudy ({clouds_total}% total, {clouds_low}% low)"
+        clouds_high = int(round(cloud_cover_high))
+        return f"☁️ Awning closed: Cloudy ({clouds_low}% low, {clouds_high}% high)"
 
     if not conditions["daytime"]:
         return "🌙 Awning closed: Nighttime"
@@ -718,9 +792,10 @@ def main() -> None:
         logger.info(f"Location: {latitude:.4f}, {longitude:.4f}")
 
         # Get thresholds
-        wind_threshold, altitude_threshold, dni_threshold, cloud_threshold = get_thresholds()
+        wind_threshold, altitude_threshold, dni_threshold, max_low_cloud, max_mid_cloud, cirrus_high_threshold, min_dni_cirrus = get_thresholds()
         logger.info(
-            f"Thresholds: DNI >= {dni_threshold:.0f} W/m², Clouds < {cloud_threshold:.0f}%, "
+            f"Thresholds: DNI >= {dni_threshold:.0f} W/m² (cirrus: {min_dni_cirrus:.0f} W/m²), "
+            f"Low clouds < {max_low_cloud:.0f}%, Cirrus: high > {cirrus_high_threshold:.0f}% AND mid < {max_mid_cloud:.0f}%, "
             f"Wind < {wind_threshold} mph, Rain = 0 mm/h, Temp > 32°F, "
             f"Sun altitude >= {altitude_threshold}°, Sun facing window (90°-220°)"
         )
@@ -768,10 +843,27 @@ def main() -> None:
             wind_threshold,
             altitude_threshold,
             dni_threshold,
-            cloud_threshold,
+            max_low_cloud,
+            max_mid_cloud,
+            cirrus_high_threshold,
+            min_dni_cirrus,
         )
 
-        # Log conditions with checkmarks/crosses
+        # Log cirrus detection state
+        cirrus_dominated = conditions.get("cirrus_dominated", False)
+        if cirrus_dominated:
+            logger.info(
+                f"Cirrus override active: high clouds {weather['cloud_cover_high']:.0f}% > {cirrus_high_threshold:.0f}%, "
+                f"low {weather['cloud_cover_low']:.0f}% < {max_low_cloud:.0f}%, "
+                f"mid {weather['cloud_cover_mid']:.0f}% < {max_mid_cloud:.0f}% — "
+                f"using DNI threshold {min_dni_cirrus:.0f} W/m² instead of {dni_threshold:.0f} W/m²"
+            )
+        else:
+            logger.info(
+                f"Normal mode (no cirrus override): using DNI threshold {dni_threshold:.0f} W/m²"
+            )
+
+        # Log conditions with checkmarks/crosses (skip cirrus_dominated — logged separately above)
         condition_symbols = {
             "sunny": "Sunny" if conditions["sunny"] else "Not sunny",
             "calm": "Calm" if conditions["calm"] else "Windy",
@@ -782,7 +874,7 @@ def main() -> None:
             "sun_facing_window": "Sun facing window" if conditions["sun_facing_window"] else "Sun not facing window",
         }
         check_str = ", ".join(
-            [f"{'✓' if v else '✗'} {condition_symbols[k]}" for k, v in conditions.items()]
+            [f"{'✓' if conditions[k] else '✗'} {condition_symbols[k]}" for k in condition_symbols]
         )
         logger.info(f"Conditions: {check_str}")
         logger.info(f"Decision: {reason}")
@@ -822,8 +914,8 @@ def main() -> None:
                 weather["wind_speed_10m"],
                 weather["precipitation"],
                 weather["temperature"],
-                weather["cloud_cover"],
                 weather["cloud_cover_low"],
+                weather["cloud_cover_high"],
             )
             send_telegram_notification(telegram_token, telegram_chat_id, msg)
 
