@@ -3,19 +3,26 @@
 Awning Weather Automation
 
 Automatically opens/closes awning based on weather conditions.
-- Opens awning if ALL 7 conditions are met: sunny, calm, no rain, above freezing,
+- Opens awning if ALL 7 conditions are met: sunny, calm, no rain, above 40°F,
   daytime, sun high enough, and sun facing window (90°-220°)
 - Closes awning if ANY condition fails
 
 Sunshine detection uses cirrus-aware logic:
 - Normal mode: DNI >= MIN_DIRECT_IRRADIANCE_WM2 AND low clouds < MAX_LOW_CLOUD_PERCENT
+  AND mid clouds < MID_CLOUD_THRESHOLD_PCT
 - Cirrus mode: When high clouds dominate (cloud_cover_high > CIRRUS_HIGH_CLOUD_THRESHOLD)
   and low/mid clouds are minimal, a lower DNI threshold (MIN_DNI_CIRRUS_WM2) is used
   so the awning stays open on thin high-cloud days but closes on genuinely overcast days.
+  The mid-cloud hard gate (MID_CLOUD_THRESHOLD_PCT) applies in cirrus mode as well.
+
+Smoothing: All numeric sensor inputs are passed through a weighted rolling average
+(weights [4,3,2,1] for current and up to 3 cached prior readings, normalized) before
+threshold evaluation, preventing false-positive opens from momentary API spikes.
 
 Designed to run as a cron job or Kubernetes scheduled job.
 """
 
+import json
 import logging
 import os
 import sys
@@ -185,6 +192,164 @@ class WeatherAPIError(Exception):
     pass
 
 
+# Default cache path; can be overridden in tests
+READINGS_CACHE_PATH = Path.home() / ".config" / "awning" / "readings-cache.json"
+
+# Keys that are stored/loaded from the readings cache
+_CACHE_KEYS = ["dni", "wind", "temp", "precip", "cloud_total", "cloud_low", "cloud_mid", "cloud_high"]
+
+# Linear weights for [current, n-1, n-2, n-3] — normalized before use
+_SMOOTHING_WEIGHTS = [4, 3, 2, 1]
+
+
+def load_readings_cache(cache_path: Path = READINGS_CACHE_PATH) -> list[dict]:
+    """
+    Load prior raw sensor readings from the local cache file.
+
+    Returns up to 3 most-recent entries (oldest first).  Gracefully returns an
+    empty list if the file is absent, empty, or malformed.
+
+    Args:
+        cache_path: Path to the JSON cache file
+
+    Returns:
+        List of reading dicts (up to 3), oldest first
+    """
+    if not cache_path.exists():
+        return []
+    try:
+        text = cache_path.read_text()
+        data = json.loads(text)
+        if not isinstance(data, list):
+            return []
+        # Keep only well-formed entries that have all required keys
+        valid = [
+            entry for entry in data
+            if isinstance(entry, dict) and all(k in entry for k in _CACHE_KEYS)
+        ]
+        # Return at most 3 most-recent entries, oldest first
+        return valid[-3:]
+    except (json.JSONDecodeError, OSError, ValueError):
+        return []
+
+
+def save_readings_cache(
+    raw_reading: dict,
+    prior_entries: list[dict],
+    cache_path: Path = READINGS_CACHE_PATH,
+) -> None:
+    """
+    Append the current raw reading to the cache and trim to 3 entries.
+
+    The cache stores only raw values (not smoothed), so each subsequent run
+    can compute a fresh weighted average from actual sensor readings.
+
+    Args:
+        raw_reading: Raw weather reading dict to append (must contain all _CACHE_KEYS)
+        prior_entries: Existing entries loaded from cache (up to 3)
+        cache_path: Path to the JSON cache file
+    """
+    entry = {k: raw_reading[k] for k in _CACHE_KEYS}
+    entry["timestamp"] = datetime.now(timezone.utc).isoformat()
+
+    updated = list(prior_entries) + [entry]
+    # Keep at most 3 entries (so next run has up to 3 priors)
+    updated = updated[-3:]
+
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(updated, indent=2))
+    except OSError as e:
+        logger.warning(f"Could not write readings cache to {cache_path}: {e}")
+
+
+def compute_smoothed_weather(
+    raw: dict,
+    prior_entries: list[dict],
+) -> dict:
+    """
+    Compute weighted rolling average over current + up to 3 prior readings.
+
+    Weights [4, 3, 2, 1] correspond to [current, n-1, n-2, n-3].  Only as
+    many weights as available readings are used, normalized so they sum to 1.
+
+    The cache entries are expected oldest-first; the most-recent prior is
+    prior_entries[-1].
+
+    Smoothed fields: dni, wind, temp, precip, cloud_total, cloud_low,
+    cloud_mid, cloud_high.  All other fields in ``raw`` are passed through
+    unchanged.
+
+    Args:
+        raw: Current weather reading (from fetch_weather())
+        prior_entries: Prior raw readings from cache (oldest first, up to 3)
+
+    Returns:
+        New weather dict with smoothed numeric sensor values
+    """
+    # Map from cache key → weather dict key
+    field_map = {
+        "dni": "dni",
+        "wind": "wind_speed_10m",
+        "temp": "temperature",
+        "precip": "precipitation",
+        "cloud_total": "cloud_cover",
+        "cloud_low": "cloud_cover_low",
+        "cloud_mid": "cloud_cover_mid",
+        "cloud_high": "cloud_cover_high",
+    }
+
+    # Build ordered list of readings: newest first (current, n-1, n-2, n-3)
+    # prior_entries is oldest-first, so reverse to get newest-first
+    readings_newest_first = [raw] + list(reversed(prior_entries))
+    n = len(readings_newest_first)
+
+    # Take only as many weights as we have readings
+    raw_weights = _SMOOTHING_WEIGHTS[:n]
+    total = sum(raw_weights)
+    normalized = [w / total for w in raw_weights]
+
+    smoothed = dict(raw)  # start with a copy of raw (preserves non-numeric fields)
+
+    for cache_key, weather_key in field_map.items():
+        # Retrieve values from each reading in newest-first order
+        values = []
+        for i, reading in enumerate(readings_newest_first):
+            if i == 0:
+                # Current reading — use weather dict key
+                values.append(float(reading.get(weather_key, 0)))
+            else:
+                # Prior cache entry — use cache key
+                values.append(float(reading.get(cache_key, 0)))
+
+        weighted_val = sum(v * w for v, w in zip(values, normalized))
+        smoothed[weather_key] = weighted_val
+
+    return smoothed
+
+
+def _raw_reading_from_weather(weather: dict) -> dict:
+    """
+    Extract raw sensor values from a fetch_weather() result for cache storage.
+
+    Args:
+        weather: Weather dict from fetch_weather()
+
+    Returns:
+        Dict with cache keys (dni, wind, temp, precip, cloud_total/low/mid/high)
+    """
+    return {
+        "dni": weather["dni"],
+        "wind": weather["wind_speed_10m"],
+        "temp": weather["temperature"],
+        "precip": weather["precipitation"],
+        "cloud_total": weather["cloud_cover"],
+        "cloud_low": weather["cloud_cover_low"],
+        "cloud_mid": weather["cloud_cover_mid"],
+        "cloud_high": weather["cloud_cover_high"],
+    }
+
+
 def load_location_config(env_file: Optional[Path] = None) -> tuple[float, float]:
     """
     Load location configuration from environment variables.
@@ -251,13 +416,14 @@ def load_location_config(env_file: Optional[Path] = None) -> tuple[float, float]
     return latitude, longitude
 
 
-def get_thresholds() -> tuple[float, float, float, float, float, float, float]:
+def get_thresholds() -> tuple[float, float, float, float, float, float, float, float]:
     """
     Get weather thresholds from environment variables.
 
     Returns:
         Tuple of (wind_speed_threshold_mph, min_sun_altitude, min_dni,
-                  max_low_cloud, max_mid_cloud, cirrus_high_threshold, min_dni_cirrus)
+                  max_low_cloud, max_mid_cloud, cirrus_high_threshold, min_dni_cirrus,
+                  mid_cloud_threshold)
 
     Raises:
         ConfigurationError: If threshold variables are missing or invalid
@@ -362,7 +528,20 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float]:
             f"MIN_DNI_CIRRUS_WM2 must be non-negative, got: {min_dni_cirrus}"
         )
 
-    return wind_threshold, altitude_threshold, dni_threshold, max_low_cloud, max_mid_cloud, cirrus_high_threshold, min_dni_cirrus
+    # Get mid cloud cover hard gate for is_sunny (optional, defaults to 50%)
+    mid_cloud_threshold_str = os.getenv("MID_CLOUD_THRESHOLD_PCT", "50").strip()
+    try:
+        mid_cloud_threshold = float(mid_cloud_threshold_str)
+    except ValueError as e:
+        raise ConfigurationError(
+            f"Invalid MID_CLOUD_THRESHOLD_PCT format: {e}. Must be a number."
+        ) from e
+    if not (0 <= mid_cloud_threshold <= 100):
+        raise ConfigurationError(
+            f"MID_CLOUD_THRESHOLD_PCT must be between 0 and 100, got: {mid_cloud_threshold}"
+        )
+
+    return wind_threshold, altitude_threshold, dni_threshold, max_low_cloud, max_mid_cloud, cirrus_high_threshold, min_dni_cirrus, mid_cloud_threshold
 
 
 def load_telegram_config() -> tuple[Optional[str], Optional[str]]:
@@ -579,6 +758,7 @@ def should_open_awning(
     max_mid_cloud: float,
     cirrus_high_threshold: float,
     min_dni_cirrus: float,
+    mid_cloud_threshold: float,
 ) -> tuple[bool, str, dict]:
     """
     Determine if awning should be open based on ALL conditions.
@@ -588,7 +768,7 @@ def should_open_awning(
       cloud_cover_low < max_low_cloud AND cloud_cover_mid < max_mid_cloud
     - When cirrus-dominated, uses min_dni_cirrus as the DNI threshold (lower bar)
     - Otherwise uses dni_threshold as the DNI threshold
-    - Cloud cover gating is based on low clouds only (cloud_cover_low)
+    - is_sunny requires cloud_cover_low < max_low_cloud AND cloud_cover_mid < mid_cloud_threshold
 
     Args:
         weather: Weather data from fetch_weather()
@@ -601,6 +781,7 @@ def should_open_awning(
         max_mid_cloud: Maximum mid cloud cover (%) for cirrus classification
         cirrus_high_threshold: Minimum high cloud cover (%) to classify as cirrus-dominated
         min_dni_cirrus: Lower DNI threshold (W/m²) used when cirrus-dominated
+        mid_cloud_threshold: Maximum mid cloud cover (%) hard gate for is_sunny
 
     Returns:
         Tuple of (should_open, reason, conditions_dict)
@@ -633,11 +814,16 @@ def should_open_awning(
     # Evaluate sunny condition:
     # - DNI must meet the effective threshold (lower if cirrus-dominated)
     # - Low clouds must be below max_low_cloud (high clouds handled by cirrus logic)
-    is_sunny = dni >= effective_dni_threshold and cloud_cover_low < max_low_cloud
+    # - Mid clouds must be below mid_cloud_threshold (hard gate regardless of cirrus branch)
+    is_sunny = (
+        dni >= effective_dni_threshold
+        and cloud_cover_low < max_low_cloud
+        and cloud_cover_mid < mid_cloud_threshold
+    )
 
     is_calm = wind_speed < wind_threshold
     no_rain = precipitation == 0
-    above_freezing = temperature > 32
+    above_freezing = temperature > 40
     is_day = is_daytime(current_time, sunrise, sunset)
     sun_high_enough = altitude >= altitude_threshold
     sun_facing_se = is_sun_facing_window(azimuth)
@@ -668,12 +854,14 @@ def should_open_awning(
             )
         if cloud_cover_low >= max_low_cloud:
             reasons.append(f"Too cloudy (low clouds {cloud_cover_low:.0f}% >= {max_low_cloud:.0f}%)")
+        if cloud_cover_mid >= mid_cloud_threshold:
+            reasons.append(f"Too cloudy (mid clouds {cloud_cover_mid:.0f}% >= {mid_cloud_threshold:.0f}%)")
     if not is_calm:
         reasons.append(f"Too windy ({wind_speed} >= {wind_threshold} mph)")
     if not no_rain:
         reasons.append(f"Raining ({precipitation} mm/h)")
     if not above_freezing:
-        reasons.append(f"Too cold ({temperature}°F <= 32°F)")
+        reasons.append(f"Too cold ({temperature}°F <= 40°F)")
     if not is_day:
         reasons.append(
             f"Nighttime (sunrise {sunrise[11:16]}, sunset {sunset[11:16]})"
@@ -792,11 +980,12 @@ def main() -> None:
         logger.info(f"Location: {latitude:.4f}, {longitude:.4f}")
 
         # Get thresholds
-        wind_threshold, altitude_threshold, dni_threshold, max_low_cloud, max_mid_cloud, cirrus_high_threshold, min_dni_cirrus = get_thresholds()
+        wind_threshold, altitude_threshold, dni_threshold, max_low_cloud, max_mid_cloud, cirrus_high_threshold, min_dni_cirrus, mid_cloud_threshold = get_thresholds()
         logger.info(
             f"Thresholds: DNI >= {dni_threshold:.0f} W/m² (cirrus: {min_dni_cirrus:.0f} W/m²), "
-            f"Low clouds < {max_low_cloud:.0f}%, Cirrus: high > {cirrus_high_threshold:.0f}% AND mid < {max_mid_cloud:.0f}%, "
-            f"Wind < {wind_threshold} mph, Rain = 0 mm/h, Temp > 32°F, "
+            f"Low clouds < {max_low_cloud:.0f}%, Mid clouds < {mid_cloud_threshold:.0f}%, "
+            f"Cirrus: high > {cirrus_high_threshold:.0f}% AND mid < {max_mid_cloud:.0f}%, "
+            f"Wind < {wind_threshold} mph, Rain = 0 mm/h, Temp > 40°F, "
             f"Sun altitude >= {altitude_threshold}°, Sun facing window (90°-220°)"
         )
 
@@ -809,13 +998,51 @@ def main() -> None:
         logger.info("Fetching weather data...")
         weather = fetch_weather(latitude, longitude)
         logger.info(
-            f"Weather: DNI {weather['dni']:.0f} W/m², {weather['wind_speed_10m']} mph wind, "
-            f"{weather['precipitation']} mm/h rain, {weather['temperature']}°F (at {weather['time']})"
+            f"Weather (raw): DNI {weather['dni']:.0f} W/m², {weather['wind_speed_10m']:.1f} mph wind, "
+            f"{weather['precipitation']:.2f} mm/h rain, {weather['temperature']:.1f}°F (at {weather['time']})"
         )
         logger.info(
-            f"Cloud cover: Total {weather['cloud_cover']}%, Low {weather['cloud_cover_low']}%, "
-            f"Mid {weather['cloud_cover_mid']}%, High {weather['cloud_cover_high']}%"
+            f"Cloud cover (raw): Total {weather['cloud_cover']:.0f}%, Low {weather['cloud_cover_low']:.0f}%, "
+            f"Mid {weather['cloud_cover_mid']:.0f}%, High {weather['cloud_cover_high']:.0f}%"
         )
+
+        # Load prior readings and compute weighted smoothed values
+        prior_entries = load_readings_cache()
+        logger.info(
+            f"Readings cache: {len(prior_entries)} prior entr{'y' if len(prior_entries) == 1 else 'ies'} available"
+        )
+        raw_reading = _raw_reading_from_weather(weather)
+        smoothed_weather = compute_smoothed_weather(weather, prior_entries)
+
+        # Log smoothed values (only when they differ meaningfully from raw)
+        def _differs(raw_val: float, smooth_val: float, tol: float = 0.05) -> bool:
+            return abs(raw_val - smooth_val) > tol
+
+        smoothed_fields = [
+            ("DNI", weather["dni"], smoothed_weather["dni"], "W/m²"),
+            ("wind", weather["wind_speed_10m"], smoothed_weather["wind_speed_10m"], "mph"),
+            ("rain", weather["precipitation"], smoothed_weather["precipitation"], "mm/h"),
+            ("temp", weather["temperature"], smoothed_weather["temperature"], "°F"),
+            ("cloud_total", weather["cloud_cover"], smoothed_weather["cloud_cover"], "%"),
+            ("cloud_low", weather["cloud_cover_low"], smoothed_weather["cloud_cover_low"], "%"),
+            ("cloud_mid", weather["cloud_cover_mid"], smoothed_weather["cloud_cover_mid"], "%"),
+            ("cloud_high", weather["cloud_cover_high"], smoothed_weather["cloud_cover_high"], "%"),
+        ]
+        diffs = [
+            f"{name}: {raw:.1f}→{smooth:.1f} {unit}"
+            for name, raw, smooth, unit in smoothed_fields
+            if _differs(raw, smooth)
+        ]
+        if diffs:
+            logger.info(f"Weather (smoothed, {len(prior_entries)+1} readings): {', '.join(diffs)}")
+        else:
+            logger.info("Weather (smoothed): no change from raw (single reading)")
+
+        # Save raw reading to cache BEFORE overwriting weather with smoothed values
+        save_readings_cache(raw_reading, prior_entries)
+
+        # Use smoothed values for all condition evaluations going forward
+        weather = smoothed_weather
 
         # Get current time from weather API (same timezone as sunrise/sunset)
         current_time_str = weather["time"]
@@ -847,6 +1074,7 @@ def main() -> None:
             max_mid_cloud,
             cirrus_high_threshold,
             min_dni_cirrus,
+            mid_cloud_threshold,
         )
 
         # Log cirrus detection state
