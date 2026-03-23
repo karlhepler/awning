@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -348,6 +349,93 @@ def _raw_reading_from_weather(weather: dict) -> dict:
         "cloud_mid": weather["cloud_cover_mid"],
         "cloud_high": weather["cloud_cover_high"],
     }
+
+
+# Number of discrete weather measurements per automation run
+_MEASUREMENT_COUNT = 3
+# Seconds to wait between measurements (~1 minute apart, 2 minutes total for 3 readings)
+_MEASUREMENT_INTERVAL_SECONDS = 60
+
+# Numeric fields that are averaged across measurements (all others pass through from first reading)
+_AVERAGED_FIELDS = [
+    "wind_speed_10m",
+    "precipitation",
+    "temperature",
+    "dni",
+    "cloud_cover",
+    "cloud_cover_low",
+    "cloud_cover_mid",
+    "cloud_cover_high",
+]
+
+
+def collect_weather_measurements(lat: float, lon: float) -> dict:
+    """
+    Collect 3 discrete weather measurements ~1 minute apart and return averaged values.
+
+    Makes _MEASUREMENT_COUNT separate weather API calls, sleeping
+    _MEASUREMENT_INTERVAL_SECONDS between each. Logs every individual
+    measurement for debugging, then logs the final averaged values.
+    Non-numeric fields (sunrise, sunset, is_day, time) are taken from the
+    first measurement.
+
+    Args:
+        lat: Latitude
+        lon: Longitude
+
+    Returns:
+        Weather dict with numeric fields averaged across all measurements,
+        non-numeric fields from the first measurement.
+
+    Raises:
+        WeatherAPIError: If any weather API request fails.
+    """
+    samples = []
+
+    for i in range(_MEASUREMENT_COUNT):
+        if i > 0:
+            logger.info(
+                f"Waiting {_MEASUREMENT_INTERVAL_SECONDS}s before measurement {i + 1} of {_MEASUREMENT_COUNT}..."
+            )
+            time.sleep(_MEASUREMENT_INTERVAL_SECONDS)
+
+        logger.info(f"Fetching weather measurement {i + 1} of {_MEASUREMENT_COUNT}...")
+        sample = fetch_weather(lat, lon)
+        samples.append(sample)
+
+        logger.info(
+            f"Sample {i + 1}: DNI {sample['dni']:.0f} W/m², "
+            f"{sample['wind_speed_10m']:.1f} mph wind, "
+            f"{sample['precipitation']:.2f} mm/h rain, "
+            f"{sample['temperature']:.1f}°F"
+        )
+        logger.info(
+            f"Sample {i + 1} clouds: Total {sample['cloud_cover']:.0f}%, "
+            f"Low {sample['cloud_cover_low']:.0f}%, "
+            f"Mid {sample['cloud_cover_mid']:.0f}%, "
+            f"High {sample['cloud_cover_high']:.0f}%"
+        )
+
+    # Average numeric fields across all samples
+    averaged = dict(samples[0])  # start with copy of first sample (non-numeric fields)
+    for field in _AVERAGED_FIELDS:
+        values = [s[field] for s in samples]
+        averaged[field] = sum(values) / len(values)
+
+    logger.info(
+        f"Average ({_MEASUREMENT_COUNT} samples): DNI {averaged['dni']:.0f} W/m², "
+        f"{averaged['wind_speed_10m']:.1f} mph wind, "
+        f"{averaged['precipitation']:.2f} mm/h rain, "
+        f"{averaged['temperature']:.1f}°F"
+    )
+    logger.info(
+        f"Average clouds ({_MEASUREMENT_COUNT} samples): Total {averaged['cloud_cover']:.0f}%, "
+        f"Low {averaged['cloud_cover_low']:.0f}%, "
+        f"Mid {averaged['cloud_cover_mid']:.0f}%, "
+        f"High {averaged['cloud_cover_high']:.0f}%"
+    )
+
+    return averaged
 
 
 def load_location_config(env_file: Optional[Path] = None) -> tuple[float, float]:
@@ -994,55 +1082,12 @@ def main() -> None:
         if telegram_token:
             logger.info("Telegram notifications enabled")
 
-        # Fetch current weather
-        logger.info("Fetching weather data...")
-        weather = fetch_weather(latitude, longitude)
+        # Collect 3 weather measurements ~1 minute apart, then use their average
         logger.info(
-            f"Weather (raw): DNI {weather['dni']:.0f} W/m², {weather['wind_speed_10m']:.1f} mph wind, "
-            f"{weather['precipitation']:.2f} mm/h rain, {weather['temperature']:.1f}°F (at {weather['time']})"
+            f"Collecting {_MEASUREMENT_COUNT} weather measurements "
+            f"({_MEASUREMENT_INTERVAL_SECONDS}s apart)..."
         )
-        logger.info(
-            f"Cloud cover (raw): Total {weather['cloud_cover']:.0f}%, Low {weather['cloud_cover_low']:.0f}%, "
-            f"Mid {weather['cloud_cover_mid']:.0f}%, High {weather['cloud_cover_high']:.0f}%"
-        )
-
-        # Load prior readings and compute weighted smoothed values
-        prior_entries = load_readings_cache()
-        logger.info(
-            f"Readings cache: {len(prior_entries)} prior entr{'y' if len(prior_entries) == 1 else 'ies'} available"
-        )
-        raw_reading = _raw_reading_from_weather(weather)
-        smoothed_weather = compute_smoothed_weather(weather, prior_entries)
-
-        # Log smoothed values (only when they differ meaningfully from raw)
-        def _differs(raw_val: float, smooth_val: float, tol: float = 0.05) -> bool:
-            return abs(raw_val - smooth_val) > tol
-
-        smoothed_fields = [
-            ("DNI", weather["dni"], smoothed_weather["dni"], "W/m²"),
-            ("wind", weather["wind_speed_10m"], smoothed_weather["wind_speed_10m"], "mph"),
-            ("rain", weather["precipitation"], smoothed_weather["precipitation"], "mm/h"),
-            ("temp", weather["temperature"], smoothed_weather["temperature"], "°F"),
-            ("cloud_total", weather["cloud_cover"], smoothed_weather["cloud_cover"], "%"),
-            ("cloud_low", weather["cloud_cover_low"], smoothed_weather["cloud_cover_low"], "%"),
-            ("cloud_mid", weather["cloud_cover_mid"], smoothed_weather["cloud_cover_mid"], "%"),
-            ("cloud_high", weather["cloud_cover_high"], smoothed_weather["cloud_cover_high"], "%"),
-        ]
-        diffs = [
-            f"{name}: {raw:.1f}→{smooth:.1f} {unit}"
-            for name, raw, smooth, unit in smoothed_fields
-            if _differs(raw, smooth)
-        ]
-        if diffs:
-            logger.info(f"Weather (smoothed, {len(prior_entries)+1} readings): {', '.join(diffs)}")
-        else:
-            logger.info("Weather (smoothed): no change from raw (single reading)")
-
-        # Save raw reading to cache BEFORE overwriting weather with smoothed values
-        save_readings_cache(raw_reading, prior_entries)
-
-        # Use smoothed values for all condition evaluations going forward
-        weather = smoothed_weather
+        weather = collect_weather_measurements(latitude, longitude)
 
         # Get current time from weather API (same timezone as sunrise/sunset)
         current_time_str = weather["time"]
