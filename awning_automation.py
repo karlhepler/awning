@@ -374,33 +374,77 @@ def collect_weather_measurements(lat: float, lon: float) -> dict:
     Collect 3 discrete weather measurements ~1 minute apart and return averaged values.
 
     Makes _MEASUREMENT_COUNT separate weather API calls, sleeping
-    _MEASUREMENT_INTERVAL_SECONDS between each. Logs every individual
-    measurement for debugging, then logs the final averaged values.
+    _MEASUREMENT_INTERVAL_SECONDS between each. Each individual API call is
+    retried up to _FETCH_MAX_RETRIES times with exponential backoff on failure.
+    If a single measurement fails all retries, it is logged as a warning and
+    skipped. Averaging is performed over whatever measurements succeeded (1, 2,
+    or 3). If ALL measurements fail, WeatherAPIError is raised so the caller's
+    existing fail-safe close logic is triggered.
+
     Non-numeric fields (sunrise, sunset, is_day, time) are taken from the
-    first measurement.
+    first successful measurement.
 
     Args:
         lat: Latitude
         lon: Longitude
 
     Returns:
-        Weather dict with numeric fields averaged across all measurements,
-        non-numeric fields from the first measurement.
+        Weather dict with numeric fields averaged across all successful
+        measurements, non-numeric fields from the first successful measurement.
 
     Raises:
-        WeatherAPIError: If any weather API request fails.
+        WeatherAPIError: If all weather API requests fail.
     """
+    # Per-measurement retry configuration (independent of tenacity)
+    _FETCH_MAX_RETRIES = 3
+    _FETCH_BASE_DELAY_SECONDS = 2  # Backoff: 2s, 4s, 8s
+
     samples = []
+    prev_measurement_end_time: Optional[float] = None
 
     for i in range(_MEASUREMENT_COUNT):
-        if i > 0:
-            logger.info(
-                f"Waiting {_MEASUREMENT_INTERVAL_SECONDS}s before measurement {i + 1} of {_MEASUREMENT_COUNT}..."
-            )
-            time.sleep(_MEASUREMENT_INTERVAL_SECONDS)
+        # Enforce the inter-measurement interval from the end of the previous
+        # measurement (success or final failure). Retry backoff within a
+        # measurement does not count toward this interval.
+        if prev_measurement_end_time is not None:
+            elapsed = time.monotonic() - prev_measurement_end_time
+            remaining = _MEASUREMENT_INTERVAL_SECONDS - elapsed
+            if remaining > 0:
+                logger.info(
+                    f"Waiting {remaining:.0f}s before measurement {i + 1} of {_MEASUREMENT_COUNT}..."
+                )
+                time.sleep(remaining)
 
         logger.info(f"Fetching weather measurement {i + 1} of {_MEASUREMENT_COUNT}...")
-        sample = fetch_weather(lat, lon)
+
+        sample = None
+        last_error = None
+        for attempt in range(1, _FETCH_MAX_RETRIES + 1):
+            try:
+                sample = fetch_weather(lat, lon)
+                break
+            except WeatherAPIError as exc:
+                last_error = exc
+                if attempt < _FETCH_MAX_RETRIES:
+                    backoff = _FETCH_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+                    logger.warning(
+                        f"Measurement {i + 1} attempt {attempt} failed: {exc}. "
+                        f"Retrying in {backoff}s (attempt {attempt + 1} of {_FETCH_MAX_RETRIES})..."
+                    )
+                    time.sleep(backoff)
+
+        # Record when this measurement resolved (success or final failure).
+        # The next measurement's inter-measurement wait is measured from here,
+        # so retry backoff time spent above never shortens the gap.
+        prev_measurement_end_time = time.monotonic()
+
+        if sample is None:
+            logger.warning(
+                f"Measurement {i + 1} failed all {_FETCH_MAX_RETRIES} retry attempts — "
+                f"skipping this sample. Last error: {last_error}"
+            )
+            continue
+
         samples.append(sample)
 
         logger.info(
@@ -416,20 +460,33 @@ def collect_weather_measurements(lat: float, lon: float) -> dict:
             f"High {sample['cloud_cover_high']:.0f}%"
         )
 
-    # Average numeric fields across all samples
+    if not samples:
+        raise WeatherAPIError(
+            f"All {_MEASUREMENT_COUNT} weather measurements failed after "
+            f"{_FETCH_MAX_RETRIES} retry attempts each."
+        )
+
+    num_samples = len(samples)
+    if num_samples < _MEASUREMENT_COUNT:
+        logger.warning(
+            f"Only {num_samples} of {_MEASUREMENT_COUNT} measurements succeeded — "
+            f"averaging over partial samples."
+        )
+
+    # Average numeric fields across all successful samples
     averaged = dict(samples[0])  # start with copy of first sample (non-numeric fields)
     for field in _AVERAGED_FIELDS:
         values = [s[field] for s in samples]
-        averaged[field] = sum(values) / len(values)
+        averaged[field] = sum(values) / num_samples
 
     logger.info(
-        f"Average ({_MEASUREMENT_COUNT} samples): DNI {averaged['dni']:.0f} W/m², "
+        f"Average ({num_samples} samples): DNI {averaged['dni']:.0f} W/m², "
         f"{averaged['wind_speed_10m']:.1f} mph wind, "
         f"{averaged['precipitation']:.2f} mm/h rain, "
         f"{averaged['temperature']:.1f}°F"
     )
     logger.info(
-        f"Average clouds ({_MEASUREMENT_COUNT} samples): Total {averaged['cloud_cover']:.0f}%, "
+        f"Average clouds ({num_samples} samples): Total {averaged['cloud_cover']:.0f}%, "
         f"Low {averaged['cloud_cover_low']:.0f}%, "
         f"Mid {averaged['cloud_cover_mid']:.0f}%, "
         f"High {averaged['cloud_cover_high']:.0f}%"
