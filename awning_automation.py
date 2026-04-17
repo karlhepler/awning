@@ -4,7 +4,7 @@ Awning Weather Automation
 
 Automatically opens/closes awning based on weather conditions.
 - Opens awning if ALL 7 conditions are met: sunny, calm, no rain, above 40°F,
-  daytime, sun high enough, and sun facing window (90°-220°)
+  daytime, sun high enough, and sun facing window (90°-260°)
 - Closes awning if ANY condition fails
 
 Sunshine detection uses a cross-model OR gate:
@@ -844,9 +844,9 @@ def is_sun_facing_window(azimuth: float) -> bool:
         azimuth: Sun azimuth in degrees (0=North, 90=East, 180=South, 270=West)
 
     Returns:
-        True if azimuth is between 90° (East) and 220° (Southwest)
+        True if azimuth is between 90° (East) and 260° (West)
     """
-    return 90 <= azimuth <= 220
+    return 90 <= azimuth <= 260
 
 
 def is_daytime(current_time: datetime, sunrise_str: str, sunset_str: str) -> bool:
@@ -979,7 +979,7 @@ def should_open_awning(
     if not sun_high_enough:
         reasons.append(f"Sun too low ({altitude:.1f}° < {altitude_threshold}°)")
     if not sun_facing_se:
-        reasons.append(f"Sun not facing window (azimuth {azimuth:.1f}°, need 90°-220°)")
+        reasons.append(f"Sun not facing window (azimuth {azimuth:.1f}°, need 90°-260°)")
 
     if should_open:
         reason = (
@@ -1091,7 +1091,7 @@ def main() -> None:
         logger.info(
             f"Thresholds: GHI >= {min_ghi:.0f} W/m² OR UV >= {min_uv_index:.1f}, "
             f"Wind < {wind_threshold} mph, Rain = 0 mm/h, Temp > 40°F, "
-            f"Sun altitude >= {altitude_threshold}°, Sun facing window (90°-220°)"
+            f"Sun altitude >= {altitude_threshold}°, Sun facing window (90°-260°)"
         )
 
         # Load Telegram config (optional)
