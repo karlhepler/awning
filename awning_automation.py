@@ -7,13 +7,16 @@ Automatically opens/closes awning based on weather conditions.
   daytime, sun high enough, and sun facing window (90°-220°)
 - Closes awning if ANY condition fails
 
-Sunshine detection uses cirrus-aware logic:
-- Normal mode: DNI >= MIN_DIRECT_IRRADIANCE_WM2 AND low clouds < MAX_LOW_CLOUD_PERCENT
-  AND mid clouds < MID_CLOUD_THRESHOLD_PCT
-- Cirrus mode: When high clouds dominate (cloud_cover_high > CIRRUS_HIGH_CLOUD_THRESHOLD)
-  and low/mid clouds are minimal, a lower DNI threshold (MIN_DNI_CIRRUS_WM2) is used
-  so the awning stays open on thin high-cloud days but closes on genuinely overcast days.
-  The mid-cloud hard gate (MID_CLOUD_THRESHOLD_PCT) applies in cirrus mode as well.
+Sunshine detection uses a cross-model OR gate:
+  sunny_enough = (shortwave_radiation >= MIN_GHI_WM2) OR (uv_index >= MIN_UV_INDEX)
+
+GHI (shortwave_radiation) comes from ECMWF. UV Index comes from GFS — a completely
+separate NWP model. Together they provide cross-model corroboration: if either
+signal says it's bright enough to matter, the awning should be open.
+
+The awning has two jobs: block UV (relevant even on cloudy-high-UV days) AND block
+heat/brightness (relevant on sunny-low-UV days). Either condition alone warrants
+opening.
 
 Smoothing: All numeric sensor inputs are passed through a weighted rolling average
 (weights [4,3,2,1] for current and up to 3 cached prior readings, normalized) before
@@ -197,7 +200,7 @@ class WeatherAPIError(Exception):
 READINGS_CACHE_PATH = Path.home() / ".config" / "awning" / "readings-cache.json"
 
 # Keys that are stored/loaded from the readings cache
-_CACHE_KEYS = ["dni", "wind", "temp", "precip", "cloud_total", "cloud_low", "cloud_mid", "cloud_high"]
+_CACHE_KEYS = ["ghi", "uv_index", "dni", "wind", "temp", "precip", "cloud_total", "cloud_low", "cloud_mid", "cloud_high"]
 
 # Linear weights for [current, n-1, n-2, n-3] — normalized before use
 _SMOOTHING_WEIGHTS = [4, 3, 2, 1]
@@ -277,9 +280,9 @@ def compute_smoothed_weather(
     The cache entries are expected oldest-first; the most-recent prior is
     prior_entries[-1].
 
-    Smoothed fields: dni, wind, temp, precip, cloud_total, cloud_low,
-    cloud_mid, cloud_high.  All other fields in ``raw`` are passed through
-    unchanged.
+    Smoothed fields: ghi, uv_index, dni, wind, temp, precip, cloud_total,
+    cloud_low, cloud_mid, cloud_high.  All other fields in ``raw`` are passed
+    through unchanged.
 
     Args:
         raw: Current weather reading (from fetch_weather())
@@ -290,6 +293,8 @@ def compute_smoothed_weather(
     """
     # Map from cache key → weather dict key
     field_map = {
+        "ghi": "shortwave_radiation",
+        "uv_index": "uv_index",
         "dni": "dni",
         "wind": "wind_speed_10m",
         "temp": "temperature",
@@ -337,9 +342,11 @@ def _raw_reading_from_weather(weather: dict) -> dict:
         weather: Weather dict from fetch_weather()
 
     Returns:
-        Dict with cache keys (dni, wind, temp, precip, cloud_total/low/mid/high)
+        Dict with cache keys (ghi, uv_index, dni, wind, temp, precip, cloud_total/low/mid/high)
     """
     return {
+        "ghi": weather["shortwave_radiation"],
+        "uv_index": weather["uv_index"],
         "dni": weather["dni"],
         "wind": weather["wind_speed_10m"],
         "temp": weather["temperature"],
@@ -358,6 +365,8 @@ _MEASUREMENT_INTERVAL_SECONDS = 60
 
 # Numeric fields that are averaged across measurements (all others pass through from first reading)
 _AVERAGED_FIELDS = [
+    "shortwave_radiation",
+    "uv_index",
     "wind_speed_10m",
     "precipitation",
     "temperature",
@@ -448,7 +457,9 @@ def collect_weather_measurements(lat: float, lon: float) -> dict:
         samples.append(sample)
 
         logger.info(
-            f"Sample {i + 1}: DNI {sample['dni']:.0f} W/m², "
+            f"Sample {i + 1}: GHI {sample['shortwave_radiation']:.0f} W/m², "
+            f"UV {sample['uv_index']:.1f}, "
+            f"DNI (obs) {sample['dni']:.0f} W/m², "
             f"{sample['wind_speed_10m']:.1f} mph wind, "
             f"{sample['precipitation']:.2f} mm/h rain, "
             f"{sample['temperature']:.1f}°F"
@@ -480,7 +491,9 @@ def collect_weather_measurements(lat: float, lon: float) -> dict:
         averaged[field] = sum(values) / num_samples
 
     logger.info(
-        f"Average ({num_samples} samples): DNI {averaged['dni']:.0f} W/m², "
+        f"Average ({num_samples} samples): GHI {averaged['shortwave_radiation']:.0f} W/m², "
+        f"UV {averaged['uv_index']:.1f}, "
+        f"DNI (obs) {averaged['dni']:.0f} W/m², "
         f"{averaged['wind_speed_10m']:.1f} mph wind, "
         f"{averaged['precipitation']:.2f} mm/h rain, "
         f"{averaged['temperature']:.1f}°F"
@@ -561,24 +574,19 @@ def load_location_config(env_file: Optional[Path] = None) -> tuple[float, float]
     return latitude, longitude
 
 
-def get_thresholds() -> tuple[float, float, float, float, float, float, float, float, float]:
+def get_thresholds() -> tuple[float, float, float, float]:
     """
     Get weather thresholds from environment variables.
 
     Returns:
-        Tuple of (wind_speed_threshold_mph, min_sun_altitude, min_dni,
-                  max_low_cloud, max_mid_cloud, cirrus_high_threshold, min_dni_cirrus,
-                  mid_cloud_threshold, dni_mid_cloud_override)
-        Types: (float, float, float, float, float, float, float, float, float)
+        Tuple of (wind_speed_threshold_mph, min_sun_altitude, min_ghi, min_uv_index)
+        Types: (float, float, float, float)
             wind_speed_threshold_mph: float — mph, upper wind limit to open awning
             min_sun_altitude: float — degrees above horizon, lower sun altitude limit
-            min_dni: float — W/m², lower DNI limit for normal (non-cirrus) sunny check
-            max_low_cloud: float — %, upper low-cloud limit for sunny check and cirrus classification
-            max_mid_cloud: float — %, upper mid-cloud limit for cirrus classification (NOT the hard gate)
-            cirrus_high_threshold: float — %, lower high-cloud limit to classify as cirrus-dominated
-            min_dni_cirrus: float — W/m², lower DNI limit when cirrus-dominated (relaxed threshold)
-            mid_cloud_threshold: float — %, hard gate on mid-cloud cover (is_sunny gate, overridable by DNI)
-            dni_mid_cloud_override: float — W/m², DNI above which mid-cloud gate is vetoed
+            min_ghi: float — W/m², minimum global horizontal irradiance (shortwave_radiation)
+                to consider it sunny; 400 W/m² is the 'enough sun to matter' threshold
+            min_uv_index: float — minimum UV Index (dimensionless) to consider UV significant;
+                UV 3 is moderate, 6 is high — 4 is the 'you'd recommend sunscreen' threshold
 
     Raises:
         ConfigurationError: If threshold variables are missing or invalid
@@ -599,19 +607,10 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
             "Please add it to your .env file (e.g., MIN_SUN_ALTITUDE_DEG=20)"
         )
 
-    # Get minimum direct normal irradiance threshold
-    dni_str = os.getenv("MIN_DIRECT_IRRADIANCE_WM2", "").strip()
-    if not dni_str:
-        raise ConfigurationError(
-            "MIN_DIRECT_IRRADIANCE_WM2 environment variable is not set. "
-            "Please add it to your .env file (e.g., MIN_DIRECT_IRRADIANCE_WM2=300)"
-        )
-
     # Parse required thresholds
     try:
         wind_threshold = float(wind_str)
         altitude_threshold = float(altitude_str)
-        dni_threshold = float(dni_str)
     except ValueError as e:
         raise ConfigurationError(
             f"Invalid threshold format: {e}. Must be numbers."
@@ -626,108 +625,38 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
         raise ConfigurationError(
             f"MIN_SUN_ALTITUDE_DEG must be between 0 and 90, got: {altitude_threshold}"
         )
-    if dni_threshold < 0:
-        raise ConfigurationError(
-            f"MIN_DIRECT_IRRADIANCE_WM2 must be non-negative, got: {dni_threshold}"
-        )
 
-    # Get low cloud cover threshold (optional, defaults to 40%)
-    max_low_cloud_str = os.getenv("MAX_LOW_CLOUD_PERCENT", "40").strip()
+    # Get minimum GHI threshold (optional, default 400 W/m²)
+    min_ghi_str = os.getenv("MIN_GHI_WM2", "400").strip()
     try:
-        max_low_cloud = float(max_low_cloud_str)
+        min_ghi = float(min_ghi_str)
     except ValueError as e:
         raise ConfigurationError(
-            f"Invalid MAX_LOW_CLOUD_PERCENT format: {e}. Must be a number."
+            f"Invalid MIN_GHI_WM2 format: {e}. Must be a number."
         ) from e
-    if not (0 <= max_low_cloud <= 100):
+    if min_ghi <= 0:
         raise ConfigurationError(
-            f"MAX_LOW_CLOUD_PERCENT must be between 0 and 100, got: {max_low_cloud}"
+            f"MIN_GHI_WM2 must be > 0; a value of 0 would always trigger the GHI arm "
+            f"of the sunny gate, effectively disabling it as a discriminator. "
+            f"Received: {min_ghi}"
         )
 
-    # Get mid cloud cover threshold for cirrus classification (optional, defaults to 20%)
-    max_mid_cloud_str = os.getenv("MAX_MID_CLOUD_PERCENT", "20").strip()
+    # Get minimum UV Index threshold (optional, default 4)
+    min_uv_str = os.getenv("MIN_UV_INDEX", "4").strip()
     try:
-        max_mid_cloud = float(max_mid_cloud_str)
+        min_uv_index = float(min_uv_str)
     except ValueError as e:
         raise ConfigurationError(
-            f"Invalid MAX_MID_CLOUD_PERCENT format: {e}. Must be a number."
+            f"Invalid MIN_UV_INDEX format: {e}. Must be a number."
         ) from e
-    if not (0 <= max_mid_cloud <= 100):
+    if min_uv_index <= 0:
         raise ConfigurationError(
-            f"MAX_MID_CLOUD_PERCENT must be between 0 and 100, got: {max_mid_cloud}"
+            f"MIN_UV_INDEX must be > 0; a value of 0 would always trigger the UV arm "
+            f"of the sunny gate, effectively disabling it as a discriminator. "
+            f"Received: {min_uv_index}"
         )
 
-    # Get high cloud cover threshold to classify as cirrus-dominated (optional, defaults to 60%)
-    cirrus_high_str = os.getenv("CIRRUS_HIGH_CLOUD_THRESHOLD", "60").strip()
-    try:
-        cirrus_high_threshold = float(cirrus_high_str)
-    except ValueError as e:
-        raise ConfigurationError(
-            f"Invalid CIRRUS_HIGH_CLOUD_THRESHOLD format: {e}. Must be a number."
-        ) from e
-    if not (0 <= cirrus_high_threshold <= 100):
-        raise ConfigurationError(
-            f"CIRRUS_HIGH_CLOUD_THRESHOLD must be between 0 and 100, got: {cirrus_high_threshold}"
-        )
-
-    # Get lower DNI threshold used when cirrus-dominated (optional, defaults to 30 W/m²)
-    min_dni_cirrus_str = os.getenv("MIN_DNI_CIRRUS_WM2", "30").strip()
-    try:
-        min_dni_cirrus = float(min_dni_cirrus_str)
-    except ValueError as e:
-        raise ConfigurationError(
-            f"Invalid MIN_DNI_CIRRUS_WM2 format: {e}. Must be a number."
-        ) from e
-    if min_dni_cirrus < 0:
-        raise ConfigurationError(
-            f"MIN_DNI_CIRRUS_WM2 must be non-negative, got: {min_dni_cirrus}"
-        )
-
-    # Get mid cloud cover hard gate for is_sunny (optional, defaults to 50%)
-    mid_cloud_threshold_str = os.getenv("MID_CLOUD_THRESHOLD_PCT", "50").strip()
-    try:
-        mid_cloud_threshold = float(mid_cloud_threshold_str)
-    except ValueError as e:
-        raise ConfigurationError(
-            f"Invalid MID_CLOUD_THRESHOLD_PCT format: {e}. Must be a number."
-        ) from e
-    if not (0 <= mid_cloud_threshold <= 100):
-        raise ConfigurationError(
-            f"MID_CLOUD_THRESHOLD_PCT must be between 0 and 100, got: {mid_cloud_threshold}"
-        )
-
-    # Get DNI threshold above which the mid-cloud gate is vetoed (optional, defaults to 400 W/m²)
-    # Physical rationale: altostratus/altocumulus at 73-100% coverage attenuates direct beam
-    # radiation by 80-95%, yielding DNI well under 200 W/m² even on a clear-sky day of ~850 W/m².
-    # If observed DNI is >= 400 W/m², the cloud_mid model value is physically contradictory —
-    # that irradiance level requires substantial direct beam transmission and the DNI sensor
-    # is the more reliable source of ground-truth in this conflict.
-    dni_mid_cloud_override_str = os.getenv("DNI_MID_CLOUD_OVERRIDE_WM2", "400").strip()
-    try:
-        dni_mid_cloud_override = float(dni_mid_cloud_override_str)
-    except ValueError as e:
-        raise ConfigurationError(
-            f"Invalid DNI_MID_CLOUD_OVERRIDE_WM2 format: {e}. Must be a number."
-        ) from e
-    if dni_mid_cloud_override <= 0:
-        raise ConfigurationError(
-            f"DNI_MID_CLOUD_OVERRIDE_WM2 must be > 0, got: {dni_mid_cloud_override}. "
-            "A value of 0 would always veto the mid-cloud gate, silently disabling it."
-        )
-    # H-2: Warn when override is at or below the normal DNI threshold — in that range the
-    # override fires whenever the awning would open anyway, so the mid-cloud gate is
-    # effectively always bypassed and operators should know.
-    if dni_mid_cloud_override <= dni_threshold:
-        logger.warning(
-            "DNI_MID_CLOUD_OVERRIDE_WM2 (%.0f W/m²) is <= MIN_DIRECT_IRRADIANCE_WM2 (%.0f W/m²). "
-            "The mid-cloud gate will always be vetoed whenever the awning is otherwise eligible "
-            "to open — the gate is effectively disabled. Increase DNI_MID_CLOUD_OVERRIDE_WM2 "
-            "above MIN_DIRECT_IRRADIANCE_WM2 if you want the gate to enforce anything.",
-            dni_mid_cloud_override,
-            dni_threshold,
-        )
-
-    return wind_threshold, altitude_threshold, dni_threshold, max_low_cloud, max_mid_cloud, cirrus_high_threshold, min_dni_cirrus, mid_cloud_threshold, dni_mid_cloud_override
+    return wind_threshold, altitude_threshold, min_ghi, min_uv_index
 
 
 def load_telegram_config() -> tuple[Optional[str], Optional[str]]:
@@ -798,7 +727,11 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
     params = {
         "latitude": lat,
         "longitude": lon,
-        "current": "wind_speed_10m,precipitation,is_day,temperature_2m,direct_normal_irradiance,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high",
+        "current": (
+            "wind_speed_10m,precipitation,is_day,temperature_2m,"
+            "shortwave_radiation,uv_index,direct_normal_irradiance,"
+            "cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high"
+        ),
         "daily": "sunrise,sunset",
         "wind_speed_unit": "mph",
         "temperature_unit": "fahrenheit",
@@ -814,12 +747,26 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
             raise WeatherAPIError("Weather API response missing 'current' field")
 
         current = data["current"]
-        required_fields = ["wind_speed_10m", "precipitation", "temperature_2m", "direct_normal_irradiance"]
+        required_fields = ["wind_speed_10m", "precipitation", "temperature_2m", "shortwave_radiation", "uv_index"]
         for field in required_fields:
             if field not in current:
                 raise WeatherAPIError(
                     f"Weather API response missing '{field}' in current data"
                 )
+
+        # Explicitly check for null values in radiation fields.
+        # Open-Meteo can return JSON null for shortwave_radiation or uv_index when
+        # the field is outside the model's forecast window or GFS coverage lapses.
+        # The key-presence check above accepts null values, which would later crash
+        # at threshold comparisons with TypeError.
+        shortwave_radiation = current["shortwave_radiation"]
+        uv_index = current["uv_index"]
+        if shortwave_radiation is None or uv_index is None:
+            raise WeatherAPIError(
+                f"Weather API returned null for required field(s): "
+                f"shortwave_radiation={shortwave_radiation}, uv_index={uv_index}. "
+                f"This can happen when GFS coverage is unavailable outside the forecast window."
+            )
 
         # Extract daily data (sunrise/sunset)
         if "daily" not in data:
@@ -835,7 +782,10 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
             "wind_speed_10m": current["wind_speed_10m"],
             "precipitation": current["precipitation"],
             "temperature": current["temperature_2m"],
-            "dni": current["direct_normal_irradiance"],
+            "shortwave_radiation": current["shortwave_radiation"],
+            "uv_index": current["uv_index"],
+            # DNI kept for observability logging only — not used in decisions
+            "dni": current.get("direct_normal_irradiance", 0),
             "cloud_cover": current.get("cloud_cover", 100),
             "cloud_cover_low": current.get("cloud_cover_low", 100),
             "cloud_cover_mid": current.get("cloud_cover_mid", 100),
@@ -939,25 +889,18 @@ def should_open_awning(
     current_time: datetime,
     wind_threshold: float,
     altitude_threshold: float,
-    dni_threshold: float,
-    max_low_cloud: float,
-    max_mid_cloud: float,
-    cirrus_high_threshold: float,
-    min_dni_cirrus: float,
-    mid_cloud_threshold: float,
-    dni_mid_cloud_override: float,
+    min_ghi: float,
+    min_uv_index: float,
 ) -> tuple[bool, str, dict]:
     """
     Determine if awning should be open based on ALL conditions.
 
-    Sunshine detection is cirrus-aware:
-    - Cirrus-dominated: cloud_cover_high > cirrus_high_threshold AND
-      cloud_cover_low < max_low_cloud AND cloud_cover_mid < max_mid_cloud
-    - When cirrus-dominated, uses min_dni_cirrus as the DNI threshold (lower bar)
-    - Otherwise uses dni_threshold as the DNI threshold
-    - is_sunny requires cloud_cover_low < max_low_cloud AND cloud_cover_mid < mid_cloud_threshold
-      UNLESS DNI >= dni_mid_cloud_override, in which case the mid-cloud gate is vetoed
-      (high DNI is physically incompatible with heavy mid-level cloud cover)
+    Sunshine detection uses a cross-model OR gate:
+      sunny_enough = (shortwave_radiation >= min_ghi) OR (uv_index >= min_uv_index)
+
+    GHI (shortwave_radiation) comes from ECMWF. UV Index comes from GFS — a separate
+    NWP model. Either signal alone is sufficient evidence of solar activity significant
+    enough to warrant shade.
 
     Args:
         weather: Weather data from fetch_weather()
@@ -965,14 +908,8 @@ def should_open_awning(
         current_time: Current datetime
         wind_threshold: Maximum wind speed (mph) for "calm"
         altitude_threshold: Minimum sun altitude (degrees) above horizon
-        dni_threshold: Minimum direct normal irradiance (W/m²) for "sunny" (normal mode)
-        max_low_cloud: Maximum low cloud cover (%) allowed to open awning
-        max_mid_cloud: Maximum mid cloud cover (%) for cirrus classification
-        cirrus_high_threshold: Minimum high cloud cover (%) to classify as cirrus-dominated
-        min_dni_cirrus: Lower DNI threshold (W/m²) used when cirrus-dominated
-        mid_cloud_threshold: Maximum mid cloud cover (%) hard gate for is_sunny
-        dni_mid_cloud_override: DNI (W/m²) above which the mid-cloud gate is vetoed;
-            altostratus/altocumulus at 73-100% cannot physically produce this irradiance
+        min_ghi: Minimum global horizontal irradiance (W/m²) for sunny_enough
+        min_uv_index: Minimum UV Index for sunny_enough
 
     Returns:
         Tuple of (should_open, reason, conditions_dict)
@@ -981,10 +918,8 @@ def should_open_awning(
     wind_speed = weather["wind_speed_10m"]
     precipitation = weather["precipitation"]
     temperature = weather["temperature"]
-    dni = weather["dni"]
-    cloud_cover_low = weather["cloud_cover_low"]
-    cloud_cover_mid = weather["cloud_cover_mid"]
-    cloud_cover_high = weather["cloud_cover_high"]
+    ghi = weather["shortwave_radiation"]
+    uv_index = weather["uv_index"]
     sunrise = weather["sunrise"]
     sunset = weather["sunset"]
 
@@ -992,39 +927,10 @@ def should_open_awning(
     azimuth = sun_position["azimuth"]
     altitude = sun_position["altitude"]
 
-    # Determine if sky is cirrus-dominated (high thin clouds, low/mid clouds minimal)
-    cirrus_dominated = (
-        cloud_cover_high > cirrus_high_threshold
-        and cloud_cover_low < max_low_cloud
-        and cloud_cover_mid < max_mid_cloud
-    )
-
-    # Select effective DNI threshold based on cirrus classification
-    effective_dni_threshold = min_dni_cirrus if cirrus_dominated else dni_threshold
-
-    # Check whether DNI is high enough to veto the mid-cloud gate.
-    # Physical basis: altostratus/altocumulus at 73-100% coverage attenuates direct-beam
-    # radiation by 80-95%, so observed DNI >= dni_mid_cloud_override is physically
-    # incompatible with that level of mid-cloud cover. Trust the DNI reading and ignore
-    # the cloud_mid model value when this conflict occurs.
-    #
-    # H-1 — Cirrus/override interaction: the default override threshold (400 W/m²) sits well
-    # above the cirrus DNI range (30-200 W/m²), so when cirrus_dominated=True this branch
-    # does NOT activate in practice (cirrus DNI will not reach 400 W/m²). The cirrus path
-    # is handled separately via effective_dni_threshold / min_dni_cirrus above.
-    # If max_mid_cloud (used in cirrus classification) is ever relaxed to cover denser clouds
-    # that can produce higher DNI, revisit whether the override threshold is still appropriate.
-    mid_cloud_gate_vetoed = dni >= dni_mid_cloud_override
-
-    # Evaluate sunny condition:
-    # - DNI must meet the effective threshold (lower if cirrus-dominated)
-    # - Low clouds must be below max_low_cloud (high clouds handled by cirrus logic)
-    # - Mid clouds must be below mid_cloud_threshold (hard gate), UNLESS DNI override is active
-    is_sunny = (
-        dni >= effective_dni_threshold
-        and cloud_cover_low < max_low_cloud
-        and (mid_cloud_gate_vetoed or cloud_cover_mid < mid_cloud_threshold)
-    )
+    # Evaluate sunny condition: OR gate across two independent NWP models
+    ghi_sunny = ghi >= min_ghi
+    uv_sunny = uv_index >= min_uv_index
+    is_sunny = ghi_sunny or uv_sunny
 
     is_calm = wind_speed < wind_threshold
     no_rain = precipitation == 0
@@ -1032,16 +938,6 @@ def should_open_awning(
     is_day = is_daytime(current_time, sunrise, sunset)
     sun_high_enough = altitude >= altitude_threshold
     sun_facing_se = is_sun_facing_window(azimuth)
-
-    # Build conditions dict for logging.
-    # M-1 Convention: the conditions dict mixes two kinds of fields:
-    #   - Decision fields: must ALL be True to open the awning (e.g. sunny, calm, no_rain).
-    #   - Diagnostic fields: stored here for logging and Telegram context but are NOT part
-    #     of the open/close decision. They MUST be listed in DIAGNOSTIC_CONDITION_KEYS so
-    #     the primary_conditions filter excludes them automatically.
-    #     When adding a new diagnostic field, add its key to DIAGNOSTIC_CONDITION_KEYS only —
-    #     the filter below picks that up without any other change.
-    DIAGNOSTIC_CONDITION_KEYS = ("cirrus_dominated", "mid_cloud_gate_vetoed")
 
     conditions = {
         "sunny": is_sunny,
@@ -1051,32 +947,25 @@ def should_open_awning(
         "daytime": is_day,
         "sun_high": sun_high_enough,
         "sun_facing_window": sun_facing_se,
-        # Diagnostic fields — excluded from primary_conditions via DIAGNOSTIC_CONDITION_KEYS:
-        "cirrus_dominated": cirrus_dominated,
-        "mid_cloud_gate_vetoed": mid_cloud_gate_vetoed,
     }
 
-    # All primary conditions must be True to open awning.
-    # Diagnostic fields are excluded so they cannot accidentally block opening.
-    primary_conditions = {k: v for k, v in conditions.items() if k not in DIAGNOSTIC_CONDITION_KEYS}
-    should_open = all(primary_conditions.values())
+    should_open = all(conditions.values())
 
-    # Build detailed reason string.
-    # M-3 Note: the exact shape of `reason` (inline notes, bracket annotations, etc.) is an
-    # informal human-readable summary for logs and Telegram messages. Downstream tooling
-    # (Telegram, log parsers) must NOT depend on its exact string format — parse the
-    # structured `conditions` dict instead for programmatic inspection of decision state.
-    cirrus_label = f" [cirrus override, threshold={effective_dni_threshold:.0f} W/m²]" if cirrus_dominated else ""
+    # Build sunny signal trace for logging
+    if is_sunny:
+        if ghi_sunny and uv_sunny:
+            sunny_trace = f"GHI {ghi:.0f} W/m² >= {min_ghi:.0f} AND UV {uv_index:.1f} >= {min_uv_index:.1f}"
+        elif ghi_sunny:
+            sunny_trace = f"GHI only: GHI {ghi:.0f} W/m² >= {min_ghi:.0f}, UV {uv_index:.1f} < {min_uv_index:.1f}"
+        else:
+            sunny_trace = f"UV only: UV {uv_index:.1f} >= {min_uv_index:.1f}, GHI {ghi:.0f} W/m² < {min_ghi:.0f}"
+    else:
+        sunny_trace = f"GHI {ghi:.0f} W/m² < {min_ghi:.0f} AND UV {uv_index:.1f} < {min_uv_index:.1f}"
+
+    # Build detailed reason string
     reasons = []
     if not is_sunny:
-        if dni < effective_dni_threshold:
-            reasons.append(
-                f"Not sunny (DNI {dni:.0f} < {effective_dni_threshold:.0f} W/m²{cirrus_label})"
-            )
-        if cloud_cover_low >= max_low_cloud:
-            reasons.append(f"Too cloudy (low clouds {cloud_cover_low:.0f}% >= {max_low_cloud:.0f}%)")
-        if cloud_cover_mid >= mid_cloud_threshold and not mid_cloud_gate_vetoed:
-            reasons.append(f"Too cloudy (mid clouds {cloud_cover_mid:.0f}% >= {mid_cloud_threshold:.0f}%)")
+        reasons.append(f"Not sunny: {sunny_trace}")
     if not is_calm:
         reasons.append(f"Too windy ({wind_speed} >= {wind_threshold} mph)")
     if not no_rain:
@@ -1093,12 +982,9 @@ def should_open_awning(
         reasons.append(f"Sun not facing window (azimuth {azimuth:.1f}°, need 90°-220°)")
 
     if should_open:
-        cirrus_note = f" (cirrus override, threshold={effective_dni_threshold:.0f} W/m²)" if cirrus_dominated else ""
-        mid_cloud_veto_note = f" [DNI override active: DNI {dni:.0f} W/m² vetoes cloud_mid {cloud_cover_mid:.0f}%]" if mid_cloud_gate_vetoed and cloud_cover_mid >= mid_cloud_threshold else ""
         reason = (
-            f"All conditions met: DNI {dni:.0f} W/m²{cirrus_note}{mid_cloud_veto_note}, low clouds {cloud_cover_low:.0f}%, "
-            f"mid {cloud_cover_mid:.0f}%, high {cloud_cover_high:.0f}%, "
-            f"{wind_speed} mph wind, {precipitation} mm/h rain, {temperature}°F, "
+            f"All conditions met: Sunny ({sunny_trace}), "
+            f"wind {wind_speed} mph, rain {precipitation} mm/h, {temperature}°F, "
             f"sun azimuth {azimuth:.1f}° (altitude {altitude:.1f}°)"
         )
     else:
@@ -1113,20 +999,20 @@ def _format_friendly_telegram_message(
     wind_speed: float,
     precipitation: float,
     temperature: float,
-    cloud_cover_low: float,
-    cloud_cover_high: float,
+    ghi: float,
+    uv_index: float,
 ) -> str:
     """
     Format a human-friendly Telegram notification message.
 
     Args:
         should_open: Whether awning should be open
-        conditions: Dictionary of condition flags (may include cirrus_dominated)
+        conditions: Dictionary of condition flags
         wind_speed: Wind speed in mph
         precipitation: Precipitation in mm/h
         temperature: Temperature in F
-        cloud_cover_low: Low cloud cover percentage
-        cloud_cover_high: High cloud cover percentage
+        ghi: Global horizontal irradiance (shortwave_radiation) in W/m²
+        uv_index: UV Index (dimensionless)
 
     Returns:
         Friendly message string with appropriate emoji
@@ -1135,11 +1021,10 @@ def _format_friendly_telegram_message(
         # Opening message - simple and positive
         temp_f = int(round(temperature))
         wind_mph = int(round(wind_speed))
-        cirrus_note = " (cirrus)" if conditions.get("cirrus_dominated") else ""
-        return f"☀️ Awning opened - sunny{cirrus_note} & calm ({temp_f}°F, {wind_mph} mph wind)"
+        return f"☀️ Awning opened - sunny & calm ({temp_f}°F, {wind_mph} mph wind)"
 
     # Closing message - determine primary reason and emoji
-    # Priority: rain > wind > cold > cloudy > nighttime > sun position
+    # Priority: rain > wind > cold > not sunny > nighttime > sun position
 
     if not conditions["no_rain"]:
         precip = round(precipitation, 1)
@@ -1154,10 +1039,10 @@ def _format_friendly_telegram_message(
         return f"❄️ Awning closed: Too cold ({temp_f}°F)"
 
     if not conditions["sunny"]:
-        # Include cloud cover details for cloudy closures
-        clouds_low = int(round(cloud_cover_low))
-        clouds_high = int(round(cloud_cover_high))
-        return f"☁️ Awning closed: Cloudy ({clouds_low}% low, {clouds_high}% high)"
+        # Report causal values (GHI and UV), not cloud_cover percentages.
+        # cloud_cover is now observational only and is NOT a decision input —
+        # the sunny gate is driven by GHI (ECMWF) and UV Index (GFS).
+        return f"☁️ Awning closed: Not enough sun (GHI {ghi:.0f} W/m², UV {uv_index:.1f})"
 
     if not conditions["daytime"]:
         return "🌙 Awning closed: Nighttime"
@@ -1202,12 +1087,9 @@ def main() -> None:
         logger.info(f"Location: {latitude:.4f}, {longitude:.4f}")
 
         # Get thresholds
-        wind_threshold, altitude_threshold, dni_threshold, max_low_cloud, max_mid_cloud, cirrus_high_threshold, min_dni_cirrus, mid_cloud_threshold, dni_mid_cloud_override = get_thresholds()
+        wind_threshold, altitude_threshold, min_ghi, min_uv_index = get_thresholds()
         logger.info(
-            f"Thresholds: DNI >= {dni_threshold:.0f} W/m² (cirrus: {min_dni_cirrus:.0f} W/m²), "
-            f"Low clouds < {max_low_cloud:.0f}%, Mid clouds < {mid_cloud_threshold:.0f}% "
-            f"(override when DNI >= {dni_mid_cloud_override:.0f} W/m²), "
-            f"Cirrus: high > {cirrus_high_threshold:.0f}% AND mid < {max_mid_cloud:.0f}%, "
+            f"Thresholds: GHI >= {min_ghi:.0f} W/m² OR UV >= {min_uv_index:.1f}, "
             f"Wind < {wind_threshold} mph, Rain = 0 mm/h, Temp > 40°F, "
             f"Sun altitude >= {altitude_threshold}°, Sun facing window (90°-220°)"
         )
@@ -1242,6 +1124,15 @@ def main() -> None:
             f"Sunset {weather['sunset'][11:16]}"
         )
 
+        # Log observational values (not used in decisions, for validation)
+        logger.info(
+            f"Observational (not used in decisions): "
+            f"DNI {weather['dni']:.0f} W/m², "
+            f"cloud_cover_low {weather['cloud_cover_low']:.0f}%, "
+            f"cloud_cover_mid {weather['cloud_cover_mid']:.0f}%, "
+            f"cloud_cover_high {weather['cloud_cover_high']:.0f}%"
+        )
+
         # Evaluate all conditions
         should_open, reason, conditions = should_open_awning(
             weather,
@@ -1249,39 +1140,11 @@ def main() -> None:
             current_time,
             wind_threshold,
             altitude_threshold,
-            dni_threshold,
-            max_low_cloud,
-            max_mid_cloud,
-            cirrus_high_threshold,
-            min_dni_cirrus,
-            mid_cloud_threshold,
-            dni_mid_cloud_override,
+            min_ghi,
+            min_uv_index,
         )
 
-        # Log cirrus detection state
-        cirrus_dominated = conditions.get("cirrus_dominated", False)
-        if cirrus_dominated:
-            logger.info(
-                f"Cirrus override active: high clouds {weather['cloud_cover_high']:.0f}% > {cirrus_high_threshold:.0f}%, "
-                f"low {weather['cloud_cover_low']:.0f}% < {max_low_cloud:.0f}%, "
-                f"mid {weather['cloud_cover_mid']:.0f}% < {max_mid_cloud:.0f}% — "
-                f"using DNI threshold {min_dni_cirrus:.0f} W/m² instead of {dni_threshold:.0f} W/m²"
-            )
-        else:
-            logger.info(
-                f"Normal mode (no cirrus override): using DNI threshold {dni_threshold:.0f} W/m²"
-            )
-
-        # Log DNI mid-cloud gate veto state
-        mid_cloud_gate_vetoed = conditions.get("mid_cloud_gate_vetoed", False)
-        if mid_cloud_gate_vetoed:
-            logger.info(
-                f"DNI override active: DNI {weather['dni']:.0f} W/m² vetoes cloud_mid "
-                f"{weather['cloud_cover_mid']:.0f}% (mid-cloud gate suppressed, "
-                f"DNI >= {dni_mid_cloud_override:.0f} W/m² threshold)"
-            )
-
-        # Log conditions with checkmarks/crosses (skip cirrus_dominated — logged separately above)
+        # Log conditions with checkmarks/crosses
         condition_symbols = {
             "sunny": "Sunny" if conditions["sunny"] else "Not sunny",
             "calm": "Calm" if conditions["calm"] else "Windy",
@@ -1332,8 +1195,8 @@ def main() -> None:
                 weather["wind_speed_10m"],
                 weather["precipitation"],
                 weather["temperature"],
-                weather["cloud_cover_low"],
-                weather["cloud_cover_high"],
+                weather["shortwave_radiation"],
+                weather["uv_index"],
             )
             send_telegram_notification(telegram_token, telegram_chat_id, msg)
 
