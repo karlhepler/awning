@@ -22,12 +22,12 @@ def _weather(
     shortwave_radiation=500.0,
     uv_index=6.0,
     dni=450.0,
+    cloud_cover=20.0,
     sunrise="2026-04-17T06:00:00",
     sunset="2026-04-17T20:00:00",
 ):
-    # Note: cloud_cover* fields are NOT included here because they are observational
-    # only and are not read by should_open_awning() — the sunny gate is driven by
-    # shortwave_radiation (GHI) and uv_index, not cloud cover percentages.
+    # cloud_cover is included because it feeds Layer 2 (observational sunny gate).
+    # Default 20% represents a clear-to-partly-cloudy day (well below MAX_CLOUD_COVER_PCT=80).
     return {
         "wind_speed_10m": wind_speed,
         "precipitation": precipitation,
@@ -35,6 +35,7 @@ def _weather(
         "shortwave_radiation": shortwave_radiation,
         "uv_index": uv_index,
         "dni": dni,
+        "cloud_cover": cloud_cover,
         "sunrise": sunrise,
         "sunset": sunset,
     }
@@ -50,6 +51,8 @@ _THRESHOLDS = dict(
     altitude_threshold=20.0,
     min_ghi=400.0,
     min_uv_index=4.0,
+    min_dni=50.0,
+    max_cloud_cover=80.0,
 )
 
 # Daytime moment that falls between the default sunrise/sunset strings above
@@ -168,14 +171,15 @@ class TestShouldOpenAwningOrGate(unittest.TestCase):
     # Both signals now well above threshold → opens.
     # ------------------------------------------------------------------
     def test_nwp_bug_scenario_both_high_opens(self):
-        """Card's bug scenario: GHI=658, UV=6.8 — both above threshold → opens."""
+        """Card's original bug: GHI=658, UV=6.8, DNI=45 but cloud=30% → opens via cloud_cover gate."""
+        # DNI=45 is just below min_dni=50, but cloud=30% < max_cloud_cover=80%
+        # so sunny_observed is True via cloud_cover. Both layers pass → opens.
         should_open, reason, conditions = should_open_awning(
             weather=_weather(
                 shortwave_radiation=658.0,
                 uv_index=6.8,
-                # Simulate the co-failed DNI field that triggered the original bug;
-                # cloud_cover_mid is now observational-only and not included in _weather()
                 dni=45.0,
+                cloud_cover=30.0,
             ),
             sun_position=_sun(),
             current_time=_DAYTIME,
@@ -384,6 +388,178 @@ class TestShouldOpenAwningOrGate(unittest.TestCase):
                 fetch_weather(37.7, -122.4)
             self.assertIn("null", str(ctx.exception).lower())
             self.assertIn("uv_index", str(ctx.exception))
+
+    # ------------------------------------------------------------------
+    # Test 16 — Null DNI from Open-Meteo raises WeatherAPIError (fail-safe)
+    # If direct_normal_irradiance is JSON null, fetch_weather() must raise
+    # WeatherAPIError rather than returning None, which would crash later
+    # at `dni >= min_dni` with TypeError — bypassing the fail-safe close.
+    # ------------------------------------------------------------------
+    def test_null_direct_normal_irradiance_raises_weather_api_error(self):
+        """fetch_weather() must raise WeatherAPIError when direct_normal_irradiance is null."""
+        from unittest.mock import patch, MagicMock
+
+        null_response = {
+            "current": {
+                "wind_speed_10m": 5.0,
+                "precipitation": 0.0,
+                "temperature_2m": 65.0,
+                "shortwave_radiation": 500.0,
+                "uv_index": 6.0,
+                "direct_normal_irradiance": None,  # JSON null
+                "cloud_cover": 20,
+                "cloud_cover_low": 10,
+                "cloud_cover_mid": 5,
+                "cloud_cover_high": 5,
+                "is_day": 1,
+                "time": "2026-04-17T13:00",
+            },
+            "daily": {
+                "sunrise": ["2026-04-17T06:00"],
+                "sunset": ["2026-04-17T20:00"],
+            },
+        }
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = null_response
+        mock_response.raise_for_status.return_value = None
+
+        with patch("awning_automation.requests.get", return_value=mock_response):
+            with self.assertRaises(WeatherAPIError) as ctx:
+                fetch_weather(37.7, -122.4)
+            self.assertIn("null", str(ctx.exception).lower())
+            self.assertIn("direct_normal_irradiance", str(ctx.exception))
+
+    # ------------------------------------------------------------------
+    # Test 17 — Null cloud_cover from Open-Meteo raises WeatherAPIError
+    # Same fail-safe concern: cloud_cover is a Layer 2 decision input.
+    # JSON null must raise WeatherAPIError, not propagate as None.
+    # ------------------------------------------------------------------
+    def test_null_cloud_cover_raises_weather_api_error(self):
+        """fetch_weather() must raise WeatherAPIError when cloud_cover is null."""
+        from unittest.mock import patch, MagicMock
+
+        null_response = {
+            "current": {
+                "wind_speed_10m": 5.0,
+                "precipitation": 0.0,
+                "temperature_2m": 65.0,
+                "shortwave_radiation": 500.0,
+                "uv_index": 6.0,
+                "direct_normal_irradiance": 400.0,
+                "cloud_cover": None,  # JSON null
+                "cloud_cover_low": 10,
+                "cloud_cover_mid": 5,
+                "cloud_cover_high": 5,
+                "is_day": 1,
+                "time": "2026-04-17T13:00",
+            },
+            "daily": {
+                "sunrise": ["2026-04-17T06:00"],
+                "sunset": ["2026-04-17T20:00"],
+            },
+        }
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = null_response
+        mock_response.raise_for_status.return_value = None
+
+        with patch("awning_automation.requests.get", return_value=mock_response):
+            with self.assertRaises(WeatherAPIError) as ctx:
+                fetch_weather(37.7, -122.4)
+            self.assertIn("null", str(ctx.exception).lower())
+            self.assertIn("cloud_cover", str(ctx.exception))
+
+
+class TestObservationalSunnyGate(unittest.TestCase):
+    """Tests for the new Layer 2 observational sunny gate (DNI + cloud_cover)."""
+
+    # ------------------------------------------------------------------
+    # Test 13 — Today's failure scenario: GHI=500, UV=1.1, DNI=10, cloud=95
+    # Model gate: GHI=500 >= 400 → sunny_model=True
+    # Observed gate: DNI=10 < 50 AND cloud=95 >= 80 → sunny_observed=False
+    # is_sunny = True AND False = False → awning must NOT open
+    # ------------------------------------------------------------------
+    def test_today_failure_high_ghi_low_dni_high_cloud_does_not_open(self):
+        """Today's failure: GHI=500 triggers model gate but DNI=10 + cloud=95 block observational gate."""
+        should_open, reason, conditions = should_open_awning(
+            weather=_weather(
+                shortwave_radiation=500.0,
+                uv_index=1.1,
+                dni=10.0,
+                cloud_cover=95.0,
+            ),
+            sun_position=_sun(),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        self.assertFalse(
+            conditions["sunny"],
+            f"Expected sunny=False (observational gate blocks) but got True. reason={reason!r}",
+        )
+        self.assertFalse(
+            should_open,
+            f"Expected awning to stay closed but got True. reason={reason!r}",
+        )
+        self.assertIn("observed failed", reason)
+
+    # ------------------------------------------------------------------
+    # Test 14 — Partly cloudy morning: GHI=450, UV=4.5, DNI=80, cloud=60
+    # Model gate: GHI=450 >= 400 AND UV=4.5 >= 4 → sunny_model=True
+    # Observed gate: DNI=80 >= 50 → sunny_observed=True
+    # is_sunny = True → awning should open
+    # ------------------------------------------------------------------
+    def test_partly_cloudy_morning_high_dni_opens(self):
+        """Partly cloudy: GHI=450, UV=4.5, DNI=80, cloud=60 → both layers pass → opens."""
+        should_open, reason, conditions = should_open_awning(
+            weather=_weather(
+                shortwave_radiation=450.0,
+                uv_index=4.5,
+                dni=80.0,
+                cloud_cover=60.0,
+            ),
+            sun_position=_sun(),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        self.assertTrue(
+            conditions["sunny"],
+            f"Expected sunny=True for partly-cloudy morning but got False. reason={reason!r}",
+        )
+        self.assertTrue(
+            should_open,
+            f"Expected awning to open for partly-cloudy morning but got False. reason={reason!r}",
+        )
+
+    # ------------------------------------------------------------------
+    # Test 15 — Overcast with low DNI: GHI=755, UV=1.1, DNI=14, cloud=100
+    # Mirrors exact verbatim log data from today (2026-04-28).
+    # Model gate: GHI=755 >= 400 → sunny_model=True
+    # Observed gate: DNI=14 < 50 AND cloud=100 >= 80 → sunny_observed=False
+    # is_sunny = False → awning must NOT open
+    # ------------------------------------------------------------------
+    def test_overcast_low_dni_high_cloud_does_not_open(self):
+        """Today's verbatim log data: GHI=755, UV=1.1, DNI=14, cloud=100 → observed gate blocks open."""
+        should_open, reason, conditions = should_open_awning(
+            weather=_weather(
+                shortwave_radiation=755.0,
+                uv_index=1.1,
+                dni=14.0,
+                cloud_cover=100.0,
+            ),
+            sun_position=_sun(),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        self.assertFalse(
+            conditions["sunny"],
+            f"Expected sunny=False for overcast (DNI=14, cloud=100) but got True. reason={reason!r}",
+        )
+        self.assertFalse(
+            should_open,
+            f"Expected awning to stay closed for overcast but got True. reason={reason!r}",
+        )
+        self.assertIn("observed failed", reason)
 
 
 if __name__ == "__main__":

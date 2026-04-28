@@ -7,16 +7,24 @@ Automatically opens/closes awning based on weather conditions.
   daytime, sun high enough, and sun facing window (90°-260°)
 - Closes awning if ANY condition fails
 
-Sunshine detection uses a cross-model OR gate:
-  sunny_enough = (shortwave_radiation >= MIN_GHI_WM2) OR (uv_index >= MIN_UV_INDEX)
+Sunshine detection uses a two-layer gate:
 
-GHI (shortwave_radiation) comes from ECMWF. UV Index comes from GFS — a completely
-separate NWP model. Together they provide cross-model corroboration: if either
-signal says it's bright enough to matter, the awning should be open.
+  Layer 1 — model forecast ('do we want shade?'):
+    sunny_model = (shortwave_radiation >= MIN_GHI_WM2) OR (uv_index >= MIN_UV_INDEX)
+    GHI (shortwave_radiation) comes from ECMWF. UV Index comes from GFS — a completely
+    separate NWP model. Either signal alone is sufficient: the awning has two jobs —
+    block UV (relevant even on cloudy-high-UV days) AND block heat/brightness.
 
-The awning has two jobs: block UV (relevant even on cloudy-high-UV days) AND block
-heat/brightness (relevant on sunny-low-UV days). Either condition alone warrants
-opening.
+  Layer 2 — observational confirmation ('is reality actually sunny?'):
+    sunny_observed = (direct_normal_irradiance >= MIN_DNI_WM2) OR (cloud_cover < MAX_CLOUD_COVER_PCT)
+    DNI is an observational field (measured, not model-forecast) that correctly
+    shows near-zero values during rain/overcast. Cloud cover updates faster than GHI.
+    The OR prevents false-closes when DNI is intermittent on partly-cloudy days.
+
+  sunny_enough = sunny_model AND sunny_observed
+
+Both layers must agree before the awning opens, preventing false-positive opens
+when the model forecast lags rapidly-arriving rain or overcast conditions.
 
 Smoothing: All numeric sensor inputs are passed through a weighted rolling average
 (weights [4,3,2,1] for current and up to 3 cached prior readings, normalized) before
@@ -574,19 +582,25 @@ def load_location_config(env_file: Optional[Path] = None) -> tuple[float, float]
     return latitude, longitude
 
 
-def get_thresholds() -> tuple[float, float, float, float]:
+def get_thresholds() -> tuple[float, float, float, float, float, float]:
     """
     Get weather thresholds from environment variables.
 
     Returns:
-        Tuple of (wind_speed_threshold_mph, min_sun_altitude, min_ghi, min_uv_index)
-        Types: (float, float, float, float)
+        Tuple of (wind_speed_threshold_mph, min_sun_altitude, min_ghi, min_uv_index,
+                  min_dni, max_cloud_cover)
+        Types: (float, float, float, float, float, float)
             wind_speed_threshold_mph: float — mph, upper wind limit to open awning
             min_sun_altitude: float — degrees above horizon, lower sun altitude limit
             min_ghi: float — W/m², minimum global horizontal irradiance (shortwave_radiation)
                 to consider it sunny; 400 W/m² is the 'enough sun to matter' threshold
             min_uv_index: float — minimum UV Index (dimensionless) to consider UV significant;
                 UV 3 is moderate, 6 is high — 4 is the 'you'd recommend sunscreen' threshold
+            min_dni: float — W/m², minimum direct normal irradiance (observational) required
+                to confirm reality is actually sunny; 50 W/m² is above rain/overcast (4-14)
+                but well below typical clear-sky values (300-900 W/m²)
+            max_cloud_cover: float — % maximum total cloud cover to consider it sunny;
+                80% allows partly-cloudy opens while blocking 100% overcast days
 
     Raises:
         ConfigurationError: If threshold variables are missing or invalid
@@ -656,7 +670,35 @@ def get_thresholds() -> tuple[float, float, float, float]:
             f"Received: {min_uv_index}"
         )
 
-    return wind_threshold, altitude_threshold, min_ghi, min_uv_index
+    # Get minimum DNI threshold (optional, default 50 W/m²)
+    # DNI is observational (measured, not model-forecast) — today's rain/overcast shows 4-14 W/m²
+    min_dni_str = os.getenv("MIN_DNI_WM2", "50").strip()
+    try:
+        min_dni = float(min_dni_str)
+    except ValueError as e:
+        raise ConfigurationError(
+            f"Invalid MIN_DNI_WM2 format: {e}. Must be a number."
+        ) from e
+    if min_dni < 0:
+        raise ConfigurationError(
+            f"MIN_DNI_WM2 must be >= 0, got: {min_dni}"
+        )
+
+    # Get maximum cloud cover threshold (optional, default 80%)
+    # Allows partly-cloudy opens while blocking 100% overcast days
+    max_cloud_cover_str = os.getenv("MAX_CLOUD_COVER_PCT", "80").strip()
+    try:
+        max_cloud_cover = float(max_cloud_cover_str)
+    except ValueError as e:
+        raise ConfigurationError(
+            f"Invalid MAX_CLOUD_COVER_PCT format: {e}. Must be a number."
+        ) from e
+    if not (0 <= max_cloud_cover <= 100):
+        raise ConfigurationError(
+            f"MAX_CLOUD_COVER_PCT must be between 0 and 100, got: {max_cloud_cover}"
+        )
+
+    return wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover
 
 
 def load_telegram_config() -> tuple[Optional[str], Optional[str]]:
@@ -754,18 +796,28 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
                     f"Weather API response missing '{field}' in current data"
                 )
 
-        # Explicitly check for null values in radiation fields.
-        # Open-Meteo can return JSON null for shortwave_radiation or uv_index when
-        # the field is outside the model's forecast window or GFS coverage lapses.
-        # The key-presence check above accepts null values, which would later crash
-        # at threshold comparisons with TypeError.
+        # Explicitly check for null values in decision-input fields.
+        # Open-Meteo can return JSON null for numeric fields when the model's
+        # forecast window or GFS/ECMWF coverage lapses. The key-presence check
+        # above accepts null values, which would later crash at threshold
+        # comparisons with TypeError — bypassing the fail-safe close path.
+        # Guard all four fields used in the sunny gate (Layer 1: GHI, UV;
+        # Layer 2: DNI, cloud_cover).
         shortwave_radiation = current["shortwave_radiation"]
         uv_index = current["uv_index"]
+        direct_normal_irradiance = current.get("direct_normal_irradiance")
+        cloud_cover_val = current.get("cloud_cover")
         if shortwave_radiation is None or uv_index is None:
             raise WeatherAPIError(
                 f"Weather API returned null for required field(s): "
                 f"shortwave_radiation={shortwave_radiation}, uv_index={uv_index}. "
                 f"This can happen when GFS coverage is unavailable outside the forecast window."
+            )
+        if direct_normal_irradiance is None or cloud_cover_val is None:
+            raise WeatherAPIError(
+                f"Weather API returned null for observational field(s): "
+                f"direct_normal_irradiance={direct_normal_irradiance}, cloud_cover={cloud_cover_val}. "
+                f"Cannot evaluate Layer 2 sunny gate without these values."
             )
 
         # Extract daily data (sunrise/sunset)
@@ -784,7 +836,6 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
             "temperature": current["temperature_2m"],
             "shortwave_radiation": current["shortwave_radiation"],
             "uv_index": current["uv_index"],
-            # DNI kept for observability logging only — not used in decisions
             "dni": current.get("direct_normal_irradiance", 0),
             "cloud_cover": current.get("cloud_cover", 100),
             "cloud_cover_low": current.get("cloud_cover_low", 100),
@@ -891,16 +942,29 @@ def should_open_awning(
     altitude_threshold: float,
     min_ghi: float,
     min_uv_index: float,
+    min_dni: float = 50.0,
+    max_cloud_cover: float = 80.0,
 ) -> tuple[bool, str, dict]:
     """
     Determine if awning should be open based on ALL conditions.
 
-    Sunshine detection uses a cross-model OR gate:
-      sunny_enough = (shortwave_radiation >= min_ghi) OR (uv_index >= min_uv_index)
+    Sunshine detection uses a two-layer gate:
 
-    GHI (shortwave_radiation) comes from ECMWF. UV Index comes from GFS — a separate
-    NWP model. Either signal alone is sufficient evidence of solar activity significant
-    enough to warrant shade.
+      Layer 1 — model forecast ('do we want shade?'):
+        sunny_model = (shortwave_radiation >= min_ghi) OR (uv_index >= min_uv_index)
+        GHI comes from ECMWF; UV Index from GFS — cross-model OR gate.
+
+      Layer 2 — observational confirmation ('is reality actually sunny?'):
+        sunny_observed = (dni >= min_dni) OR (cloud_cover < max_cloud_cover)
+        DNI (direct_normal_irradiance) and cloud_cover are observational fields
+        that respond to actual conditions faster than model forecasts.
+        The OR allows either observation to confirm sunny — avoiding false-closes
+        when DNI is intermittent on partly-cloudy days.
+
+      sunny_enough = sunny_model AND sunny_observed
+
+    Both layers must agree before the awning opens, preventing false-positive
+    opens when the model forecast lags rapidly-arriving rain.
 
     Args:
         weather: Weather data from fetch_weather()
@@ -908,8 +972,10 @@ def should_open_awning(
         current_time: Current datetime
         wind_threshold: Maximum wind speed (mph) for "calm"
         altitude_threshold: Minimum sun altitude (degrees) above horizon
-        min_ghi: Minimum global horizontal irradiance (W/m²) for sunny_enough
-        min_uv_index: Minimum UV Index for sunny_enough
+        min_ghi: Minimum global horizontal irradiance (W/m²) for sunny_model
+        min_uv_index: Minimum UV Index for sunny_model
+        min_dni: Minimum direct normal irradiance (W/m²) for sunny_observed
+        max_cloud_cover: Maximum total cloud cover (%) for sunny_observed
 
     Returns:
         Tuple of (should_open, reason, conditions_dict)
@@ -920,6 +986,8 @@ def should_open_awning(
     temperature = weather["temperature"]
     ghi = weather["shortwave_radiation"]
     uv_index = weather["uv_index"]
+    dni = weather.get("dni", 0.0)
+    cloud_cover = weather.get("cloud_cover", 100.0)
     sunrise = weather["sunrise"]
     sunset = weather["sunset"]
 
@@ -927,10 +995,20 @@ def should_open_awning(
     azimuth = sun_position["azimuth"]
     altitude = sun_position["altitude"]
 
-    # Evaluate sunny condition: OR gate across two independent NWP models
+    # Layer 1: model forecast — 'do we want shade?' (GHI or UV above threshold)
     ghi_sunny = ghi >= min_ghi
     uv_sunny = uv_index >= min_uv_index
-    is_sunny = ghi_sunny or uv_sunny
+    sunny_model = ghi_sunny or uv_sunny
+
+    # Layer 2: observational confirmation — 'is reality actually sunny?'
+    # DNI is measured (not model-forecast); cloud_cover updates faster than GHI.
+    # OR: either observation alone is sufficient to confirm sunny, preventing
+    # false-closes when DNI is intermittent on partly-cloudy days.
+    dni_sunny = dni >= min_dni
+    cloud_sunny = cloud_cover < max_cloud_cover
+    sunny_observed = dni_sunny or cloud_sunny
+
+    is_sunny = sunny_model and sunny_observed
 
     is_calm = wind_speed < wind_threshold
     no_rain = precipitation == 0
@@ -951,16 +1029,35 @@ def should_open_awning(
 
     should_open = all(conditions.values())
 
-    # Build sunny signal trace for logging
-    if is_sunny:
+    # Build sunny signal trace for logging (two-layer gate)
+    # Layer 1: model forecast signal
+    if sunny_model:
         if ghi_sunny and uv_sunny:
-            sunny_trace = f"GHI {ghi:.0f} W/m² >= {min_ghi:.0f} AND UV {uv_index:.1f} >= {min_uv_index:.1f}"
+            model_trace = f"GHI {ghi:.0f} W/m² >= {min_ghi:.0f} AND UV {uv_index:.1f} >= {min_uv_index:.1f}"
         elif ghi_sunny:
-            sunny_trace = f"GHI only: GHI {ghi:.0f} W/m² >= {min_ghi:.0f}, UV {uv_index:.1f} < {min_uv_index:.1f}"
+            model_trace = f"GHI only: GHI {ghi:.0f} W/m² >= {min_ghi:.0f}, UV {uv_index:.1f} < {min_uv_index:.1f}"
         else:
-            sunny_trace = f"UV only: UV {uv_index:.1f} >= {min_uv_index:.1f}, GHI {ghi:.0f} W/m² < {min_ghi:.0f}"
+            model_trace = f"UV only: UV {uv_index:.1f} >= {min_uv_index:.1f}, GHI {ghi:.0f} W/m² < {min_ghi:.0f}"
     else:
-        sunny_trace = f"GHI {ghi:.0f} W/m² < {min_ghi:.0f} AND UV {uv_index:.1f} < {min_uv_index:.1f}"
+        model_trace = f"GHI {ghi:.0f} W/m² < {min_ghi:.0f} AND UV {uv_index:.1f} < {min_uv_index:.1f}"
+
+    # Layer 2: observational confirmation signal
+    if sunny_observed:
+        if dni_sunny and cloud_sunny:
+            obs_trace = f"DNI {dni:.0f} W/m² >= {min_dni:.0f} AND cloud {cloud_cover:.0f}% < {max_cloud_cover:.0f}%"
+        elif dni_sunny:
+            obs_trace = f"DNI {dni:.0f} W/m² >= {min_dni:.0f} (cloud {cloud_cover:.0f}% >= {max_cloud_cover:.0f}%)"
+        else:
+            obs_trace = f"cloud {cloud_cover:.0f}% < {max_cloud_cover:.0f}% (DNI {dni:.0f} W/m² < {min_dni:.0f})"
+    else:
+        obs_trace = f"DNI {dni:.0f} W/m² < {min_dni:.0f} AND cloud {cloud_cover:.0f}% >= {max_cloud_cover:.0f}%"
+
+    if is_sunny:
+        sunny_trace = f"model=({model_trace}), observed=({obs_trace})"
+    elif not sunny_model:
+        sunny_trace = f"model failed: {model_trace}"
+    else:
+        sunny_trace = f"observed failed: {obs_trace} (model ok: {model_trace})"
 
     # Build detailed reason string
     reasons = []
@@ -993,39 +1090,25 @@ def should_open_awning(
     return should_open, reason, conditions
 
 
-def _format_friendly_telegram_message(
-    should_open: bool,
+def build_close_reason(
     conditions: dict,
     wind_speed: float,
     precipitation: float,
     temperature: float,
     ghi: float,
     uv_index: float,
+    dni: float,
+    cloud_cover: float,
 ) -> str:
     """
-    Format a human-friendly Telegram notification message.
+    Build a human-readable close reason string for Telegram notifications.
 
-    Args:
-        should_open: Whether awning should be open
-        conditions: Dictionary of condition flags
-        wind_speed: Wind speed in mph
-        precipitation: Precipitation in mm/h
-        temperature: Temperature in F
-        ghi: Global horizontal irradiance (shortwave_radiation) in W/m²
-        uv_index: UV Index (dimensionless)
+    Surfaces all four sunny-gate inputs (GHI, UV from Layer 1; DNI, cloud_cover
+    from Layer 2) when the sunny condition is the blocking reason, so the message
+    clearly indicates which layer failed without needing to consult the full log.
 
-    Returns:
-        Friendly message string with appropriate emoji
+    Priority order: rain > wind > cold > not sunny > nighttime > sun position.
     """
-    if should_open:
-        # Opening message - simple and positive
-        temp_f = int(round(temperature))
-        wind_mph = int(round(wind_speed))
-        return f"☀️ Awning opened - sunny & calm ({temp_f}°F, {wind_mph} mph wind)"
-
-    # Closing message - determine primary reason and emoji
-    # Priority: rain > wind > cold > not sunny > nighttime > sun position
-
     if not conditions["no_rain"]:
         precip = round(precipitation, 1)
         return f"🌧️ Awning closed: Rain starting ({precip} mm/h)"
@@ -1039,10 +1122,11 @@ def _format_friendly_telegram_message(
         return f"❄️ Awning closed: Too cold ({temp_f}°F)"
 
     if not conditions["sunny"]:
-        # Report causal values (GHI and UV), not cloud_cover percentages.
-        # cloud_cover is now observational only and is NOT a decision input —
-        # the sunny gate is driven by GHI (ECMWF) and UV Index (GFS).
-        return f"☁️ Awning closed: Not enough sun (GHI {ghi:.0f} W/m², UV {uv_index:.1f})"
+        return (
+            f"☁️ Awning closed: Not enough sun "
+            f"(GHI {ghi:.0f} W/m², UV {uv_index:.1f}, "
+            f"DNI {dni:.0f} W/m², cloud {cloud_cover:.0f}%)"
+        )
 
     if not conditions["daytime"]:
         return "🌙 Awning closed: Nighttime"
@@ -1052,6 +1136,46 @@ def _format_friendly_telegram_message(
 
     # Fallback (shouldn't happen)
     return "🌙 Awning closed: Conditions changed"
+
+
+def _format_friendly_telegram_message(
+    should_open: bool,
+    conditions: dict,
+    wind_speed: float,
+    precipitation: float,
+    temperature: float,
+    ghi: float,
+    uv_index: float,
+    dni: float = 0.0,
+    cloud_cover: float = 100.0,
+) -> str:
+    """
+    Format a human-friendly Telegram notification message.
+
+    Args:
+        should_open: Whether awning should be open
+        conditions: Dictionary of condition flags
+        wind_speed: Wind speed in mph
+        precipitation: Precipitation in mm/h
+        temperature: Temperature in F
+        ghi: Global horizontal irradiance (shortwave_radiation) in W/m²
+        uv_index: UV Index (dimensionless)
+        dni: Direct normal irradiance in W/m² (Layer 2 observational gate)
+        cloud_cover: Total cloud cover percentage (Layer 2 observational gate)
+
+    Returns:
+        Friendly message string with appropriate emoji
+    """
+    if should_open:
+        # Opening message - simple and positive
+        temp_f = int(round(temperature))
+        wind_mph = int(round(wind_speed))
+        return f"☀️ Awning opened - sunny & calm ({temp_f}°F, {wind_mph} mph wind)"
+
+    return build_close_reason(
+        conditions, wind_speed, precipitation, temperature,
+        ghi, uv_index, dni, cloud_cover,
+    )
 
 
 def main() -> None:
@@ -1087,9 +1211,10 @@ def main() -> None:
         logger.info(f"Location: {latitude:.4f}, {longitude:.4f}")
 
         # Get thresholds
-        wind_threshold, altitude_threshold, min_ghi, min_uv_index = get_thresholds()
+        wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover = get_thresholds()
         logger.info(
-            f"Thresholds: GHI >= {min_ghi:.0f} W/m² OR UV >= {min_uv_index:.1f}, "
+            f"Thresholds: model=(GHI >= {min_ghi:.0f} W/m² OR UV >= {min_uv_index:.1f}), "
+            f"observed=(DNI >= {min_dni:.0f} W/m² OR cloud < {max_cloud_cover:.0f}%), "
             f"Wind < {wind_threshold} mph, Rain = 0 mm/h, Temp > 40°F, "
             f"Sun altitude >= {altitude_threshold}°, Sun facing window (90°-260°)"
         )
@@ -1124,13 +1249,14 @@ def main() -> None:
             f"Sunset {weather['sunset'][11:16]}"
         )
 
-        # Log observational values (not used in decisions, for validation)
+        # Log observational values (used in sunny gate layer 2)
         logger.info(
-            f"Observational (not used in decisions): "
+            f"Observational: "
             f"DNI {weather['dni']:.0f} W/m², "
-            f"cloud_cover_low {weather['cloud_cover_low']:.0f}%, "
-            f"cloud_cover_mid {weather['cloud_cover_mid']:.0f}%, "
-            f"cloud_cover_high {weather['cloud_cover_high']:.0f}%"
+            f"cloud_cover {weather['cloud_cover']:.0f}% total "
+            f"(low {weather['cloud_cover_low']:.0f}%, "
+            f"mid {weather['cloud_cover_mid']:.0f}%, "
+            f"high {weather['cloud_cover_high']:.0f}%)"
         )
 
         # Evaluate all conditions
@@ -1142,6 +1268,8 @@ def main() -> None:
             altitude_threshold,
             min_ghi,
             min_uv_index,
+            min_dni,
+            max_cloud_cover,
         )
 
         # Log conditions with checkmarks/crosses
@@ -1197,6 +1325,8 @@ def main() -> None:
                 weather["temperature"],
                 weather["shortwave_radiation"],
                 weather["uv_index"],
+                weather.get("dni", 0.0),
+                weather.get("cloud_cover", 100.0),
             )
             send_telegram_notification(telegram_token, telegram_chat_id, msg)
 

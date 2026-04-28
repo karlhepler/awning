@@ -19,6 +19,7 @@
           pandas
           pytz
           tenacity
+          pytest
         ]);
 
         awning = pkgs.writeScriptBin "awning" ''
