@@ -24,11 +24,14 @@ Sunshine detection uses a two-layer gate plus a hard cloud-cover ceiling:
     preventing false-closes when DNI is intermittent on partly-cloudy days.
 
   Layer 3 — hard cloud-cover ceiling (overcast override):
-    not_overcast = cloud_cover < OVERCAST_THRESHOLD_PCT
-    When cloud_cover is very high (≥95%), the sky is fully overcast regardless
-    of what DNI reports. This ceiling overrides DNI when cloud_cover signals
-    true overcast, blocking false-positive opens caused by model-internal
-    inconsistency (high DNI + very high cloud_cover simultaneously).
+    not_overcast = cloud_cover_mid < OVERCAST_THRESHOLD_PCT
+    When cloud_cover_mid is very high (≥95%), the sky has mid-level (altostratus/
+    altocumulus) cloud cover that blocks direct sun. This ceiling overrides DNI
+    when mid-level clouds signal true overcast, blocking false-positive opens.
+    Mid-level clouds are used instead of total cloud cover because total saturates
+    to 100% when high cirrus is present, even when mid-level and low clouds are
+    sparse and the sun is visibly shining. High clouds (cirrus) are handled
+    permissively here because DNI already captures their optical impact.
 
   sunny_enough = sunny_model AND sunny_observed AND not_overcast
 
@@ -619,13 +622,13 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
         )
 
     # Get overcast threshold (optional, default 95%)
-    # Layer 3 hard ceiling: when cloud_cover >= this value, DNI is overridden and
-    # awning stays closed regardless of DNI. Set above MAX_CLOUD_COVER_PCT (80%) so
-    # it only fires for true overcast cases (95-100%), not partly-cloudy days.
-    # Handles the model-internal inconsistency where DNI reports sunny but
-    # cloud_cover_total=100% — both are NWP model outputs from different schemes
-    # (radiative transfer vs humidity-based Sundqvist 1989), so disagreement at this
-    # extreme is a reliable signal that the sky is truly overcast.
+    # Layer 3 hard ceiling: when cloud_cover_mid >= this value, DNI is overridden and
+    # awning stays closed regardless of DNI. Uses MID-level cloud cover (altostratus/
+    # altocumulus), NOT total cloud cover. Total saturates to 100% when high cirrus
+    # is present even when the sun is visibly shining (cirrus is thin and does not
+    # block awning-relevant sun). Mid-level clouds are the optical layer that
+    # determines whether direct sun reaches the ground. Set above MAX_CLOUD_COVER_PCT
+    # (80%) so it only fires for true overcast cases (95-100%), not partly-cloudy days.
     overcast_threshold_str = os.getenv("OVERCAST_THRESHOLD_PCT", "95").strip()
     try:
         overcast_threshold = float(overcast_threshold_str)
@@ -905,11 +908,13 @@ def should_open_awning(
         is intermittent on partly-cloudy days and cloud_cover is wrongly high.
 
       Layer 3 — hard cloud-cover ceiling (overcast override):
-        not_overcast = cloud_cover < overcast_threshold
-        When cloud_cover >= overcast_threshold (default 95%), DNI is overridden.
-        Handles model-internal inconsistency: high DNI + very high cloud_cover
-        simultaneously means one scheme is wrong; at ≥95% cloud_cover the
-        humidity-based scheme is the more reliable discriminator.
+        not_overcast = cloud_cover_mid < overcast_threshold
+        When cloud_cover_mid >= overcast_threshold (default 95%), DNI is overridden.
+        Mid-level clouds (altostratus/altocumulus) are the optical layer that
+        determines whether direct sun reaches the ground. Total cloud cover is NOT
+        used here because it saturates to 100% when high cirrus is present —
+        even when the sun is visibly shining. High (cirrus) clouds are correctly
+        permissive; low clouds (fog/stratus) are handled by the DNI gate.
 
       sunny_enough = sunny_model AND sunny_observed AND not_overcast
 
@@ -937,6 +942,7 @@ def should_open_awning(
     uv_index = weather["uv_index"]
     dni = weather.get("dni", 0.0)
     cloud_cover = weather.get("cloud_cover", 100.0)
+    cloud_cover_mid = weather.get("cloud_cover_mid", 100.0)
     sunrise = weather["sunrise"]
     sunset = weather["sunset"]
 
@@ -960,10 +966,13 @@ def should_open_awning(
     sunny_observed = dni_sunny or cloud_sunny
 
     # Layer 3: hard cloud-cover ceiling — overcast override
-    # When cloud_cover >= overcast_threshold, the sky is fully overcast regardless
-    # of what DNI reports. At this extreme, the humidity-derived cloud_cover is the
-    # more reliable discriminator over the radiative-transfer-derived DNI.
-    not_overcast = cloud_cover < overcast_threshold
+    # When cloud_cover_mid >= overcast_threshold, mid-level (altostratus/altocumulus)
+    # clouds block direct sun regardless of what DNI reports. Mid-level clouds are
+    # used here instead of total cloud cover because total saturates to 100% when
+    # high cirrus is present, even when the sun is visibly shining (cirrus is thin
+    # and does not block awning-relevant sun). High clouds are correctly permissive;
+    # low clouds are handled by the DNI gate.
+    not_overcast = cloud_cover_mid < overcast_threshold
 
     is_sunny = sunny_model and sunny_observed and not_overcast
 
@@ -1010,7 +1019,7 @@ def should_open_awning(
         obs_trace = f"DNI {dni:.0f} W/m² < {min_dni:.0f} AND cloud {cloud_cover:.0f}% >= {max_cloud_cover:.0f}%"
 
     # Layer 3: hard cloud-cover ceiling
-    overcast_trace = f"cloud {cloud_cover:.0f}% {'<' if not_overcast else '>='} {overcast_threshold:.0f}% ceiling"
+    overcast_trace = f"cloud_mid {cloud_cover_mid:.0f}% {'<' if not_overcast else '>='} {overcast_threshold:.0f}% ceiling"
 
     if is_sunny:
         sunny_trace = f"model=({model_trace}), consistency=({obs_trace}), overcast=({overcast_trace})"

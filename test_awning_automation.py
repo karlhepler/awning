@@ -24,11 +24,16 @@ def _weather(
     uv_index=6.0,
     dni=450.0,
     cloud_cover=20.0,
+    cloud_cover_low=10.0,
+    cloud_cover_mid=5.0,
+    cloud_cover_high=10.0,
     sunrise="2026-04-17T06:00:00",
     sunset="2026-04-17T20:00:00",
 ):
-    # cloud_cover is included because it feeds Layer 2 (observational sunny gate).
-    # Default 20% represents a clear-to-partly-cloudy day (well below MAX_CLOUD_COVER_PCT=80).
+    # cloud_cover feeds Layer 2 (observational sunny gate).
+    # cloud_cover_mid feeds Layer 3 (overcast ceiling).
+    # Defaults represent a clear-to-partly-cloudy day:
+    #   cloud_cover=20%, cloud_cover_mid=5% (well below thresholds).
     return {
         "wind_speed_10m": wind_speed,
         "precipitation": precipitation,
@@ -37,6 +42,9 @@ def _weather(
         "uv_index": uv_index,
         "dni": dni,
         "cloud_cover": cloud_cover,
+        "cloud_cover_low": cloud_cover_low,
+        "cloud_cover_mid": cloud_cover_mid,
+        "cloud_cover_high": cloud_cover_high,
         "sunrise": sunrise,
         "sunset": sunset,
     }
@@ -577,13 +585,18 @@ class TestOvercastCeilingGate(unittest.TestCase):
     # Post-fix: closed (Layer 3 ceiling overrides DNI).
     # ------------------------------------------------------------------
     def test_overcast_ceiling_blocks_open(self):
-        """Overcast ceiling: GHI=850, UV=2.7, DNI=364, cloud=100 → Layer 3 blocks open."""
+        """Overcast ceiling: GHI=850, UV=2.7, DNI=364, cloud=100, cloud_mid=100 → Layer 3 blocks open."""
+        # This mirrors the 12:05 drizzle case: low=5, mid=100, high=78, total=100.
+        # cloud_cover_mid=100 triggers the Layer 3 ceiling even though DNI is high.
         should_open, reason, conditions = should_open_awning(
             weather=_weather(
                 shortwave_radiation=850.0,
                 uv_index=2.7,
                 dni=364.0,
                 cloud_cover=100.0,
+                cloud_cover_low=5.0,
+                cloud_cover_mid=100.0,
+                cloud_cover_high=78.0,
                 temperature=70.0,
             ),
             sun_position=_sun(),
@@ -607,14 +620,52 @@ class TestOvercastCeilingGate(unittest.TestCase):
     # Layer 3: cloud=85 < 95 (ceiling) → not_overcast=True
     # All three layers pass → should open (temp=70 > 60).
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Test — 2026-04-28 13:05 afternoon case: high cirrus saturates total
+    # cloud cover to 100% but mid-level clouds are only 5%. Sun was visibly
+    # shining on porch. The overcast ceiling must NOT fire on cirrus alone.
+    #
+    # Data: low=46, mid=5, high=100, total=100, GHI=860, UV=4.0, DNI=492
+    # Layer 1: GHI=860 >= 400 → sunny_model=True
+    # Layer 2: DNI=492 >= 50 → sunny_observed=True
+    # Layer 3: cloud_cover_mid=5 < 95 (ceiling) → not_overcast=True
+    # All three layers pass → should open
+    # ------------------------------------------------------------------
+    def test_high_cirrus_does_not_trigger_overcast_ceiling(self):
+        """Afternoon cirrus case: cloud_mid=5% despite total=100% → ceiling doesn't fire → opens."""
+        should_open, reason, conditions = should_open_awning(
+            weather=_weather(
+                shortwave_radiation=860.0,
+                uv_index=4.0,
+                dni=492.0,
+                cloud_cover=100.0,
+                cloud_cover_low=46.0,
+                cloud_cover_mid=5.0,
+                cloud_cover_high=100.0,
+                temperature=65.0,
+            ),
+            sun_position=_sun(),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        self.assertTrue(
+            conditions["sunny"],
+            f"Expected sunny=True (cirrus should not trigger ceiling) but got False. reason={reason!r}",
+        )
+        self.assertTrue(
+            should_open,
+            f"Expected awning to open (sun shining despite high cirrus) but got False. reason={reason!r}",
+        )
+
     def test_partly_cloudy_below_ceiling_still_opens(self):
-        """Partly cloudy below ceiling: GHI=600, UV=4, DNI=300, cloud=85 → all layers pass → opens."""
+        """Partly cloudy below ceiling: GHI=600, UV=4, DNI=300, cloud=85, cloud_mid=30 → all layers pass → opens."""
         should_open, reason, conditions = should_open_awning(
             weather=_weather(
                 shortwave_radiation=600.0,
                 uv_index=4.0,
                 dni=300.0,
                 cloud_cover=85.0,
+                cloud_cover_mid=30.0,
                 temperature=70.0,
             ),
             sun_position=_sun(),
