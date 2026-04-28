@@ -8,6 +8,7 @@ Run:  python3 -m unittest test_awning_automation.py -v
 """
 import os
 import unittest
+import unittest.mock
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
@@ -53,6 +54,8 @@ _THRESHOLDS = dict(
     min_uv_index=4.0,
     min_dni=50.0,
     max_cloud_cover=80.0,
+    min_temperature_f=60.0,
+    overcast_threshold=95.0,
 )
 
 # Daytime moment that falls between the default sunrise/sunset strings above
@@ -560,6 +563,165 @@ class TestObservationalSunnyGate(unittest.TestCase):
             f"Expected awning to stay closed for overcast but got True. reason={reason!r}",
         )
         self.assertIn("observed failed", reason)
+
+
+class TestOvercastCeilingGate(unittest.TestCase):
+    """Tests for the Layer 3 cloud-cover hard ceiling (OVERCAST_THRESHOLD_PCT)."""
+
+    # ------------------------------------------------------------------
+    # Test — today's exact failure data: GHI=850, UV=2.7, DNI=364, cloud=100
+    # Layer 1: GHI=850 >= 400 → sunny_model=True
+    # Layer 2: DNI=364 >= 50 → sunny_observed=True (DNI arm fires)
+    # Layer 3: cloud=100 >= 95 (ceiling) → not_overcast=False → blocks open
+    # Pre-fix: would open (Layer 2 OR short-circuited via DNI).
+    # Post-fix: closed (Layer 3 ceiling overrides DNI).
+    # ------------------------------------------------------------------
+    def test_overcast_ceiling_blocks_open(self):
+        """Overcast ceiling: GHI=850, UV=2.7, DNI=364, cloud=100 → Layer 3 blocks open."""
+        should_open, reason, conditions = should_open_awning(
+            weather=_weather(
+                shortwave_radiation=850.0,
+                uv_index=2.7,
+                dni=364.0,
+                cloud_cover=100.0,
+                temperature=70.0,
+            ),
+            sun_position=_sun(),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        self.assertFalse(
+            conditions["sunny"],
+            f"Expected sunny=False (overcast ceiling blocks) but got True. reason={reason!r}",
+        )
+        self.assertFalse(
+            should_open,
+            f"Expected awning closed (overcast ceiling) but got True. reason={reason!r}",
+        )
+        self.assertIn("overcast", reason.lower())
+
+    # ------------------------------------------------------------------
+    # Test — partly cloudy below ceiling: GHI=600, UV=4, DNI=300, cloud=85
+    # Layer 1: GHI=600 >= 400 → sunny_model=True
+    # Layer 2: DNI=300 >= 50 → sunny_observed=True
+    # Layer 3: cloud=85 < 95 (ceiling) → not_overcast=True
+    # All three layers pass → should open (temp=70 > 60).
+    # ------------------------------------------------------------------
+    def test_partly_cloudy_below_ceiling_still_opens(self):
+        """Partly cloudy below ceiling: GHI=600, UV=4, DNI=300, cloud=85 → all layers pass → opens."""
+        should_open, reason, conditions = should_open_awning(
+            weather=_weather(
+                shortwave_radiation=600.0,
+                uv_index=4.0,
+                dni=300.0,
+                cloud_cover=85.0,
+                temperature=70.0,
+            ),
+            sun_position=_sun(),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        self.assertTrue(
+            conditions["sunny"],
+            f"Expected sunny=True (below ceiling) but got False. reason={reason!r}",
+        )
+        self.assertTrue(
+            should_open,
+            f"Expected awning to open (below ceiling) but got False. reason={reason!r}",
+        )
+
+
+class TestTemperatureThreshold(unittest.TestCase):
+    """Tests for the MIN_TEMPERATURE_F threshold (raised from 40°F to 60°F)."""
+
+    # ------------------------------------------------------------------
+    # Test — full sun + favorable sun + temp=55 → should NOT open
+    # Temperature 55°F is below the new 60°F threshold.
+    # ------------------------------------------------------------------
+    def test_temperature_below_60_does_not_open(self):
+        """Temp=55°F < 60°F threshold → awning stays closed despite full sun."""
+        should_open, reason, conditions = should_open_awning(
+            weather=_weather(
+                shortwave_radiation=700.0,
+                uv_index=7.0,
+                dni=450.0,
+                cloud_cover=20.0,
+                temperature=55.0,
+            ),
+            sun_position=_sun(),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        self.assertFalse(
+            conditions["above_freezing"],
+            f"Expected above_freezing=False for temp=55 but got True. reason={reason!r}",
+        )
+        self.assertFalse(
+            should_open,
+            f"Expected awning closed for temp=55 but got True. reason={reason!r}",
+        )
+
+    # ------------------------------------------------------------------
+    # Test — full sun + favorable sun + temp=65 → should open
+    # Temperature 65°F is above the new 60°F threshold.
+    # ------------------------------------------------------------------
+    def test_temperature_above_60_can_open(self):
+        """Temp=65°F > 60°F threshold → awning opens (full sun + favorable conditions)."""
+        should_open, reason, conditions = should_open_awning(
+            weather=_weather(
+                shortwave_radiation=700.0,
+                uv_index=7.0,
+                dni=450.0,
+                cloud_cover=20.0,
+                temperature=65.0,
+            ),
+            sun_position=_sun(),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        self.assertTrue(
+            conditions["above_freezing"],
+            f"Expected above_freezing=True for temp=65 but got False. reason={reason!r}",
+        )
+        self.assertTrue(
+            should_open,
+            f"Expected awning to open for temp=65 but got False. reason={reason!r}",
+        )
+
+
+class TestGetThresholdsMinTemperatureFValidation(unittest.TestCase):
+    """Tests for MIN_TEMPERATURE_F range validation in get_thresholds()."""
+
+    # Required env vars (no defaults in get_thresholds)
+    _REQUIRED_ENV = {"WIND_SPEED_THRESHOLD_MPH": "15", "MIN_SUN_ALTITUDE_DEG": "20"}
+
+    def test_min_temperature_f_below_range_raises(self):
+        """MIN_TEMPERATURE_F=-999 is below -50 → ConfigurationError."""
+        env = {**self._REQUIRED_ENV, "MIN_TEMPERATURE_F": "-999"}
+        with unittest.mock.patch.dict(os.environ, env):
+            with self.assertRaises(ConfigurationError):
+                get_thresholds()
+
+    def test_min_temperature_f_above_range_raises(self):
+        """MIN_TEMPERATURE_F=200 is above 120 → ConfigurationError."""
+        env = {**self._REQUIRED_ENV, "MIN_TEMPERATURE_F": "200"}
+        with unittest.mock.patch.dict(os.environ, env):
+            with self.assertRaises(ConfigurationError):
+                get_thresholds()
+
+    def test_min_temperature_f_at_lower_bound_is_valid(self):
+        """MIN_TEMPERATURE_F=-50 is at the lower bound → no error."""
+        env = {**self._REQUIRED_ENV, "MIN_TEMPERATURE_F": "-50"}
+        with unittest.mock.patch.dict(os.environ, env):
+            _, _, _, _, _, _, min_temperature_f, _ = get_thresholds()
+            self.assertEqual(min_temperature_f, -50.0)
+
+    def test_min_temperature_f_at_upper_bound_is_valid(self):
+        """MIN_TEMPERATURE_F=120 is at the upper bound → no error."""
+        env = {**self._REQUIRED_ENV, "MIN_TEMPERATURE_F": "120"}
+        with unittest.mock.patch.dict(os.environ, env):
+            _, _, _, _, _, _, min_temperature_f, _ = get_thresholds()
+            self.assertEqual(min_temperature_f, 120.0)
 
 
 if __name__ == "__main__":

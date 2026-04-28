@@ -3,11 +3,11 @@
 Awning Weather Automation
 
 Automatically opens/closes awning based on weather conditions.
-- Opens awning if ALL 7 conditions are met: sunny, calm, no rain, above 40°F,
+- Opens awning if ALL 7 conditions are met: sunny, calm, no rain, above 60°F,
   daytime, sun high enough, and sun facing window (90°-260°)
 - Closes awning if ANY condition fails
 
-Sunshine detection uses a two-layer gate:
+Sunshine detection uses a two-layer gate plus a hard cloud-cover ceiling:
 
   Layer 1 — model forecast ('do we want shade?'):
     sunny_model = (shortwave_radiation >= MIN_GHI_WM2) OR (uv_index >= MIN_UV_INDEX)
@@ -15,16 +15,24 @@ Sunshine detection uses a two-layer gate:
     separate NWP model. Either signal alone is sufficient: the awning has two jobs —
     block UV (relevant even on cloudy-high-UV days) AND block heat/brightness.
 
-  Layer 2 — observational confirmation ('is reality actually sunny?'):
+  Layer 2 — multi-variable consistency check (independent model variable cross-check):
     sunny_observed = (direct_normal_irradiance >= MIN_DNI_WM2) OR (cloud_cover < MAX_CLOUD_COVER_PCT)
-    DNI is an observational field (measured, not model-forecast) that correctly
-    shows near-zero values during rain/overcast. Cloud cover updates faster than GHI.
-    The OR prevents false-closes when DNI is intermittent on partly-cloudy days.
+    DNI and cloud_cover come from different NWP model schemes:
+      - DNI/GHI: derived from the model's radiative transfer scheme
+      - cloud_cover: derived from the model's humidity field (Sundqvist 1989)
+    When they disagree, one is wrong — the OR allows either to confirm sunny,
+    preventing false-closes when DNI is intermittent on partly-cloudy days.
 
-  sunny_enough = sunny_model AND sunny_observed
+  Layer 3 — hard cloud-cover ceiling (overcast override):
+    not_overcast = cloud_cover < OVERCAST_THRESHOLD_PCT
+    When cloud_cover is very high (≥95%), the sky is fully overcast regardless
+    of what DNI reports. This ceiling overrides DNI when cloud_cover signals
+    true overcast, blocking false-positive opens caused by model-internal
+    inconsistency (high DNI + very high cloud_cover simultaneously).
 
-Both layers must agree before the awning opens, preventing false-positive opens
-when the model forecast lags rapidly-arriving rain or overcast conditions.
+  sunny_enough = sunny_model AND sunny_observed AND not_overcast
+
+All three layers must agree before the awning opens.
 
 Smoothing: All numeric sensor inputs are passed through a weighted rolling average
 (weights [4,3,2,1] for current and up to 3 cached prior readings, normalized) before
@@ -393,7 +401,7 @@ def collect_weather_measurements(lat: float, lon: float) -> dict:
     logger.info(
         f"Weather: GHI {weather['shortwave_radiation']:.0f} W/m², "
         f"UV {weather['uv_index']:.1f}, "
-        f"DNI (obs) {weather['dni']:.0f} W/m², "
+        f"DNI {weather['dni']:.0f} W/m², "
         f"{weather['wind_speed_10m']:.1f} mph wind, "
         f"{weather['precipitation']:.2f} mm/h rain, "
         f"{weather['temperature']:.1f}°F"
@@ -473,25 +481,31 @@ def load_location_config(env_file: Optional[Path] = None) -> tuple[float, float]
     return latitude, longitude
 
 
-def get_thresholds() -> tuple[float, float, float, float, float, float]:
+def get_thresholds() -> tuple[float, float, float, float, float, float, float, float]:
     """
     Get weather thresholds from environment variables.
 
     Returns:
         Tuple of (wind_speed_threshold_mph, min_sun_altitude, min_ghi, min_uv_index,
-                  min_dni, max_cloud_cover)
-        Types: (float, float, float, float, float, float)
+                  min_dni, max_cloud_cover, min_temperature_f, overcast_threshold)
+        Types: (float, float, float, float, float, float, float, float)
             wind_speed_threshold_mph: float — mph, upper wind limit to open awning
             min_sun_altitude: float — degrees above horizon, lower sun altitude limit
             min_ghi: float — W/m², minimum global horizontal irradiance (shortwave_radiation)
                 to consider it sunny; 400 W/m² is the 'enough sun to matter' threshold
             min_uv_index: float — minimum UV Index (dimensionless) to consider UV significant;
                 UV 3 is moderate, 6 is high — 4 is the 'you'd recommend sunscreen' threshold
-            min_dni: float — W/m², minimum direct normal irradiance (observational) required
-                to confirm reality is actually sunny; 50 W/m² is above rain/overcast (4-14)
-                but well below typical clear-sky values (300-900 W/m²)
-            max_cloud_cover: float — % maximum total cloud cover to consider it sunny;
-                80% allows partly-cloudy opens while blocking 100% overcast days
+            min_dni: float — W/m², minimum direct normal irradiance (NWP radiative
+                transfer scheme) for Layer 2 consistency check; 50 W/m² is above
+                overcast/rain (4-14) but well below typical clear-sky values (300-900)
+            max_cloud_cover: float — % maximum total cloud cover (NWP humidity-based
+                scheme) for Layer 2 consistency check; 80% allows partly-cloudy opens
+                while blocking most overcast days
+            min_temperature_f: float — °F minimum temperature to open awning; 60°F is
+                the 'warm enough to want shade' threshold
+            overcast_threshold: float — % cloud cover ceiling (Layer 3 hard override);
+                when cloud_cover >= this value, DNI is overridden and awning stays closed;
+                95% is above MAX_CLOUD_COVER_PCT (80%) so it only fires for true overcast
 
     Raises:
         ConfigurationError: If threshold variables are missing or invalid
@@ -562,7 +576,7 @@ def get_thresholds() -> tuple[float, float, float, float, float, float]:
         )
 
     # Get minimum DNI threshold (optional, default 50 W/m²)
-    # DNI is observational (measured, not model-forecast) — today's rain/overcast shows 4-14 W/m²
+    # DNI comes from the NWP model's radiative transfer scheme — 4-14 W/m² during rain/overcast
     min_dni_str = os.getenv("MIN_DNI_WM2", "50").strip()
     try:
         min_dni = float(min_dni_str)
@@ -576,7 +590,7 @@ def get_thresholds() -> tuple[float, float, float, float, float, float]:
         )
 
     # Get maximum cloud cover threshold (optional, default 80%)
-    # Allows partly-cloudy opens while blocking 100% overcast days
+    # Layer 2 consistency check: allows partly-cloudy opens while blocking most overcast days
     max_cloud_cover_str = os.getenv("MAX_CLOUD_COVER_PCT", "80").strip()
     try:
         max_cloud_cover = float(max_cloud_cover_str)
@@ -589,7 +603,42 @@ def get_thresholds() -> tuple[float, float, float, float, float, float]:
             f"MAX_CLOUD_COVER_PCT must be between 0 and 100, got: {max_cloud_cover}"
         )
 
-    return wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover
+    # Get minimum temperature threshold (optional, default 60°F)
+    # 60°F is the 'warm enough to want shade' threshold.
+    # Prior default was 40°F (safety-above-freezing), which allowed opens in cold weather.
+    min_temperature_str = os.getenv("MIN_TEMPERATURE_F", "60").strip()
+    try:
+        min_temperature_f = float(min_temperature_str)
+    except ValueError as e:
+        raise ConfigurationError(
+            f"Invalid MIN_TEMPERATURE_F format: {e}. Must be a number."
+        ) from e
+    if not (-50 <= min_temperature_f <= 120):
+        raise ConfigurationError(
+            f"MIN_TEMPERATURE_F must be between -50 and 120°F, got: {min_temperature_f}"
+        )
+
+    # Get overcast threshold (optional, default 95%)
+    # Layer 3 hard ceiling: when cloud_cover >= this value, DNI is overridden and
+    # awning stays closed regardless of DNI. Set above MAX_CLOUD_COVER_PCT (80%) so
+    # it only fires for true overcast cases (95-100%), not partly-cloudy days.
+    # Handles the model-internal inconsistency where DNI reports sunny but
+    # cloud_cover_total=100% — both are NWP model outputs from different schemes
+    # (radiative transfer vs humidity-based Sundqvist 1989), so disagreement at this
+    # extreme is a reliable signal that the sky is truly overcast.
+    overcast_threshold_str = os.getenv("OVERCAST_THRESHOLD_PCT", "95").strip()
+    try:
+        overcast_threshold = float(overcast_threshold_str)
+    except ValueError as e:
+        raise ConfigurationError(
+            f"Invalid OVERCAST_THRESHOLD_PCT format: {e}. Must be a number."
+        ) from e
+    if not (0 <= overcast_threshold <= 100):
+        raise ConfigurationError(
+            f"OVERCAST_THRESHOLD_PCT must be between 0 and 100, got: {overcast_threshold}"
+        )
+
+    return wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold
 
 
 def load_telegram_config() -> tuple[Optional[str], Optional[str]]:
@@ -706,9 +755,9 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
             )
         if direct_normal_irradiance is None or cloud_cover_val is None:
             raise WeatherAPIError(
-                f"Weather API returned null for observational field(s): "
+                f"Weather API returned null for cross-check field(s): "
                 f"direct_normal_irradiance={direct_normal_irradiance}, cloud_cover={cloud_cover_val}. "
-                f"Cannot evaluate Layer 2 sunny gate without these values."
+                f"Cannot evaluate Layer 2/3 sunny gate without these values."
             )
 
         # Extract daily data (sunrise/sunset)
@@ -835,27 +884,34 @@ def should_open_awning(
     min_uv_index: float,
     min_dni: float = 50.0,
     max_cloud_cover: float = 80.0,
+    min_temperature_f: float = 60.0,
+    overcast_threshold: float = 95.0,
 ) -> tuple[bool, str, dict]:
     """
     Determine if awning should be open based on ALL conditions.
 
-    Sunshine detection uses a two-layer gate:
+    Sunshine detection uses a two-layer gate plus a hard cloud-cover ceiling:
 
       Layer 1 — model forecast ('do we want shade?'):
         sunny_model = (shortwave_radiation >= min_ghi) OR (uv_index >= min_uv_index)
         GHI comes from ECMWF; UV Index from GFS — cross-model OR gate.
 
-      Layer 2 — observational confirmation ('is reality actually sunny?'):
+      Layer 2 — multi-variable consistency check (independent model variable cross-check):
         sunny_observed = (dni >= min_dni) OR (cloud_cover < max_cloud_cover)
-        DNI (direct_normal_irradiance) and cloud_cover are observational fields
-        that respond to actual conditions faster than model forecasts.
-        The OR allows either observation to confirm sunny — avoiding false-closes
-        when DNI is intermittent on partly-cloudy days.
+        DNI and cloud_cover come from different NWP model schemes:
+          - DNI/GHI: derived from the model's radiative transfer scheme
+          - cloud_cover: derived from the model's humidity field (Sundqvist 1989)
+        The OR allows either to confirm sunny — preventing false-closes when DNI
+        is intermittent on partly-cloudy days and cloud_cover is wrongly high.
 
-      sunny_enough = sunny_model AND sunny_observed
+      Layer 3 — hard cloud-cover ceiling (overcast override):
+        not_overcast = cloud_cover < overcast_threshold
+        When cloud_cover >= overcast_threshold (default 95%), DNI is overridden.
+        Handles model-internal inconsistency: high DNI + very high cloud_cover
+        simultaneously means one scheme is wrong; at ≥95% cloud_cover the
+        humidity-based scheme is the more reliable discriminator.
 
-    Both layers must agree before the awning opens, preventing false-positive
-    opens when the model forecast lags rapidly-arriving rain.
+      sunny_enough = sunny_model AND sunny_observed AND not_overcast
 
     Args:
         weather: Weather data from fetch_weather()
@@ -865,8 +921,10 @@ def should_open_awning(
         altitude_threshold: Minimum sun altitude (degrees) above horizon
         min_ghi: Minimum global horizontal irradiance (W/m²) for sunny_model
         min_uv_index: Minimum UV Index for sunny_model
-        min_dni: Minimum direct normal irradiance (W/m²) for sunny_observed
-        max_cloud_cover: Maximum total cloud cover (%) for sunny_observed
+        min_dni: Minimum direct normal irradiance (W/m²) for sunny_observed (Layer 2)
+        max_cloud_cover: Maximum total cloud cover (%) for sunny_observed (Layer 2)
+        min_temperature_f: Minimum temperature (°F) to open awning
+        overcast_threshold: Cloud cover ceiling (%) for not_overcast (Layer 3)
 
     Returns:
         Tuple of (should_open, reason, conditions_dict)
@@ -891,19 +949,27 @@ def should_open_awning(
     uv_sunny = uv_index >= min_uv_index
     sunny_model = ghi_sunny or uv_sunny
 
-    # Layer 2: observational confirmation — 'is reality actually sunny?'
-    # DNI is measured (not model-forecast); cloud_cover updates faster than GHI.
-    # OR: either observation alone is sufficient to confirm sunny, preventing
-    # false-closes when DNI is intermittent on partly-cloudy days.
+    # Layer 2: multi-variable consistency check — independent model variable cross-check
+    # DNI and cloud_cover come from different NWP model schemes:
+    #   - DNI/GHI: radiative transfer scheme
+    #   - cloud_cover: humidity-based scheme (Sundqvist 1989)
+    # The OR allows either to confirm sunny, preventing false-closes when DNI is
+    # intermittent on partly-cloudy days and cloud_cover is wrongly high.
     dni_sunny = dni >= min_dni
     cloud_sunny = cloud_cover < max_cloud_cover
     sunny_observed = dni_sunny or cloud_sunny
 
-    is_sunny = sunny_model and sunny_observed
+    # Layer 3: hard cloud-cover ceiling — overcast override
+    # When cloud_cover >= overcast_threshold, the sky is fully overcast regardless
+    # of what DNI reports. At this extreme, the humidity-derived cloud_cover is the
+    # more reliable discriminator over the radiative-transfer-derived DNI.
+    not_overcast = cloud_cover < overcast_threshold
+
+    is_sunny = sunny_model and sunny_observed and not_overcast
 
     is_calm = wind_speed < wind_threshold
     no_rain = precipitation == 0
-    above_freezing = temperature > 40
+    above_freezing = temperature > min_temperature_f
     is_day = is_daytime(current_time, sunrise, sunset)
     sun_high_enough = altitude >= altitude_threshold
     sun_facing_se = is_sun_facing_window(azimuth)
@@ -920,7 +986,7 @@ def should_open_awning(
 
     should_open = all(conditions.values())
 
-    # Build sunny signal trace for logging (two-layer gate)
+    # Build sunny signal trace for logging (three-layer gate)
     # Layer 1: model forecast signal
     if sunny_model:
         if ghi_sunny and uv_sunny:
@@ -932,7 +998,7 @@ def should_open_awning(
     else:
         model_trace = f"GHI {ghi:.0f} W/m² < {min_ghi:.0f} AND UV {uv_index:.1f} < {min_uv_index:.1f}"
 
-    # Layer 2: observational confirmation signal
+    # Layer 2: multi-variable consistency check signal
     if sunny_observed:
         if dni_sunny and cloud_sunny:
             obs_trace = f"DNI {dni:.0f} W/m² >= {min_dni:.0f} AND cloud {cloud_cover:.0f}% < {max_cloud_cover:.0f}%"
@@ -943,12 +1009,17 @@ def should_open_awning(
     else:
         obs_trace = f"DNI {dni:.0f} W/m² < {min_dni:.0f} AND cloud {cloud_cover:.0f}% >= {max_cloud_cover:.0f}%"
 
+    # Layer 3: hard cloud-cover ceiling
+    overcast_trace = f"cloud {cloud_cover:.0f}% {'<' if not_overcast else '>='} {overcast_threshold:.0f}% ceiling"
+
     if is_sunny:
-        sunny_trace = f"model=({model_trace}), observed=({obs_trace})"
+        sunny_trace = f"model=({model_trace}), consistency=({obs_trace}), overcast=({overcast_trace})"
     elif not sunny_model:
         sunny_trace = f"model failed: {model_trace}"
-    else:
+    elif not sunny_observed:
         sunny_trace = f"observed failed: {obs_trace} (model ok: {model_trace})"
+    else:
+        sunny_trace = f"overcast ceiling blocked: {overcast_trace} (model ok: {model_trace}, consistency ok: {obs_trace})"
 
     # Build detailed reason string
     reasons = []
@@ -959,7 +1030,7 @@ def should_open_awning(
     if not no_rain:
         reasons.append(f"Raining ({precipitation} mm/h)")
     if not above_freezing:
-        reasons.append(f"Too cold ({temperature}°F <= 40°F)")
+        reasons.append(f"Too cold ({temperature}°F <= {min_temperature_f:.0f}°F)")
     if not is_day:
         reasons.append(
             f"Nighttime (sunrise {sunrise[11:16]}, sunset {sunset[11:16]})"
@@ -1102,11 +1173,12 @@ def main() -> None:
         logger.info(f"Location: {latitude:.4f}, {longitude:.4f}")
 
         # Get thresholds
-        wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover = get_thresholds()
+        wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold = get_thresholds()
         logger.info(
             f"Thresholds: model=(GHI >= {min_ghi:.0f} W/m² OR UV >= {min_uv_index:.1f}), "
-            f"observed=(DNI >= {min_dni:.0f} W/m² OR cloud < {max_cloud_cover:.0f}%), "
-            f"Wind < {wind_threshold} mph, Rain = 0 mm/h, Temp > 40°F, "
+            f"consistency=(DNI >= {min_dni:.0f} W/m² OR cloud < {max_cloud_cover:.0f}%), "
+            f"overcast ceiling=cloud < {overcast_threshold:.0f}%, "
+            f"Wind < {wind_threshold} mph, Rain = 0 mm/h, Temp > {min_temperature_f:.0f}°F, "
             f"Sun altitude >= {altitude_threshold}°, Sun facing window (90°-260°)"
         )
 
@@ -1136,9 +1208,10 @@ def main() -> None:
             f"Sunset {weather['sunset'][11:16]}"
         )
 
-        # Log observational values (used in sunny gate layer 2)
+        # Log consistency-check values (DNI from radiative transfer scheme;
+        # cloud_cover from humidity-based scheme — independent model variables)
         logger.info(
-            f"Observational: "
+            f"Cross-check: "
             f"DNI {weather['dni']:.0f} W/m², "
             f"cloud_cover {weather['cloud_cover']:.0f}% total "
             f"(low {weather['cloud_cover_low']:.0f}%, "
@@ -1157,6 +1230,8 @@ def main() -> None:
             min_uv_index,
             min_dni,
             max_cloud_cover,
+            min_temperature_f,
+            overcast_threshold,
         )
 
         # Log conditions with checkmarks/crosses
