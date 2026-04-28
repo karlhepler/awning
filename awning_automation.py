@@ -37,7 +37,6 @@ import json
 import logging
 import os
 import sys
-import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -366,154 +365,46 @@ def _raw_reading_from_weather(weather: dict) -> dict:
     }
 
 
-# Number of discrete weather measurements per automation run
-_MEASUREMENT_COUNT = 3
-# Seconds to wait between measurements (~1 minute apart, 2 minutes total for 3 readings)
-_MEASUREMENT_INTERVAL_SECONDS = 60
-
-# Numeric fields that are averaged across measurements (all others pass through from first reading)
-_AVERAGED_FIELDS = [
-    "shortwave_radiation",
-    "uv_index",
-    "wind_speed_10m",
-    "precipitation",
-    "temperature",
-    "dni",
-    "cloud_cover",
-    "cloud_cover_low",
-    "cloud_cover_mid",
-    "cloud_cover_high",
-]
-
-
 def collect_weather_measurements(lat: float, lon: float) -> dict:
     """
-    Collect 3 discrete weather measurements ~1 minute apart and return averaged values.
+    Fetch a single weather measurement from Open-Meteo.
 
-    Makes _MEASUREMENT_COUNT separate weather API calls, sleeping
-    _MEASUREMENT_INTERVAL_SECONDS between each. Each individual API call is
-    retried up to _FETCH_MAX_RETRIES times with exponential backoff on failure.
-    If a single measurement fails all retries, it is logged as a warning and
-    skipped. Averaging is performed over whatever measurements succeeded (1, 2,
-    or 3). If ALL measurements fail, WeatherAPIError is raised so the caller's
-    existing fail-safe close logic is triggered.
+    The cron job runs every 15 minutes — that cadence is the sampling interval.
+    Open-Meteo caches API responses within sub-minute windows, so multiple calls
+    spaced 1 minute apart return identical values. A single call per cron run is
+    sufficient and avoids wasted work.
 
-    Non-numeric fields (sunrise, sunset, is_day, time) are taken from the
-    first successful measurement.
+    The underlying fetch_weather() call is retried by tenacity with exponential
+    backoff on transient network errors (ConnectionError, Timeout,
+    ChunkedEncodingError) — see WEATHER_RETRY_CONFIG.
 
     Args:
         lat: Latitude
         lon: Longitude
 
     Returns:
-        Weather dict with numeric fields averaged across all successful
-        measurements, non-numeric fields from the first successful measurement.
+        Weather dict from fetch_weather().
 
     Raises:
-        WeatherAPIError: If all weather API requests fail.
+        WeatherAPIError: If the weather API request fails.
     """
-    # Per-measurement retry configuration (independent of tenacity)
-    _FETCH_MAX_RETRIES = 3
-    _FETCH_BASE_DELAY_SECONDS = 2  # Backoff: 2s, 4s, 8s
-
-    samples = []
-    prev_measurement_end_time: Optional[float] = None
-
-    for i in range(_MEASUREMENT_COUNT):
-        # Enforce the inter-measurement interval from the end of the previous
-        # measurement (success or final failure). Retry backoff within a
-        # measurement does not count toward this interval.
-        if prev_measurement_end_time is not None:
-            elapsed = time.monotonic() - prev_measurement_end_time
-            remaining = _MEASUREMENT_INTERVAL_SECONDS - elapsed
-            if remaining > 0:
-                logger.info(
-                    f"Waiting {remaining:.0f}s before measurement {i + 1} of {_MEASUREMENT_COUNT}..."
-                )
-                time.sleep(remaining)
-
-        logger.info(f"Fetching weather measurement {i + 1} of {_MEASUREMENT_COUNT}...")
-
-        sample = None
-        last_error = None
-        for attempt in range(1, _FETCH_MAX_RETRIES + 1):
-            try:
-                sample = fetch_weather(lat, lon)
-                break
-            except WeatherAPIError as exc:
-                last_error = exc
-                if attempt < _FETCH_MAX_RETRIES:
-                    backoff = _FETCH_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
-                    logger.warning(
-                        f"Measurement {i + 1} attempt {attempt} failed: {exc}. "
-                        f"Retrying in {backoff}s (attempt {attempt + 1} of {_FETCH_MAX_RETRIES})..."
-                    )
-                    time.sleep(backoff)
-
-        # Record when this measurement resolved (success or final failure).
-        # The next measurement's inter-measurement wait is measured from here,
-        # so retry backoff time spent above never shortens the gap.
-        prev_measurement_end_time = time.monotonic()
-
-        if sample is None:
-            logger.warning(
-                f"Measurement {i + 1} failed all {_FETCH_MAX_RETRIES} retry attempts — "
-                f"skipping this sample. Last error: {last_error}"
-            )
-            continue
-
-        samples.append(sample)
-
-        logger.info(
-            f"Sample {i + 1}: GHI {sample['shortwave_radiation']:.0f} W/m², "
-            f"UV {sample['uv_index']:.1f}, "
-            f"DNI (obs) {sample['dni']:.0f} W/m², "
-            f"{sample['wind_speed_10m']:.1f} mph wind, "
-            f"{sample['precipitation']:.2f} mm/h rain, "
-            f"{sample['temperature']:.1f}°F"
-        )
-        logger.info(
-            f"Sample {i + 1} clouds: Total {sample['cloud_cover']:.0f}%, "
-            f"Low {sample['cloud_cover_low']:.0f}%, "
-            f"Mid {sample['cloud_cover_mid']:.0f}%, "
-            f"High {sample['cloud_cover_high']:.0f}%"
-        )
-
-    if not samples:
-        raise WeatherAPIError(
-            f"All {_MEASUREMENT_COUNT} weather measurements failed after "
-            f"{_FETCH_MAX_RETRIES} retry attempts each."
-        )
-
-    num_samples = len(samples)
-    if num_samples < _MEASUREMENT_COUNT:
-        logger.warning(
-            f"Only {num_samples} of {_MEASUREMENT_COUNT} measurements succeeded — "
-            f"averaging over partial samples."
-        )
-
-    # Average numeric fields across all successful samples
-    averaged = dict(samples[0])  # start with copy of first sample (non-numeric fields)
-    for field in _AVERAGED_FIELDS:
-        values = [s[field] for s in samples]
-        averaged[field] = sum(values) / num_samples
-
+    logger.info("Fetching weather measurement...")
+    weather = fetch_weather(lat, lon)
     logger.info(
-        f"Average ({num_samples} samples): GHI {averaged['shortwave_radiation']:.0f} W/m², "
-        f"UV {averaged['uv_index']:.1f}, "
-        f"DNI (obs) {averaged['dni']:.0f} W/m², "
-        f"{averaged['wind_speed_10m']:.1f} mph wind, "
-        f"{averaged['precipitation']:.2f} mm/h rain, "
-        f"{averaged['temperature']:.1f}°F"
+        f"Weather: GHI {weather['shortwave_radiation']:.0f} W/m², "
+        f"UV {weather['uv_index']:.1f}, "
+        f"DNI (obs) {weather['dni']:.0f} W/m², "
+        f"{weather['wind_speed_10m']:.1f} mph wind, "
+        f"{weather['precipitation']:.2f} mm/h rain, "
+        f"{weather['temperature']:.1f}°F"
     )
     logger.info(
-        f"Average clouds ({num_samples} samples): Total {averaged['cloud_cover']:.0f}%, "
-        f"Low {averaged['cloud_cover_low']:.0f}%, "
-        f"Mid {averaged['cloud_cover_mid']:.0f}%, "
-        f"High {averaged['cloud_cover_high']:.0f}%"
+        f"Clouds: Total {weather['cloud_cover']:.0f}%, "
+        f"Low {weather['cloud_cover_low']:.0f}%, "
+        f"Mid {weather['cloud_cover_mid']:.0f}%, "
+        f"High {weather['cloud_cover_high']:.0f}%"
     )
-
-    return averaged
+    return weather
 
 
 def load_location_config(env_file: Optional[Path] = None) -> tuple[float, float]:
@@ -1224,11 +1115,7 @@ def main() -> None:
         if telegram_token:
             logger.info("Telegram notifications enabled")
 
-        # Collect 3 weather measurements ~1 minute apart, then use their average
-        logger.info(
-            f"Collecting {_MEASUREMENT_COUNT} weather measurements "
-            f"({_MEASUREMENT_INTERVAL_SECONDS}s apart)..."
-        )
+        # Fetch current weather (cron runs every 15 minutes — that's the sampling cadence)
         weather = collect_weather_measurements(latitude, longitude)
 
         # Get current time from weather API (same timezone as sunrise/sunset)
