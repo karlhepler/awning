@@ -73,6 +73,7 @@ _DAYTIME = datetime(2026, 4, 17, 13, 0, 0, tzinfo=timezone.utc)
 # ---------------------------------------------------------------------------
 # Import functions under test
 # ---------------------------------------------------------------------------
+import awning_automation
 from awning_automation import should_open_awning, ConfigurationError, get_thresholds, WeatherAPIError, fetch_weather
 
 
@@ -356,7 +357,7 @@ class TestShouldOpenAwningOrGate(unittest.TestCase):
         mock_response.json.return_value = null_response
         mock_response.raise_for_status.return_value = None
 
-        with patch("awning_automation.requests.get", return_value=mock_response):
+        with patch.object(awning_automation._weather_session, "get", return_value=mock_response):
             with self.assertRaises(WeatherAPIError) as ctx:
                 fetch_weather(37.7, -122.4)
             self.assertIn("null", str(ctx.exception).lower())
@@ -394,7 +395,7 @@ class TestShouldOpenAwningOrGate(unittest.TestCase):
         mock_response.json.return_value = null_response
         mock_response.raise_for_status.return_value = None
 
-        with patch("awning_automation.requests.get", return_value=mock_response):
+        with patch.object(awning_automation._weather_session, "get", return_value=mock_response):
             with self.assertRaises(WeatherAPIError) as ctx:
                 fetch_weather(37.7, -122.4)
             self.assertIn("null", str(ctx.exception).lower())
@@ -435,7 +436,7 @@ class TestShouldOpenAwningOrGate(unittest.TestCase):
         mock_response.json.return_value = null_response
         mock_response.raise_for_status.return_value = None
 
-        with patch("awning_automation.requests.get", return_value=mock_response):
+        with patch.object(awning_automation._weather_session, "get", return_value=mock_response):
             with self.assertRaises(WeatherAPIError) as ctx:
                 fetch_weather(37.7, -122.4)
             self.assertIn("null", str(ctx.exception).lower())
@@ -475,7 +476,7 @@ class TestShouldOpenAwningOrGate(unittest.TestCase):
         mock_response.json.return_value = null_response
         mock_response.raise_for_status.return_value = None
 
-        with patch("awning_automation.requests.get", return_value=mock_response):
+        with patch.object(awning_automation._weather_session, "get", return_value=mock_response):
             with self.assertRaises(WeatherAPIError) as ctx:
                 fetch_weather(37.7, -122.4)
             self.assertIn("null", str(ctx.exception).lower())
@@ -621,18 +622,19 @@ class TestOvercastCeilingGate(unittest.TestCase):
     # All three layers pass → should open (temp=70 > 60).
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
-    # Test — 2026-04-28 13:05 afternoon case: high cirrus saturates total
-    # cloud cover to 100% but mid-level clouds are only 5%. Sun was visibly
-    # shining on porch. The overcast ceiling must NOT fire on cirrus alone.
+    # Test — 2026-04-28 incident: high-level cirrostratus (cloud_cover_high=99%)
+    # with cloud_cover_mid=53-70% fully blocked direct sun while awning was open.
+    # The overcast ceiling now uses max(cloud_cover_mid, cloud_cover_high) so that
+    # thick high-level cloud cover alone is sufficient to fire the ceiling gate.
     #
-    # Data: low=46, mid=5, high=100, total=100, GHI=860, UV=4.0, DNI=492
+    # Scenario: low=46, mid=5, high=100, total=100, GHI=860, UV=4.0, DNI=492
     # Layer 1: GHI=860 >= 400 → sunny_model=True
     # Layer 2: DNI=492 >= 50 → sunny_observed=True
-    # Layer 3: cloud_cover_mid=5 < 95 (ceiling) → not_overcast=True
-    # All three layers pass → should open
+    # Layer 3: max(cloud_mid=5, cloud_high=100) = 100 >= 95 → not_overcast=False
+    # Layer 3 fires → ceiling blocked → should NOT open
     # ------------------------------------------------------------------
-    def test_high_cirrus_does_not_trigger_overcast_ceiling(self):
-        """Afternoon cirrus case: cloud_mid=5% despite total=100% → ceiling doesn't fire → opens."""
+    def test_high_cirrus_triggers_overcast_ceiling(self):
+        """High cirrus case: cloud_high=100% → max(mid=5,high=100)=100 >= 95 ceiling → ceiling fires → stays closed."""
         should_open, reason, conditions = should_open_awning(
             weather=_weather(
                 shortwave_radiation=860.0,
@@ -648,13 +650,13 @@ class TestOvercastCeilingGate(unittest.TestCase):
             current_time=_DAYTIME,
             **_THRESHOLDS,
         )
-        self.assertTrue(
+        self.assertFalse(
             conditions["sunny"],
-            f"Expected sunny=True (cirrus should not trigger ceiling) but got False. reason={reason!r}",
+            f"Expected sunny=False (high cirrus should trigger ceiling) but got True. reason={reason!r}",
         )
-        self.assertTrue(
+        self.assertFalse(
             should_open,
-            f"Expected awning to open (sun shining despite high cirrus) but got False. reason={reason!r}",
+            f"Expected awning to stay closed (high cirrus blocks sun) but got True. reason={reason!r}",
         )
 
     def test_partly_cloudy_below_ceiling_still_opens(self):
@@ -773,6 +775,180 @@ class TestGetThresholdsMinTemperatureFValidation(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, env):
             _, _, _, _, _, _, min_temperature_f, _ = get_thresholds()
             self.assertEqual(min_temperature_f, 120.0)
+
+
+class TestWeatherRetryBehavior(unittest.TestCase):
+    """Tests for urllib3-level retry behavior introduced in card #45.
+
+    All four tests patch urllib3.HTTPSConnectionPool._make_request — the lowest
+    level that urllib3's internal retry loop calls on each attempt.  This is the
+    correct target: the retry loop lives inside urllib3.urlopen() and calls
+    _make_request recursively on each attempt, so a side_effect list on
+    _make_request produces one entry per attempt, exactly mirroring the real
+    retry sequence.
+
+    Patching at session.get (the existing test pattern) would bypass the retry
+    adapter entirely and is not suitable for these tests.
+    """
+
+    # Shared valid weather JSON that fetch_weather() will accept.
+    _GOOD_JSON = {
+        "current": {
+            "wind_speed_10m": 5.0,
+            "precipitation": 0.0,
+            "temperature_2m": 65.0,
+            "shortwave_radiation": 500.0,
+            "uv_index": 6.0,
+            "direct_normal_irradiance": 400.0,
+            "cloud_cover": 20,
+            "cloud_cover_low": 10,
+            "cloud_cover_mid": 5,
+            "cloud_cover_high": 5,
+            "is_day": 1,
+            "time": "2026-04-17T13:00",
+        },
+        "daily": {
+            "sunrise": ["2026-04-17T06:00"],
+            "sunset": ["2026-04-17T20:00"],
+        },
+    }
+
+    @staticmethod
+    def _make_urllib3_resp(status, body=b""):
+        """Build a minimal urllib3.response.HTTPResponse suitable for retry tests."""
+        import io
+        import urllib3
+        return urllib3.response.HTTPResponse(
+            body=io.BytesIO(body),
+            status=status,
+            headers={"Content-Type": "application/json"},
+            preload_content=False,
+        )
+
+    def _make_resp_503(self):
+        return self._make_urllib3_resp(503, b"Service Unavailable")
+
+    def _make_resp_200(self):
+        import json
+        return self._make_urllib3_resp(200, json.dumps(self._GOOD_JSON).encode())
+
+    # ------------------------------------------------------------------
+    # Test — 503 retry fires: first attempt returns 503, second returns 200.
+    # fetch_weather() must succeed (retry kicked in) and _make_request must
+    # have been called more than once, proving the retry adapter engaged.
+    # ------------------------------------------------------------------
+    def test_weather_retry_fires_on_503(self):
+        """503 on first attempt → urllib3 retry fires → second attempt returns 200 → fetch_weather succeeds."""
+        import urllib3
+        from unittest.mock import patch
+
+        with patch.object(
+            urllib3.HTTPSConnectionPool,
+            "_make_request",
+            side_effect=[self._make_resp_503(), self._make_resp_200()],
+        ) as mock_req:
+            result = fetch_weather(37.7, -122.4)
+
+        self.assertEqual(result["shortwave_radiation"], 500.0)
+        self.assertGreater(
+            mock_req.call_count,
+            1,
+            "Expected _make_request to be called more than once (retry fired), "
+            f"but it was called {mock_req.call_count} time(s)",
+        )
+
+    # ------------------------------------------------------------------
+    # Test — retry exhaustion raises WeatherAPIError, not raw urllib3 error.
+    # All attempts return 503.  After retries exhaust, fetch_weather() must
+    # raise WeatherAPIError (not MaxRetryError or requests.HTTPError).
+    # ------------------------------------------------------------------
+    def test_weather_retry_exhaustion_raises_WeatherAPIError(self):
+        """All attempts return 503 → retries exhaust → fetch_weather raises WeatherAPIError."""
+        import urllib3
+        from unittest.mock import patch
+        from awning_automation import _WEATHER_RETRY_TOTAL
+
+        # One initial attempt + _WEATHER_RETRY_TOTAL retries
+        responses_503 = [
+            self._make_resp_503()
+            for _ in range(_WEATHER_RETRY_TOTAL + 1)
+        ]
+
+        with patch.object(
+            urllib3.HTTPSConnectionPool,
+            "_make_request",
+            side_effect=responses_503,
+        ):
+            with self.assertRaises(WeatherAPIError) as ctx:
+                fetch_weather(37.7, -122.4)
+
+        # Must be our domain exception, not a raw urllib3 or requests error
+        self.assertIsInstance(ctx.exception, WeatherAPIError)
+
+    # ------------------------------------------------------------------
+    # Test — fail-safe close runs after retry exhaustion.
+    # Compose with #2: when fetch_weather() raises WeatherAPIError, main()'s
+    # exception handler must trigger the fail-safe close path.  Assert that
+    # controller.close() is called and a Telegram failure notification fires
+    # (Telegram fires only after full retry exhaustion — correct behavior).
+    # ------------------------------------------------------------------
+    def test_failsafe_close_runs_after_weather_retry_exhaustion(self):
+        """WeatherAPIError in fetch_weather → main() fail-safe: close called + Telegram fires."""
+        import sys
+        from unittest.mock import patch, MagicMock
+
+        mock_controller = MagicMock()
+        mock_controller.get_state.return_value = 1  # Awning is open → fail-safe should close it
+
+        mock_log_path = MagicMock()
+        mock_log_path.parent = MagicMock()
+
+        with patch.object(sys, "argv", ["awning_automation.py"]):
+            with patch.object(awning_automation, "setup_logging", return_value=mock_log_path):
+                with patch.object(awning_automation, "load_location_config", return_value=(37.7, -122.4)):
+                    with patch.object(awning_automation, "get_thresholds", return_value=(15, 20, 400, 4, 50, 80, 60, 95)):
+                        with patch.object(awning_automation, "load_telegram_config", return_value=("fake_token", "fake_chat")):
+                            with patch.object(
+                                awning_automation,
+                                "collect_weather_measurements",
+                                side_effect=WeatherAPIError("Simulated API exhaustion"),
+                            ):
+                                with patch.object(awning_automation, "create_controller_from_env", return_value=mock_controller):
+                                    with patch.object(awning_automation, "send_telegram_notification") as mock_telegram:
+                                        with self.assertRaises(SystemExit):
+                                            awning_automation.main()
+
+        mock_controller.close.assert_called_once()
+
+        # Telegram must fire exactly once with the fail-safe message (exhaustion case)
+        mock_telegram.assert_called_once()
+        call_args = mock_telegram.call_args
+        self.assertIn("fail-safe", call_args[0][2].lower())
+
+    # ------------------------------------------------------------------
+    # Test — Telegram is NOT pinged on individual retries.
+    # 503 once then 200: fetch_weather() retries and succeeds.  Telegram
+    # must be silent during the retry — it only fires on state changes
+    # (handled in main()) or final exhaustion, never on intermediate retries.
+    # ------------------------------------------------------------------
+    def test_telegram_not_pinged_on_individual_retries(self):
+        """503 then 200 retry succeeds → send_telegram_notification never called during retry."""
+        import urllib3
+        from unittest.mock import patch
+
+        with patch.object(
+            urllib3.HTTPSConnectionPool,
+            "_make_request",
+            side_effect=[self._make_resp_503(), self._make_resp_200()],
+        ):
+            with patch.object(awning_automation, "send_telegram_notification") as mock_telegram:
+                result = fetch_weather(37.7, -122.4)
+
+        # Verify fetch_weather succeeded (the retry recovered)
+        self.assertEqual(result["shortwave_radiation"], 500.0)
+
+        # Telegram must NOT have been called during the retry
+        mock_telegram.assert_not_called()
 
 
 if __name__ == "__main__":
