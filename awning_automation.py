@@ -24,27 +24,24 @@ Sunshine detection uses a two-layer gate plus a hard cloud-cover ceiling:
     preventing false-closes when DNI is intermittent on partly-cloudy days.
 
   Layer 3 — hard cloud-cover ceiling (overcast override):
-    not_overcast = cloud_cover_mid < OVERCAST_THRESHOLD_PCT
-    When cloud_cover_mid is very high (≥95%), the sky has mid-level (altostratus/
-    altocumulus) cloud cover that blocks direct sun. This ceiling overrides DNI
-    when mid-level clouds signal true overcast, blocking false-positive opens.
-    Mid-level clouds are used instead of total cloud cover because total saturates
-    to 100% when high cirrus is present, even when mid-level and low clouds are
-    sparse and the sun is visibly shining. High clouds (cirrus) are handled
-    permissively here because DNI already captures their optical impact.
+    not_overcast = max(cloud_cover_mid, cloud_cover_high) < OVERCAST_THRESHOLD_PCT
+    When max(cloud_cover_mid, cloud_cover_high) is very high (≥95%), the sky has
+    optically thick cloud cover that blocks direct sun. Both mid-level (altostratus/
+    altocumulus) and high-level (cirrostratus) clouds can independently cause full
+    overcast. The 2026-04-28 incident confirmed that cloud_cover_high=99% with
+    cloud_cover_mid=53-70% fully blocked the sun while the awning remained open.
+    Using max() ensures either layer alone is sufficient to fire the ceiling gate.
 
   sunny_enough = sunny_model AND sunny_observed AND not_overcast
 
 All three layers must agree before the awning opens.
 
-Smoothing: All numeric sensor inputs are passed through a weighted rolling average
-(weights [4,3,2,1] for current and up to 3 cached prior readings, normalized) before
-threshold evaluation, preventing false-positive opens from momentary API spikes.
+Each cron run makes a single weather API call. Open-Meteo caches responses within
+sub-minute windows, so the 15-minute cron cadence is the effective sampling interval.
 
 Designed to run as a cron job or Kubernetes scheduled job.
 """
 
-import json
 import logging
 import os
 import sys
@@ -56,6 +53,9 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 from pvlib import solarposition
+from requests.adapters import HTTPAdapter
+# NOTE: tenacity is retained for Telegram POST retries; weather/Bond migrated to urllib3.Retry.
+# The split is intentional — POST methods require additional urllib3 Retry config we don't need elsewhere.
 from tenacity import (
     before_sleep_log,
     retry,
@@ -63,6 +63,7 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
 )
+from urllib3.util.retry import Retry
 
 from awning_controller import (
     BondAPIError,
@@ -177,21 +178,77 @@ def cleanup_old_logs(log_dir: Path, retention_days: int = 30) -> None:
             # Invalid filename format or permission error - skip
             pass
 
-# Retry configuration for Weather API
-# Retries transient network errors with exponential backoff (2s, 4s, 8s)
-WEATHER_RETRY_CONFIG = {
-    "stop": stop_after_attempt(3),
-    "wait": wait_exponential(multiplier=2, min=2, max=30),
-    "retry": retry_if_exception_type(
-        (
-            requests.exceptions.ConnectionError,
-            requests.exceptions.Timeout,
-            requests.exceptions.ChunkedEncodingError,
+# Weather API retry configuration
+# Retries on 5xx server errors (including 503), 429 rate-limit, and
+# connection-level errors with exponential backoff.
+# Approximate retry delays: 0s, 2s, 4s, 8s, 16s (wall-clock cap ~30s).
+_WEATHER_RETRY_TOTAL = 5
+_WEATHER_RETRY_BACKOFF_FACTOR = 1.0
+_WEATHER_RETRY_STATUS_FORCELIST = [429, 500, 502, 503, 504]
+
+
+class _WeatherLoggingRetry(Retry):
+    """Retry subclass that logs each weather API retry attempt at WARNING level."""
+
+    def new(self, **kw):
+        # Mirror _LoggingRetry.new() for defensive consistency: urllib3 calls
+        # new() to produce successive Retry objects in the retry chain. There is
+        # no instance state to propagate here today, but overriding keeps the
+        # pattern symmetric with _LoggingRetry and prevents a latent trap if
+        # state is added later.
+        return super().new(**kw)
+
+    def increment(self, method=None, url=None, response=None, error=None, _pool=None, _stacktrace=None):
+        attempt_num = len(self.history) + 1
+
+        if response is not None:
+            status = response.status
+            logger.warning(
+                f"weather API returned {status}, retrying "
+                f"(attempt {attempt_num}/{_WEATHER_RETRY_TOTAL}) ..."
+            )
+        elif error is not None:
+            logger.warning(
+                f"weather API connection error ({error}), retrying "
+                f"(attempt {attempt_num}/{_WEATHER_RETRY_TOTAL}) ..."
+            )
+
+        return super().increment(
+            method=method,
+            url=url,
+            response=response,
+            error=error,
+            _pool=_pool,
+            _stacktrace=_stacktrace,
         )
-    ),
-    "reraise": True,
-    "before_sleep": before_sleep_log(logger, logging.WARNING),
-}
+
+
+def _make_weather_session() -> requests.Session:
+    """
+    Create a requests.Session with exponential-backoff retry for the Open-Meteo API.
+
+    Retries on 5xx server errors (including 503), 429 rate-limit, and
+    connection-level errors. GET-only — Open-Meteo uses GET for all requests.
+
+    Approximate retry delays: 0s, 2s, 4s, 8s, 16s (wall-clock cap ~30s).
+    """
+    retry = _WeatherLoggingRetry(
+        total=_WEATHER_RETRY_TOTAL,
+        backoff_factor=_WEATHER_RETRY_BACKOFF_FACTOR,
+        status_forcelist=_WEATHER_RETRY_STATUS_FORCELIST,
+        allowed_methods=["GET", "HEAD"],
+        raise_on_status=False,  # let raise_for_status() decide after retries
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session = requests.Session()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+# Module-level session shared across all weather API calls in this process.
+# Tests may replace _weather_session.get via patch.object().
+_weather_session = _make_weather_session()
 
 # Retry configuration for Telegram API (best-effort, shorter waits)
 TELEGRAM_RETRY_CONFIG = {
@@ -212,168 +269,6 @@ class WeatherAPIError(Exception):
     """Raised when weather API request fails."""
 
     pass
-
-
-# Default cache path; can be overridden in tests
-READINGS_CACHE_PATH = Path.home() / ".config" / "awning" / "readings-cache.json"
-
-# Keys that are stored/loaded from the readings cache
-_CACHE_KEYS = ["ghi", "uv_index", "dni", "wind", "temp", "precip", "cloud_total", "cloud_low", "cloud_mid", "cloud_high"]
-
-# Linear weights for [current, n-1, n-2, n-3] — normalized before use
-_SMOOTHING_WEIGHTS = [4, 3, 2, 1]
-
-
-def load_readings_cache(cache_path: Path = READINGS_CACHE_PATH) -> list[dict]:
-    """
-    Load prior raw sensor readings from the local cache file.
-
-    Returns up to 3 most-recent entries (oldest first).  Gracefully returns an
-    empty list if the file is absent, empty, or malformed.
-
-    Args:
-        cache_path: Path to the JSON cache file
-
-    Returns:
-        List of reading dicts (up to 3), oldest first
-    """
-    if not cache_path.exists():
-        return []
-    try:
-        text = cache_path.read_text()
-        data = json.loads(text)
-        if not isinstance(data, list):
-            return []
-        # Keep only well-formed entries that have all required keys
-        valid = [
-            entry for entry in data
-            if isinstance(entry, dict) and all(k in entry for k in _CACHE_KEYS)
-        ]
-        # Return at most 3 most-recent entries, oldest first
-        return valid[-3:]
-    except (json.JSONDecodeError, OSError, ValueError):
-        return []
-
-
-def save_readings_cache(
-    raw_reading: dict,
-    prior_entries: list[dict],
-    cache_path: Path = READINGS_CACHE_PATH,
-) -> None:
-    """
-    Append the current raw reading to the cache and trim to 3 entries.
-
-    The cache stores only raw values (not smoothed), so each subsequent run
-    can compute a fresh weighted average from actual sensor readings.
-
-    Args:
-        raw_reading: Raw weather reading dict to append (must contain all _CACHE_KEYS)
-        prior_entries: Existing entries loaded from cache (up to 3)
-        cache_path: Path to the JSON cache file
-    """
-    entry = {k: raw_reading[k] for k in _CACHE_KEYS}
-    entry["timestamp"] = datetime.now(timezone.utc).isoformat()
-
-    updated = list(prior_entries) + [entry]
-    # Keep at most 3 entries (so next run has up to 3 priors)
-    updated = updated[-3:]
-
-    try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(json.dumps(updated, indent=2))
-    except OSError as e:
-        logger.warning(f"Could not write readings cache to {cache_path}: {e}")
-
-
-def compute_smoothed_weather(
-    raw: dict,
-    prior_entries: list[dict],
-) -> dict:
-    """
-    Compute weighted rolling average over current + up to 3 prior readings.
-
-    Weights [4, 3, 2, 1] correspond to [current, n-1, n-2, n-3].  Only as
-    many weights as available readings are used, normalized so they sum to 1.
-
-    The cache entries are expected oldest-first; the most-recent prior is
-    prior_entries[-1].
-
-    Smoothed fields: ghi, uv_index, dni, wind, temp, precip, cloud_total,
-    cloud_low, cloud_mid, cloud_high.  All other fields in ``raw`` are passed
-    through unchanged.
-
-    Args:
-        raw: Current weather reading (from fetch_weather())
-        prior_entries: Prior raw readings from cache (oldest first, up to 3)
-
-    Returns:
-        New weather dict with smoothed numeric sensor values
-    """
-    # Map from cache key → weather dict key
-    field_map = {
-        "ghi": "shortwave_radiation",
-        "uv_index": "uv_index",
-        "dni": "dni",
-        "wind": "wind_speed_10m",
-        "temp": "temperature",
-        "precip": "precipitation",
-        "cloud_total": "cloud_cover",
-        "cloud_low": "cloud_cover_low",
-        "cloud_mid": "cloud_cover_mid",
-        "cloud_high": "cloud_cover_high",
-    }
-
-    # Build ordered list of readings: newest first (current, n-1, n-2, n-3)
-    # prior_entries is oldest-first, so reverse to get newest-first
-    readings_newest_first = [raw] + list(reversed(prior_entries))
-    n = len(readings_newest_first)
-
-    # Take only as many weights as we have readings
-    raw_weights = _SMOOTHING_WEIGHTS[:n]
-    total = sum(raw_weights)
-    normalized = [w / total for w in raw_weights]
-
-    smoothed = dict(raw)  # start with a copy of raw (preserves non-numeric fields)
-
-    for cache_key, weather_key in field_map.items():
-        # Retrieve values from each reading in newest-first order
-        values = []
-        for i, reading in enumerate(readings_newest_first):
-            if i == 0:
-                # Current reading — use weather dict key
-                values.append(float(reading.get(weather_key, 0)))
-            else:
-                # Prior cache entry — use cache key
-                values.append(float(reading.get(cache_key, 0)))
-
-        weighted_val = sum(v * w for v, w in zip(values, normalized))
-        smoothed[weather_key] = weighted_val
-
-    return smoothed
-
-
-def _raw_reading_from_weather(weather: dict) -> dict:
-    """
-    Extract raw sensor values from a fetch_weather() result for cache storage.
-
-    Args:
-        weather: Weather dict from fetch_weather()
-
-    Returns:
-        Dict with cache keys (ghi, uv_index, dni, wind, temp, precip, cloud_total/low/mid/high)
-    """
-    return {
-        "ghi": weather["shortwave_radiation"],
-        "uv_index": weather["uv_index"],
-        "dni": weather["dni"],
-        "wind": weather["wind_speed_10m"],
-        "temp": weather["temperature"],
-        "precip": weather["precipitation"],
-        "cloud_total": weather["cloud_cover"],
-        "cloud_low": weather["cloud_cover_low"],
-        "cloud_mid": weather["cloud_cover_mid"],
-        "cloud_high": weather["cloud_cover_high"],
-    }
 
 
 def collect_weather_measurements(lat: float, lon: float) -> dict:
@@ -794,10 +689,9 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
         raise WeatherAPIError(f"Failed to fetch weather data: {e}") from e
 
 
-@retry(**WEATHER_RETRY_CONFIG)
 def _fetch_weather_request(url: str, params: dict, timeout: int) -> dict:
-    """Make a GET request to weather API with retry logic."""
-    response = requests.get(url, params=params, timeout=timeout)
+    """Make a GET request to weather API using the retry-equipped session."""
+    response = _weather_session.get(url, params=params, timeout=timeout)
     response.raise_for_status()
     return response.json()
 
@@ -908,13 +802,14 @@ def should_open_awning(
         is intermittent on partly-cloudy days and cloud_cover is wrongly high.
 
       Layer 3 — hard cloud-cover ceiling (overcast override):
-        not_overcast = cloud_cover_mid < overcast_threshold
-        When cloud_cover_mid >= overcast_threshold (default 95%), DNI is overridden.
-        Mid-level clouds (altostratus/altocumulus) are the optical layer that
-        determines whether direct sun reaches the ground. Total cloud cover is NOT
-        used here because it saturates to 100% when high cirrus is present —
-        even when the sun is visibly shining. High (cirrus) clouds are correctly
-        permissive; low clouds (fog/stratus) are handled by the DNI gate.
+        not_overcast = max(cloud_cover_mid, cloud_cover_high) < overcast_threshold
+        When max(cloud_cover_mid, cloud_cover_high) >= overcast_threshold (default 95%),
+        DNI is overridden. Both mid-level (altostratus/altocumulus) and high-level
+        (cirrostratus) clouds can independently produce full optical overcast — the
+        2026-04-28 incident confirmed this: cloud_cover_high=99% with cloud_cover_mid
+        at 53-70% fully blocked the sun. max() ensures either layer fires the ceiling.
+        Total cloud cover is NOT used because it saturates to 100% for any cirrus,
+        making it too aggressive for partly-cloudy conditions.
 
       sunny_enough = sunny_model AND sunny_observed AND not_overcast
 
@@ -943,6 +838,7 @@ def should_open_awning(
     dni = weather.get("dni", 0.0)
     cloud_cover = weather.get("cloud_cover", 100.0)
     cloud_cover_mid = weather.get("cloud_cover_mid", 100.0)
+    cloud_cover_high = weather.get("cloud_cover_high", 100.0)
     sunrise = weather["sunrise"]
     sunset = weather["sunset"]
 
@@ -966,13 +862,12 @@ def should_open_awning(
     sunny_observed = dni_sunny or cloud_sunny
 
     # Layer 3: hard cloud-cover ceiling — overcast override
-    # When cloud_cover_mid >= overcast_threshold, mid-level (altostratus/altocumulus)
-    # clouds block direct sun regardless of what DNI reports. Mid-level clouds are
-    # used here instead of total cloud cover because total saturates to 100% when
-    # high cirrus is present, even when the sun is visibly shining (cirrus is thin
-    # and does not block awning-relevant sun). High clouds are correctly permissive;
-    # low clouds are handled by the DNI gate.
-    not_overcast = cloud_cover_mid < overcast_threshold
+    # max(cloud_cover_mid, cloud_cover_high) fires the ceiling if EITHER mid-level
+    # (altostratus/altocumulus) OR high-level (cirrostratus) clouds are thick enough.
+    # The 2026-04-28 incident confirmed that cloud_cover_high=99% with cloud_cover_mid
+    # at 53-70% fully blocked direct sun. Total cloud cover is NOT used because it
+    # saturates to 100% with any cirrus, making it too aggressive.
+    not_overcast = max(cloud_cover_mid, cloud_cover_high) < overcast_threshold
 
     is_sunny = sunny_model and sunny_observed and not_overcast
 
@@ -1019,7 +914,8 @@ def should_open_awning(
         obs_trace = f"DNI {dni:.0f} W/m² < {min_dni:.0f} AND cloud {cloud_cover:.0f}% >= {max_cloud_cover:.0f}%"
 
     # Layer 3: hard cloud-cover ceiling
-    overcast_trace = f"cloud_mid {cloud_cover_mid:.0f}% {'<' if not_overcast else '>='} {overcast_threshold:.0f}% ceiling"
+    _overcast_driver = max(cloud_cover_mid, cloud_cover_high)
+    overcast_trace = f"max(cloud_mid={cloud_cover_mid:.0f}%,cloud_high={cloud_cover_high:.0f}%)={_overcast_driver:.0f}% {'<' if not_overcast else '>='} {overcast_threshold:.0f}% ceiling"
 
     if is_sunny:
         sunny_trace = f"model=({model_trace}), consistency=({obs_trace}), overcast=({overcast_trace})"

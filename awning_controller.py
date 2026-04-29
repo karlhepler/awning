@@ -12,32 +12,87 @@ from typing import Optional
 
 import requests
 from dotenv import load_dotenv
-from tenacity import (
-    before_sleep_log,
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
 
 # Retry configuration for Bond API
-# Retries transient network errors with exponential backoff (1s, 2s, 4s)
-# Does NOT retry on HTTP 4xx errors (those raise HTTPError after raise_for_status)
-BOND_RETRY_CONFIG = {
-    "stop": stop_after_attempt(3),
-    "wait": wait_exponential(multiplier=1, min=1, max=10),
-    "retry": retry_if_exception_type(
-        (
-            requests.exceptions.ConnectionError,
-            requests.exceptions.Timeout,
-            requests.exceptions.ChunkedEncodingError,
+# Retries transient HTTP failures (5xx, 429) and connection errors with
+# exponential backoff: 0s, 2s, 4s, 8s, 16s (backoff_factor=1.0, total=5).
+# Bond Open/Close/Stop actions are idempotent in practice (Open-while-open
+# is a no-op), so PUT is safe to retry.
+# NOTE: ToggleOpen is the exception — it is non-idempotent. A retry on
+# ToggleOpen after a lost-response could double-toggle the awning. ToggleOpen
+# is only used by the manual CLI (awning.py), not by automation.
+_BOND_RETRY_TOTAL = 5
+_BOND_RETRY_STATUS_FORCELIST = [429, 500, 502, 503, 504]
+_BOND_RETRY_BACKOFF_FACTOR = 1.0
+_BOND_RETRY_ALLOWED_METHODS = ["GET", "PUT", "HEAD"]
+
+
+class _LoggingRetry(Retry):
+    """Retry subclass that logs each retry attempt at WARNING level."""
+
+    def __init__(self, *args, _service_name="API", **kwargs):
+        self._service_name = _service_name
+        super().__init__(*args, **kwargs)
+
+    def new(self, **kw):
+        # Propagate _service_name through Retry.new() so it persists across
+        # the retry chain (urllib3 calls new() to produce successive Retry objects).
+        instance = super().new(**kw)
+        instance._service_name = self._service_name
+        return instance
+
+    def increment(self, method=None, url=None, response=None, error=None, _pool=None, _stacktrace=None):
+        attempt_num = len(self.history) + 1
+
+        if response is not None:
+            status = response.status
+            logger.warning(
+                f"{self._service_name} returned {status}, retrying "
+                f"(attempt {attempt_num}/{_BOND_RETRY_TOTAL}) ..."
+            )
+        elif error is not None:
+            logger.warning(
+                f"{self._service_name} connection error ({error}), retrying "
+                f"(attempt {attempt_num}/{_BOND_RETRY_TOTAL}) ..."
+            )
+
+        return super().increment(
+            method=method,
+            url=url,
+            response=response,
+            error=error,
+            _pool=_pool,
+            _stacktrace=_stacktrace,
         )
-    ),
-    "reraise": True,
-    "before_sleep": before_sleep_log(logger, logging.WARNING),
-}
+
+
+def _make_bond_session() -> requests.Session:
+    """
+    Create a requests.Session with exponential-backoff retry for the Bond API.
+
+    Retries on 5xx server errors (including 503), 429 rate-limit, and
+    connection-level errors. Includes PUT so Bond action commands (Open,
+    Close, Stop) are retried — they are idempotent in practice.
+
+    Approximate retry delays: 0s, 2s, 4s, 8s, 16s (wall-clock cap ~30s).
+    """
+    retry = _LoggingRetry(
+        total=_BOND_RETRY_TOTAL,
+        backoff_factor=_BOND_RETRY_BACKOFF_FACTOR,
+        status_forcelist=_BOND_RETRY_STATUS_FORCELIST,
+        allowed_methods=_BOND_RETRY_ALLOWED_METHODS,
+        raise_on_status=False,  # let raise_for_status() decide after retries
+        _service_name="Bond API",
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session = requests.Session()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
 
 class ConfigurationError(Exception):
@@ -71,6 +126,8 @@ class BondAwningController:
         self.timeout = timeout
         self.base_url = f"http://{bond_host}/v2/devices/{device_id}"
         self.headers = {"BOND-Token": bond_token}
+        self._session = _make_bond_session()
+        self._session.headers.update(self.headers)
 
     def _send_action(self, action: str) -> None:
         """
@@ -80,7 +137,7 @@ class BondAwningController:
             action: Action name (e.g., "Open", "Close", "Stop")
 
         Raises:
-            BondAPIError: If the API request fails
+            BondAPIError: If the API request fails after all retries
         """
         url = f"{self.base_url}/actions/{action}"
         try:
@@ -96,7 +153,7 @@ class BondAwningController:
             State value (1=open, 0=closed) or None if unavailable
 
         Raises:
-            BondAPIError: If the API request fails
+            BondAPIError: If the API request fails after all retries
         """
         url = f"{self.base_url}/state"
         try:
@@ -113,24 +170,22 @@ class BondAwningController:
             Device information as dictionary
 
         Raises:
-            BondAPIError: If the API request fails
+            BondAPIError: If the API request fails after all retries
         """
         try:
             return self._get_request(self.base_url)
         except requests.RequestException as e:
             raise BondAPIError(f"Failed to get device info: {e}") from e
 
-    @retry(**BOND_RETRY_CONFIG)
     def _get_request(self, url: str) -> dict:
-        """Make a GET request with retry logic."""
-        response = requests.get(url, headers=self.headers, timeout=self.timeout)
+        """Make a GET request using the retry-equipped session."""
+        response = self._session.get(url, timeout=self.timeout)
         response.raise_for_status()
         return response.json()
 
-    @retry(**BOND_RETRY_CONFIG)
     def _put_request(self, url: str) -> None:
-        """Make a PUT request with retry logic."""
-        response = requests.put(url, headers=self.headers, json={}, timeout=self.timeout)
+        """Make a PUT request using the retry-equipped session."""
+        response = self._session.put(url, json={}, timeout=self.timeout)
         response.raise_for_status()
 
     def open(self) -> None:
@@ -138,7 +193,7 @@ class BondAwningController:
         Open the awning.
 
         Raises:
-            BondAPIError: If the API request fails
+            BondAPIError: If the API request fails after all retries
         """
         self._send_action("Open")
 
@@ -147,7 +202,7 @@ class BondAwningController:
         Close the awning.
 
         Raises:
-            BondAPIError: If the API request fails
+            BondAPIError: If the API request fails after all retries
         """
         self._send_action("Close")
 
@@ -156,7 +211,7 @@ class BondAwningController:
         Stop awning movement.
 
         Raises:
-            BondAPIError: If the API request fails
+            BondAPIError: If the API request fails after all retries
         """
         self._send_action("Stop")
 
@@ -165,7 +220,7 @@ class BondAwningController:
         Toggle awning between open and closed.
 
         Raises:
-            BondAPIError: If the API request fails
+            BondAPIError: If the API request fails after all retries
         """
         self._send_action("ToggleOpen")
 
