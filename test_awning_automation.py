@@ -62,7 +62,7 @@ _THRESHOLDS = dict(
     min_uv_index=4.0,
     min_dni=50.0,
     max_cloud_cover=80.0,
-    min_temperature_f=60.0,
+    min_temperature_f=45.0,
     overcast_threshold=95.0,
 )
 
@@ -685,21 +685,21 @@ class TestOvercastCeilingGate(unittest.TestCase):
 
 
 class TestTemperatureThreshold(unittest.TestCase):
-    """Tests for the MIN_TEMPERATURE_F threshold (raised from 40°F to 60°F)."""
+    """Tests for the MIN_TEMPERATURE_F threshold (default 45°F)."""
 
     # ------------------------------------------------------------------
-    # Test — full sun + favorable sun + temp=55 → should NOT open
-    # Temperature 55°F is below the new 60°F threshold.
+    # Test — full sun + favorable sun + temp=40 → should NOT open
+    # Temperature 40°F is below the 45°F threshold.
     # ------------------------------------------------------------------
-    def test_temperature_below_60_does_not_open(self):
-        """Temp=55°F < 60°F threshold → awning stays closed despite full sun."""
+    def test_temperature_below_45_does_not_open(self):
+        """Temp=40°F < 45°F threshold → awning stays closed despite full sun."""
         should_open, reason, conditions = should_open_awning(
             weather=_weather(
                 shortwave_radiation=700.0,
                 uv_index=7.0,
                 dni=450.0,
                 cloud_cover=20.0,
-                temperature=55.0,
+                temperature=40.0,
             ),
             sun_position=_sun(),
             current_time=_DAYTIME,
@@ -707,26 +707,26 @@ class TestTemperatureThreshold(unittest.TestCase):
         )
         self.assertFalse(
             conditions["above_freezing"],
-            f"Expected above_freezing=False for temp=55 but got True. reason={reason!r}",
+            f"Expected above_freezing=False for temp=40 but got True. reason={reason!r}",
         )
         self.assertFalse(
             should_open,
-            f"Expected awning closed for temp=55 but got True. reason={reason!r}",
+            f"Expected awning closed for temp=40 but got True. reason={reason!r}",
         )
 
     # ------------------------------------------------------------------
-    # Test — full sun + favorable sun + temp=65 → should open
-    # Temperature 65°F is above the new 60°F threshold.
+    # Test — full sun + favorable sun + temp=50 → should open
+    # Temperature 50°F is above the 45°F threshold.
     # ------------------------------------------------------------------
-    def test_temperature_above_60_can_open(self):
-        """Temp=65°F > 60°F threshold → awning opens (full sun + favorable conditions)."""
+    def test_temperature_above_45_can_open(self):
+        """Temp=50°F > 45°F threshold → awning opens (full sun + favorable conditions)."""
         should_open, reason, conditions = should_open_awning(
             weather=_weather(
                 shortwave_radiation=700.0,
                 uv_index=7.0,
                 dni=450.0,
                 cloud_cover=20.0,
-                temperature=65.0,
+                temperature=50.0,
             ),
             sun_position=_sun(),
             current_time=_DAYTIME,
@@ -734,11 +734,11 @@ class TestTemperatureThreshold(unittest.TestCase):
         )
         self.assertTrue(
             conditions["above_freezing"],
-            f"Expected above_freezing=True for temp=65 but got False. reason={reason!r}",
+            f"Expected above_freezing=True for temp=50 but got False. reason={reason!r}",
         )
         self.assertTrue(
             should_open,
-            f"Expected awning to open for temp=65 but got False. reason={reason!r}",
+            f"Expected awning to open for temp=50 but got False. reason={reason!r}",
         )
 
 

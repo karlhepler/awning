@@ -3,7 +3,7 @@
 Awning Weather Automation
 
 Automatically opens/closes awning based on weather conditions.
-- Opens awning if ALL 7 conditions are met: sunny, calm, no rain, above 60°F,
+- Opens awning if ALL 7 conditions are met: sunny, calm, no rain, above 45°F,
   daytime, sun high enough, and sun facing window (90°-260°)
 - Closes awning if ANY condition fails
 
@@ -399,8 +399,8 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
             max_cloud_cover: float — % maximum total cloud cover (NWP humidity-based
                 scheme) for Layer 2 consistency check; 80% allows partly-cloudy opens
                 while blocking most overcast days
-            min_temperature_f: float — °F minimum temperature to open awning; 60°F is
-                the 'warm enough to want shade' threshold
+            min_temperature_f: float — °F minimum temperature to open awning; 45°F is
+                the cool-but-pleasant threshold
             overcast_threshold: float — % cloud cover ceiling (Layer 3 hard override);
                 when cloud_cover >= this value, DNI is overridden and awning stays closed;
                 95% is above MAX_CLOUD_COVER_PCT (80%) so it only fires for true overcast
@@ -501,10 +501,10 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
             f"MAX_CLOUD_COVER_PCT must be between 0 and 100, got: {max_cloud_cover}"
         )
 
-    # Get minimum temperature threshold (optional, default 60°F)
-    # 60°F is the 'warm enough to want shade' threshold.
-    # Prior default was 40°F (safety-above-freezing), which allowed opens in cold weather.
-    min_temperature_str = os.getenv("MIN_TEMPERATURE_F", "60").strip()
+    # Get minimum temperature threshold (optional, default 45°F)
+    # 45°F is the cool-but-pleasant threshold.
+    # Prior default was 60°F (warm enough to want shade), which closed on cool-but-pleasant days.
+    min_temperature_str = os.getenv("MIN_TEMPERATURE_F", "45").strip()
     try:
         min_temperature_f = float(min_temperature_str)
     except ValueError as e:
@@ -781,7 +781,7 @@ def should_open_awning(
     min_uv_index: float,
     min_dni: float = 50.0,
     max_cloud_cover: float = 80.0,
-    min_temperature_f: float = 60.0,
+    min_temperature_f: float = 45.0,
     overcast_threshold: float = 95.0,
 ) -> tuple[bool, str, dict]:
     """
