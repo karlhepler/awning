@@ -64,6 +64,7 @@ _THRESHOLDS = dict(
     max_cloud_cover=80.0,
     min_temperature_f=45.0,
     overcast_threshold=95.0,
+    min_dni_cirrus=30.0,
 )
 
 # Daytime moment that falls between the default sunrise/sunset strings above
@@ -578,23 +579,28 @@ class TestOvercastCeilingGate(unittest.TestCase):
     """Tests for the Layer 3 cloud-cover hard ceiling (OVERCAST_THRESHOLD_PCT)."""
 
     # ------------------------------------------------------------------
-    # Test — today's exact failure data: GHI=850, UV=2.7, DNI=364, cloud=100
-    # Layer 1: GHI=850 >= 400 → sunny_model=True
-    # Layer 2: DNI=364 >= 50 → sunny_observed=True (DNI arm fires)
-    # Layer 3: cloud=100 >= 95 (ceiling) → not_overcast=False → blocks open
-    # Pre-fix: would open (Layer 2 OR short-circuited via DNI).
-    # Post-fix: closed (Layer 3 ceiling overrides DNI).
+    # Test — overcast ceiling fires when cloud model says overcast AND DNI
+    # is below the cirrus guard threshold (genuine mid-level overcast).
+    #
+    # Scenario design: isolate Layer 3 as the blocking gate:
+    #   Layer 1: GHI=850 >= 400 → sunny_model=True
+    #   Layer 2: cloud=60 < 80 → sunny_observed=True (cloud arm rescues low DNI=14)
+    #   Layer 3: max(cloud_mid=100, cloud_high=78)=100 >= 95 ceiling
+    #            AND DNI=14 < 30 (min_dni_cirrus guard) → guard does NOT rescue
+    #            → not_overcast=False → sunny=False
     # ------------------------------------------------------------------
     def test_overcast_ceiling_blocks_open(self):
-        """Overcast ceiling: GHI=850, UV=2.7, DNI=364, cloud=100, cloud_mid=100 → Layer 3 blocks open."""
-        # This mirrors the 12:05 drizzle case: low=5, mid=100, high=78, total=100.
-        # cloud_cover_mid=100 triggers the Layer 3 ceiling even though DNI is high.
+        """Overcast ceiling: GHI=850, UV=2.7, DNI=14, cloud=60, cloud_mid=100 → Layer 3 blocks open."""
+        # Using cloud=60 (total) to pass Layer 2 via cloud arm while cloud_mid=100
+        # represents true altostratus overcast that physically blocks direct sun.
+        # DNI=14 is in the overcast/rain range (4-14 W/m²) — well below the
+        # min_dni_cirrus guard of 30, so the guard does NOT rescue.
         should_open, reason, conditions = should_open_awning(
             weather=_weather(
                 shortwave_radiation=850.0,
                 uv_index=2.7,
-                dni=364.0,
-                cloud_cover=100.0,
+                dni=14.0,
+                cloud_cover=60.0,
                 cloud_cover_low=5.0,
                 cloud_cover_mid=100.0,
                 cloud_cover_high=78.0,
@@ -615,31 +621,32 @@ class TestOvercastCeilingGate(unittest.TestCase):
         self.assertIn("overcast", reason.lower())
 
     # ------------------------------------------------------------------
-    # Test — partly cloudy below ceiling: GHI=600, UV=4, DNI=300, cloud=85
-    # Layer 1: GHI=600 >= 400 → sunny_model=True
-    # Layer 2: DNI=300 >= 50 → sunny_observed=True
-    # Layer 3: cloud=85 < 95 (ceiling) → not_overcast=True
-    # All three layers pass → should open (temp=70 > 60).
-    # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
     # Test — 2026-04-28 incident: high-level cirrostratus (cloud_cover_high=99%)
     # with cloud_cover_mid=53-70% fully blocked direct sun while awning was open.
-    # The overcast ceiling now uses max(cloud_cover_mid, cloud_cover_high) so that
+    # The overcast ceiling uses max(cloud_cover_mid, cloud_cover_high) so that
     # thick high-level cloud cover alone is sufficient to fire the ceiling gate.
     #
-    # Scenario: low=46, mid=5, high=100, total=100, GHI=860, UV=4.0, DNI=492
+    # NEW behavior (post DNI guard): the ceiling fires ONLY when BOTH the cloud
+    # model says overcast AND DNI is below the cirrus guard threshold. This test
+    # uses low DNI (14 W/m² — overcast/rain range) so the guard does NOT rescue,
+    # and the ceiling correctly fires.
+    #
+    # Scenario: low=46, mid=5, high=100, total=100, GHI=860, UV=4.0, DNI=14
     # Layer 1: GHI=860 >= 400 → sunny_model=True
-    # Layer 2: DNI=492 >= 50 → sunny_observed=True
-    # Layer 3: max(cloud_mid=5, cloud_high=100) = 100 >= 95 → not_overcast=False
-    # Layer 3 fires → ceiling blocked → should NOT open
+    # Layer 2: DNI=14 < 50 AND cloud=100 >= 80 → sunny_observed=False
+    # (Test correctly shows ceiling + observed gate both fire; ceiling trace visible)
+    #
+    # Note: if DNI were >= 30 (min_dni_cirrus guard), the DNI guard would bypass
+    # the ceiling — which is the intended behavior for the 2026-05-12 incident.
+    # See test_dni_guard_overrides_high_cloud_false_positive for that regression.
     # ------------------------------------------------------------------
     def test_high_cirrus_triggers_overcast_ceiling(self):
-        """High cirrus case: cloud_high=100% → max(mid=5,high=100)=100 >= 95 ceiling → ceiling fires → stays closed."""
+        """High cirrus + low DNI: cloud_high=100%, DNI=14 < guard=30 → ceiling fires → stays closed."""
         should_open, reason, conditions = should_open_awning(
             weather=_weather(
                 shortwave_radiation=860.0,
                 uv_index=4.0,
-                dni=492.0,
+                dni=14.0,
                 cloud_cover=100.0,
                 cloud_cover_low=46.0,
                 cloud_cover_mid=5.0,
@@ -652,12 +659,53 @@ class TestOvercastCeilingGate(unittest.TestCase):
         )
         self.assertFalse(
             conditions["sunny"],
-            f"Expected sunny=False (high cirrus should trigger ceiling) but got True. reason={reason!r}",
+            f"Expected sunny=False (high cirrus + low DNI should trigger ceiling) but got True. reason={reason!r}",
         )
         self.assertFalse(
             should_open,
-            f"Expected awning to stay closed (high cirrus blocks sun) but got True. reason={reason!r}",
+            f"Expected awning to stay closed (high cirrus + low DNI) but got True. reason={reason!r}",
         )
+
+    # ------------------------------------------------------------------
+    # Regression test — 2026-05-12 incident:
+    #   cloud_cover_high=100% (bad Open-Meteo model data), cloud_cover_mid=0%,
+    #   DNI=905 W/m² (peak midday sun), direct visual observation confirmed clear sky.
+    #
+    # OLD behavior: not_overcast = max(0, 100)=100 >= 95 → False → closed (WRONG)
+    # NEW behavior: DNI guard: 905 >= 30 (min_dni_cirrus) → not_overcast=True → opens
+    #
+    # Layer 1: GHI=1010 >= 400, UV=7.2 >= 4 → sunny_model=True
+    # Layer 2: DNI=905 >= 50 → sunny_observed=True
+    # Layer 3: max(mid=0, high=100)=100 >= 95 BUT DNI=905 >= 30 (guard) → not_overcast=True
+    # All conditions pass → should_open=True
+    # ------------------------------------------------------------------
+    def test_dni_guard_overrides_high_cloud_false_positive(self):
+        """2026-05-12 incident: cloud_cover_high=100% bad model data + DNI=905 W/m² → DNI guard fires → awning opens."""
+        should_open, reason, conditions = should_open_awning(
+            weather=_weather(
+                shortwave_radiation=1010.0,
+                uv_index=7.2,
+                dni=905.0,
+                cloud_cover=100.0,
+                cloud_cover_low=0.0,
+                cloud_cover_mid=0.0,
+                cloud_cover_high=100.0,
+                temperature=72.0,
+            ),
+            sun_position=_sun(),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        self.assertTrue(
+            conditions["sunny"],
+            f"Expected sunny=True (DNI guard should override cloud_high=100%) but got False. reason={reason!r}",
+        )
+        self.assertTrue(
+            should_open,
+            f"Expected awning to open (DNI=905 confirms direct sun) but got False. reason={reason!r}",
+        )
+        # Verify the DNI guard trace appears in the reason
+        self.assertIn("DNI guard", reason, f"Expected 'DNI guard' in reason trace. reason={reason!r}")
 
     def test_partly_cloudy_below_ceiling_still_opens(self):
         """Partly cloudy below ceiling: GHI=600, UV=4, DNI=300, cloud=85, cloud_mid=30 → all layers pass → opens."""
@@ -766,14 +814,14 @@ class TestGetThresholdsMinTemperatureFValidation(unittest.TestCase):
         """MIN_TEMPERATURE_F=-50 is at the lower bound → no error."""
         env = {**self._REQUIRED_ENV, "MIN_TEMPERATURE_F": "-50"}
         with unittest.mock.patch.dict(os.environ, env):
-            _, _, _, _, _, _, min_temperature_f, _ = get_thresholds()
+            _, _, _, _, _, _, min_temperature_f, _, _ = get_thresholds()
             self.assertEqual(min_temperature_f, -50.0)
 
     def test_min_temperature_f_at_upper_bound_is_valid(self):
         """MIN_TEMPERATURE_F=120 is at the upper bound → no error."""
         env = {**self._REQUIRED_ENV, "MIN_TEMPERATURE_F": "120"}
         with unittest.mock.patch.dict(os.environ, env):
-            _, _, _, _, _, _, min_temperature_f, _ = get_thresholds()
+            _, _, _, _, _, _, min_temperature_f, _, _ = get_thresholds()
             self.assertEqual(min_temperature_f, 120.0)
 
 
@@ -906,7 +954,7 @@ class TestWeatherRetryBehavior(unittest.TestCase):
         with patch.object(sys, "argv", ["awning_automation.py"]):
             with patch.object(awning_automation, "setup_logging", return_value=mock_log_path):
                 with patch.object(awning_automation, "load_location_config", return_value=(37.7, -122.4)):
-                    with patch.object(awning_automation, "get_thresholds", return_value=(15, 20, 400, 4, 50, 80, 60, 95)):
+                    with patch.object(awning_automation, "get_thresholds", return_value=(15, 20, 400, 4, 50, 80, 60, 95, 30)):
                         with patch.object(awning_automation, "load_telegram_config", return_value=("fake_token", "fake_chat")):
                             with patch.object(
                                 awning_automation,
@@ -949,6 +997,133 @@ class TestWeatherRetryBehavior(unittest.TestCase):
 
         # Telegram must NOT have been called during the retry
         mock_telegram.assert_not_called()
+
+
+class TestFetchWeatherNullCloudCoverMidHigh(unittest.TestCase):
+    """Tests for null guards on cloud_cover_mid and cloud_cover_high in fetch_weather()."""
+
+    # ------------------------------------------------------------------
+    # Test — Null cloud_cover_mid raises WeatherAPIError (Layer 3 input).
+    # cloud_cover_mid drives the Layer 3 overcast ceiling. A JSON null must
+    # raise WeatherAPIError explicitly rather than being silently coerced to
+    # 100% by the .get(..., 100) default, which would lose observability.
+    # ------------------------------------------------------------------
+    def test_null_cloud_cover_mid_raises_weather_api_error(self):
+        """fetch_weather() must raise WeatherAPIError when cloud_cover_mid is null."""
+        from unittest.mock import patch, MagicMock
+
+        null_response = {
+            "current": {
+                "wind_speed_10m": 5.0,
+                "precipitation": 0.0,
+                "temperature_2m": 65.0,
+                "shortwave_radiation": 500.0,
+                "uv_index": 6.0,
+                "direct_normal_irradiance": 400.0,
+                "cloud_cover": 20,
+                "cloud_cover_low": 10,
+                "cloud_cover_mid": None,  # JSON null
+                "cloud_cover_high": 5,
+                "is_day": 1,
+                "time": "2026-04-17T13:00",
+            },
+            "daily": {
+                "sunrise": ["2026-04-17T06:00"],
+                "sunset": ["2026-04-17T20:00"],
+            },
+        }
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = null_response
+        mock_response.raise_for_status.return_value = None
+
+        with patch.object(awning_automation._weather_session, "get", return_value=mock_response):
+            with self.assertRaises(WeatherAPIError) as ctx:
+                fetch_weather(37.7, -122.4)
+            self.assertIn("null", str(ctx.exception).lower())
+            self.assertIn("cloud_cover_mid", str(ctx.exception))
+
+    # ------------------------------------------------------------------
+    # Test — Null cloud_cover_high raises WeatherAPIError (Layer 3 input).
+    # cloud_cover_high is used alongside cloud_cover_mid in the Layer 3
+    # ceiling expression max(cloud_cover_mid, cloud_cover_high). A JSON null
+    # must raise WeatherAPIError rather than silently coercing to 100%.
+    # ------------------------------------------------------------------
+    def test_null_cloud_cover_high_raises_weather_api_error(self):
+        """fetch_weather() must raise WeatherAPIError when cloud_cover_high is null."""
+        from unittest.mock import patch, MagicMock
+
+        null_response = {
+            "current": {
+                "wind_speed_10m": 5.0,
+                "precipitation": 0.0,
+                "temperature_2m": 65.0,
+                "shortwave_radiation": 500.0,
+                "uv_index": 6.0,
+                "direct_normal_irradiance": 400.0,
+                "cloud_cover": 20,
+                "cloud_cover_low": 10,
+                "cloud_cover_mid": 5,
+                "cloud_cover_high": None,  # JSON null
+                "is_day": 1,
+                "time": "2026-04-17T13:00",
+            },
+            "daily": {
+                "sunrise": ["2026-04-17T06:00"],
+                "sunset": ["2026-04-17T20:00"],
+            },
+        }
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = null_response
+        mock_response.raise_for_status.return_value = None
+
+        with patch.object(awning_automation._weather_session, "get", return_value=mock_response):
+            with self.assertRaises(WeatherAPIError) as ctx:
+                fetch_weather(37.7, -122.4)
+            self.assertIn("null", str(ctx.exception).lower())
+            self.assertIn("cloud_cover_high", str(ctx.exception))
+
+
+class TestGetThresholdsMinDniCirrusWM2Validation(unittest.TestCase):
+    """Tests for MIN_DNI_CIRRUS_WM2 validation in get_thresholds()."""
+
+    # Required env vars (no defaults in get_thresholds)
+    _REQUIRED_ENV = {"WIND_SPEED_THRESHOLD_MPH": "15", "MIN_SUN_ALTITUDE_DEG": "20"}
+
+    def test_min_dni_cirrus_zero_raises(self):
+        """MIN_DNI_CIRRUS_WM2=0 silently disables Layer 3 ceiling → ConfigurationError."""
+        env = {**self._REQUIRED_ENV, "MIN_DNI_CIRRUS_WM2": "0"}
+        with unittest.mock.patch.dict(os.environ, env):
+            with self.assertRaises(ConfigurationError) as ctx:
+                get_thresholds()
+        self.assertIn("0", str(ctx.exception))
+
+    def test_min_dni_cirrus_above_min_dni_raises(self):
+        """MIN_DNI_CIRRUS_WM2 > MIN_DIRECT_IRRADIANCE_WM2 is logically inconsistent → ConfigurationError."""
+        # Default MIN_DNI_WM2=50; set MIN_DNI_CIRRUS_WM2=60 to exceed it.
+        env = {**self._REQUIRED_ENV, "MIN_DNI_CIRRUS_WM2": "60", "MIN_DNI_WM2": "50"}
+        with unittest.mock.patch.dict(os.environ, env):
+            with self.assertRaises(ConfigurationError) as ctx:
+                get_thresholds()
+        self.assertIn("MIN_DIRECT_IRRADIANCE_WM2", str(ctx.exception))
+
+    def test_min_dni_cirrus_equal_to_min_dni_is_valid(self):
+        """MIN_DNI_CIRRUS_WM2 == MIN_DIRECT_IRRADIANCE_WM2 is at the boundary → no error."""
+        # Both set to 50: cirrus guard == Layer 2 threshold, which is valid.
+        env = {**self._REQUIRED_ENV, "MIN_DNI_CIRRUS_WM2": "50", "MIN_DNI_WM2": "50"}
+        with unittest.mock.patch.dict(os.environ, env):
+            result = get_thresholds()
+        # min_dni_cirrus is the 9th element in the returned tuple
+        self.assertEqual(result[8], 50.0)
+
+    def test_min_dni_cirrus_below_min_dni_is_valid(self):
+        """MIN_DNI_CIRRUS_WM2 < MIN_DIRECT_IRRADIANCE_WM2 is the expected configuration → no error."""
+        # Default: MIN_DNI_CIRRUS_WM2=30, MIN_DNI_WM2=50 — standard deployment.
+        env = {**self._REQUIRED_ENV, "MIN_DNI_CIRRUS_WM2": "30", "MIN_DNI_WM2": "50"}
+        with unittest.mock.patch.dict(os.environ, env):
+            result = get_thresholds()
+        self.assertEqual(result[8], 30.0)
 
 
 if __name__ == "__main__":

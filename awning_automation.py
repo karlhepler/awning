@@ -23,14 +23,20 @@ Sunshine detection uses a two-layer gate plus a hard cloud-cover ceiling:
     When they disagree, one is wrong — the OR allows either to confirm sunny,
     preventing false-closes when DNI is intermittent on partly-cloudy days.
 
-  Layer 3 — hard cloud-cover ceiling (overcast override):
-    not_overcast = max(cloud_cover_mid, cloud_cover_high) < OVERCAST_THRESHOLD_PCT
+  Layer 3 — hard cloud-cover ceiling with DNI guard (overcast override):
+    not_overcast = (max(cloud_cover_mid, cloud_cover_high) < OVERCAST_THRESHOLD_PCT)
+                   OR (dni >= MIN_DNI_CIRRUS_WM2)
     When max(cloud_cover_mid, cloud_cover_high) is very high (≥95%), the sky has
     optically thick cloud cover that blocks direct sun. Both mid-level (altostratus/
     altocumulus) and high-level (cirrostratus) clouds can independently cause full
     overcast. The 2026-04-28 incident confirmed that cloud_cover_high=99% with
     cloud_cover_mid=53-70% fully blocked the sun while the awning remained open.
     Using max() ensures either layer alone is sufficient to fire the ceiling gate.
+    The DNI guard (MIN_DNI_CIRRUS_WM2, default 30 W/m²) bypasses the ceiling when
+    direct sun is demonstrably arriving — the 2026-05-12 incident showed Open-Meteo
+    cloud_cover_high=100% (bad model data) closing the awning at DNI=905 W/m² during
+    peak midday sun. When DNI is above the guard threshold, irradiance wins over the
+    cloud-cover estimate.
 
   sunny_enough = sunny_model AND sunny_observed AND not_overcast
 
@@ -379,14 +385,15 @@ def load_location_config(env_file: Optional[Path] = None) -> tuple[float, float]
     return latitude, longitude
 
 
-def get_thresholds() -> tuple[float, float, float, float, float, float, float, float]:
+def get_thresholds() -> tuple[float, float, float, float, float, float, float, float, float]:
     """
     Get weather thresholds from environment variables.
 
     Returns:
         Tuple of (wind_speed_threshold_mph, min_sun_altitude, min_ghi, min_uv_index,
-                  min_dni, max_cloud_cover, min_temperature_f, overcast_threshold)
-        Types: (float, float, float, float, float, float, float, float)
+                  min_dni, max_cloud_cover, min_temperature_f, overcast_threshold,
+                  min_dni_cirrus)
+        Types: (float, float, float, float, float, float, float, float, float)
             wind_speed_threshold_mph: float — mph, upper wind limit to open awning
             min_sun_altitude: float — degrees above horizon, lower sun altitude limit
             min_ghi: float — W/m², minimum global horizontal irradiance (shortwave_radiation)
@@ -404,6 +411,10 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
             overcast_threshold: float — % cloud cover ceiling (Layer 3 hard override);
                 when cloud_cover >= this value, DNI is overridden and awning stays closed;
                 95% is above MAX_CLOUD_COVER_PCT (80%) so it only fires for true overcast
+            min_dni_cirrus: float — W/m², DNI guard for Layer 3 overcast ceiling; when
+                DNI >= this value, the overcast ceiling is bypassed (direct sun is arriving
+                despite high cloud_cover_high model estimate); 30 W/m² is well above
+                overcast/rain (4-14) and low enough to catch any real direct-beam sun
 
     Raises:
         ConfigurationError: If threshold variables are missing or invalid
@@ -536,7 +547,35 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
             f"OVERCAST_THRESHOLD_PCT must be between 0 and 100, got: {overcast_threshold}"
         )
 
-    return wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold
+    # Get minimum DNI threshold for cirrus guard (optional, default 30 W/m²)
+    # Layer 3 DNI guard: when DNI >= this value, the overcast ceiling is bypassed
+    # because direct sun is demonstrably arriving despite high cloud_cover_high model
+    # estimates (which are unreliable for thin cirrus). 30 W/m² is well above
+    # overcast/rain (4-14 W/m²) but low enough to catch any real direct-beam sun.
+    # The 2026-05-12 incident: cloud_cover_high=100% (bad model data) with DNI=905 W/m²
+    # closed the awning during peak midday sun. This guard prevents that false positive.
+    min_dni_cirrus_str = os.getenv("MIN_DNI_CIRRUS_WM2", "30").strip()
+    try:
+        min_dni_cirrus = float(min_dni_cirrus_str)
+    except ValueError as e:
+        raise ConfigurationError(
+            f"Invalid MIN_DNI_CIRRUS_WM2 format: {e}. Must be a number."
+        ) from e
+    if min_dni_cirrus <= 0:
+        raise ConfigurationError(
+            f"MIN_DNI_CIRRUS_WM2 must be > 0; a value of 0 would make the DNI guard "
+            f"always True (DNI is always >= 0), effectively disabling the Layer 3 "
+            f"overcast ceiling entirely. Received: {min_dni_cirrus}"
+        )
+    if min_dni_cirrus > min_dni:
+        raise ConfigurationError(
+            f"MIN_DNI_CIRRUS_WM2 ({min_dni_cirrus}) must be <= MIN_DIRECT_IRRADIANCE_WM2 "
+            f"({min_dni}). The Layer 3 DNI guard threshold must be at or below the "
+            f"Layer 2 DNI threshold; otherwise the guard fires for a narrower range "
+            f"than Layer 2, which is logically inconsistent."
+        )
+
+    return wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus
 
 
 def load_telegram_config() -> tuple[Optional[str], Optional[str]]:
@@ -639,12 +678,17 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
         # forecast window or GFS/ECMWF coverage lapses. The key-presence check
         # above accepts null values, which would later crash at threshold
         # comparisons with TypeError — bypassing the fail-safe close path.
-        # Guard all four fields used in the sunny gate (Layer 1: GHI, UV;
-        # Layer 2: DNI, cloud_cover).
+        # Guard all four Layer 1/2 fields (GHI, UV, DNI, cloud_cover) and the
+        # two Layer 3 ceiling fields (cloud_cover_mid, cloud_cover_high). The
+        # .get(..., 100) defaults below handle missing keys (network glitch),
+        # but a JSON null for these fields is a distinct error condition that
+        # must be surfaced explicitly rather than silently classified as 100%.
         shortwave_radiation = current["shortwave_radiation"]
         uv_index = current["uv_index"]
         direct_normal_irradiance = current.get("direct_normal_irradiance")
         cloud_cover_val = current.get("cloud_cover")
+        cloud_cover_mid_val = current.get("cloud_cover_mid")
+        cloud_cover_high_val = current.get("cloud_cover_high")
         if shortwave_radiation is None or uv_index is None:
             raise WeatherAPIError(
                 f"Weather API returned null for required field(s): "
@@ -656,6 +700,16 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
                 f"Weather API returned null for cross-check field(s): "
                 f"direct_normal_irradiance={direct_normal_irradiance}, cloud_cover={cloud_cover_val}. "
                 f"Cannot evaluate Layer 2/3 sunny gate without these values."
+            )
+        if cloud_cover_mid_val is None:
+            raise WeatherAPIError(
+                f"Weather API returned null for cloud_cover_mid. "
+                f"Cannot evaluate Layer 3 overcast ceiling without this value."
+            )
+        if cloud_cover_high_val is None:
+            raise WeatherAPIError(
+                f"Weather API returned null for cloud_cover_high. "
+                f"Cannot evaluate Layer 3 overcast ceiling without this value."
             )
 
         # Extract daily data (sunrise/sunset)
@@ -783,6 +837,7 @@ def should_open_awning(
     max_cloud_cover: float = 80.0,
     min_temperature_f: float = 45.0,
     overcast_threshold: float = 95.0,
+    min_dni_cirrus: float = 30.0,
 ) -> tuple[bool, str, dict]:
     """
     Determine if awning should be open based on ALL conditions.
@@ -801,13 +856,18 @@ def should_open_awning(
         The OR allows either to confirm sunny — preventing false-closes when DNI
         is intermittent on partly-cloudy days and cloud_cover is wrongly high.
 
-      Layer 3 — hard cloud-cover ceiling (overcast override):
-        not_overcast = max(cloud_cover_mid, cloud_cover_high) < overcast_threshold
+      Layer 3 — hard cloud-cover ceiling with DNI guard (overcast override):
+        not_overcast = (max(cloud_cover_mid, cloud_cover_high) < overcast_threshold)
+                       OR (dni >= min_dni_cirrus)
         When max(cloud_cover_mid, cloud_cover_high) >= overcast_threshold (default 95%),
-        DNI is overridden. Both mid-level (altostratus/altocumulus) and high-level
-        (cirrostratus) clouds can independently produce full optical overcast — the
-        2026-04-28 incident confirmed this: cloud_cover_high=99% with cloud_cover_mid
-        at 53-70% fully blocked the sun. max() ensures either layer fires the ceiling.
+        DNI is overridden — UNLESS dni >= min_dni_cirrus (default 30 W/m²), which proves
+        direct sun is arriving despite the cloud model. Both mid-level (altostratus/
+        altocumulus) and high-level (cirrostratus) clouds can independently produce full
+        optical overcast — the 2026-04-28 incident confirmed this: cloud_cover_high=99%
+        with cloud_cover_mid at 53-70% fully blocked the sun. max() ensures either layer
+        fires the ceiling. The DNI guard handles the 2026-05-12 false positive where
+        Open-Meteo returned cloud_cover_high=100% despite a clear sky (DNI=905 W/m²
+        and direct visual observation both confirmed direct sun was arriving).
         Total cloud cover is NOT used because it saturates to 100% for any cirrus,
         making it too aggressive for partly-cloudy conditions.
 
@@ -825,6 +885,8 @@ def should_open_awning(
         max_cloud_cover: Maximum total cloud cover (%) for sunny_observed (Layer 2)
         min_temperature_f: Minimum temperature (°F) to open awning
         overcast_threshold: Cloud cover ceiling (%) for not_overcast (Layer 3)
+        min_dni_cirrus: DNI guard threshold (W/m²) for Layer 3; when DNI >= this value,
+            the overcast ceiling is bypassed because direct sun is demonstrably arriving
 
     Returns:
         Tuple of (should_open, reason, conditions_dict)
@@ -861,13 +923,21 @@ def should_open_awning(
     cloud_sunny = cloud_cover < max_cloud_cover
     sunny_observed = dni_sunny or cloud_sunny
 
-    # Layer 3: hard cloud-cover ceiling — overcast override
+    # Layer 3: hard cloud-cover ceiling with DNI guard — overcast override
     # max(cloud_cover_mid, cloud_cover_high) fires the ceiling if EITHER mid-level
     # (altostratus/altocumulus) OR high-level (cirrostratus) clouds are thick enough.
     # The 2026-04-28 incident confirmed that cloud_cover_high=99% with cloud_cover_mid
     # at 53-70% fully blocked direct sun. Total cloud cover is NOT used because it
     # saturates to 100% with any cirrus, making it too aggressive.
-    not_overcast = max(cloud_cover_mid, cloud_cover_high) < overcast_threshold
+    #
+    # DNI guard: if DNI >= min_dni_cirrus, direct sun is demonstrably arriving and
+    # the cloud model estimate is wrong. The ceiling fires ONLY when BOTH the cloud
+    # model says overcast AND DNI is too low to confirm direct beam. This prevents
+    # the 2026-05-12 false positive where cloud_cover_high=100% (bad model data)
+    # closed the awning during peak midday sun (DNI=905 W/m²).
+    cloud_ceiling_clear = max(cloud_cover_mid, cloud_cover_high) < overcast_threshold
+    dni_confirms_sun = dni >= min_dni_cirrus
+    not_overcast = cloud_ceiling_clear or dni_confirms_sun
 
     is_sunny = sunny_model and sunny_observed and not_overcast
 
@@ -913,9 +983,24 @@ def should_open_awning(
     else:
         obs_trace = f"DNI {dni:.0f} W/m² < {min_dni:.0f} AND cloud {cloud_cover:.0f}% >= {max_cloud_cover:.0f}%"
 
-    # Layer 3: hard cloud-cover ceiling
+    # Layer 3: hard cloud-cover ceiling with DNI guard
     _overcast_driver = max(cloud_cover_mid, cloud_cover_high)
-    overcast_trace = f"max(cloud_mid={cloud_cover_mid:.0f}%,cloud_high={cloud_cover_high:.0f}%)={_overcast_driver:.0f}% {'<' if not_overcast else '>='} {overcast_threshold:.0f}% ceiling"
+    if cloud_ceiling_clear:
+        overcast_trace = (
+            f"max(cloud_mid={cloud_cover_mid:.0f}%,cloud_high={cloud_cover_high:.0f}%)"
+            f"={_overcast_driver:.0f}% < {overcast_threshold:.0f}% ceiling"
+        )
+    elif dni_confirms_sun:
+        overcast_trace = (
+            f"DNI guard: DNI {dni:.0f} W/m² >= {min_dni_cirrus:.0f} overrides "
+            f"cloud ceiling (max={_overcast_driver:.0f}% >= {overcast_threshold:.0f}%)"
+        )
+    else:
+        overcast_trace = (
+            f"max(cloud_mid={cloud_cover_mid:.0f}%,cloud_high={cloud_cover_high:.0f}%)"
+            f"={_overcast_driver:.0f}% >= {overcast_threshold:.0f}% ceiling "
+            f"AND DNI {dni:.0f} W/m² < {min_dni_cirrus:.0f} guard"
+        )
 
     if is_sunny:
         sunny_trace = f"model=({model_trace}), consistency=({obs_trace}), overcast=({overcast_trace})"
@@ -1078,11 +1163,11 @@ def main() -> None:
         logger.info(f"Location: {latitude:.4f}, {longitude:.4f}")
 
         # Get thresholds
-        wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold = get_thresholds()
+        wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus = get_thresholds()
         logger.info(
             f"Thresholds: model=(GHI >= {min_ghi:.0f} W/m² OR UV >= {min_uv_index:.1f}), "
             f"consistency=(DNI >= {min_dni:.0f} W/m² OR cloud < {max_cloud_cover:.0f}%), "
-            f"overcast ceiling=cloud < {overcast_threshold:.0f}%, "
+            f"overcast ceiling=cloud < {overcast_threshold:.0f}% (DNI guard >= {min_dni_cirrus:.0f} W/m²), "
             f"Wind < {wind_threshold} mph, Rain = 0 mm/h, Temp > {min_temperature_f:.0f}°F, "
             f"Sun altitude >= {altitude_threshold}°, Sun facing window (90°-260°)"
         )
@@ -1137,6 +1222,7 @@ def main() -> None:
             max_cloud_cover,
             min_temperature_f,
             overcast_threshold,
+            min_dni_cirrus,
         )
 
         # Log conditions with checkmarks/crosses
