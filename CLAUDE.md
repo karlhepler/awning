@@ -67,7 +67,7 @@ Bond Bridge awning controller - sends HTTP commands to control a motorized awnin
 **Decision Logic (ALL 7 conditions must be met to open):**
 1. **Sunny**: multi-layer model — ALL three layers must be true:
    - **Model layer**: GHI >= `MIN_GHI_WM2` (default 400 W/m²) OR UV >= `MIN_UV_INDEX` (default 4.0)
-   - **Consistency layer**: DNI >= `MIN_DIRECT_IRRADIANCE_WM2` (default 50 W/m²) OR total cloud cover < threshold (default 80%)
+   - **Consistency layer**: DNI >= `MIN_DNI_WM2` (default 50 W/m²) OR total cloud cover < `MAX_CLOUD_COVER_PCT` (default 80%)
    - **Overcast ceiling**: max(cloud_cover_mid, cloud_cover_high) < threshold (default 95%) OR DNI >= `MIN_DNI_CIRRUS_WM2` (default 30 W/m²). The DNI guard bypasses the ceiling when direct irradiance proves the sun is reaching the ground — added after the 2026-05-12 incident where Open-Meteo's `cloud_cover_high` field hallucinated 100% on a clear day with DNI=905 W/m².
 2. **Calm**: Wind speed < `WIND_SPEED_THRESHOLD_MPH` (default 15.0 mph)
 3. **No rain**: Precipitation = 0 mm/h
@@ -118,7 +118,17 @@ See `.env.example` for full documentation. Key variables:
 
 **Required for automation:**
 - `LATITUDE`, `LONGITUDE` - Location for weather/sun calculations
-- `MIN_DIRECT_IRRADIANCE_WM2`, `MIN_SUN_ALTITUDE_DEG`, `WIND_SPEED_THRESHOLD_MPH`
+- `WIND_SPEED_THRESHOLD_MPH` - Max wind speed (mph) to open awning; no default, must be set
+- `MIN_SUN_ALTITUDE_DEG` - Min sun altitude (degrees above horizon); no default, must be set
+
+**Optional for automation (have defaults):**
+- `MIN_GHI_WM2` - Min global horizontal irradiance W/m² for Layer 1 sunny gate (default: 400)
+- `MIN_UV_INDEX` - Min UV Index for Layer 1 sunny gate (default: 4)
+- `MIN_DNI_WM2` - Min direct normal irradiance W/m² for Layer 2 consistency check (default: 50)
+- `MAX_CLOUD_COVER_PCT` - Max total cloud cover % for Layer 2 consistency check (default: 80)
+- `MIN_TEMPERATURE_F` - Min temperature °F to open awning (default: 45)
+- `OVERCAST_THRESHOLD_PCT` - Layer 3 hard ceiling: max(cloud_cover_mid, cloud_cover_high) must be below this % (default: 95)
+- `MIN_DNI_CIRRUS_WM2` - Layer 3 DNI guard: bypasses overcast ceiling when DNI >= this W/m² (default: 30)
 
 **Optional:**
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` - For notifications
