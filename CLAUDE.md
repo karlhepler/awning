@@ -65,13 +65,16 @@ Bond Bridge awning controller - sends HTTP commands to control a motorized awnin
 ## Weather Automation
 
 **Decision Logic (ALL 7 conditions must be met to open):**
-1. **Sunny**: DNI >= `MIN_DIRECT_IRRADIANCE_WM2` (direct normal irradiance in W/m²)
-2. **Calm**: Wind speed < `WIND_SPEED_THRESHOLD_MPH`
+1. **Sunny**: multi-layer model — ALL three layers must be true:
+   - **Model layer**: GHI >= `MIN_GHI_WM2` (default 400 W/m²) OR UV >= `MIN_UV_INDEX` (default 4.0)
+   - **Consistency layer**: DNI >= `MIN_DIRECT_IRRADIANCE_WM2` (default 50 W/m²) OR total cloud cover < threshold (default 80%)
+   - **Overcast ceiling**: max(cloud_cover_mid, cloud_cover_high) < threshold (default 95%) OR DNI >= `MIN_DNI_CIRRUS_WM2` (default 30 W/m²). The DNI guard bypasses the ceiling when direct irradiance proves the sun is reaching the ground — added after the 2026-05-12 incident where Open-Meteo's `cloud_cover_high` field hallucinated 100% on a clear day with DNI=905 W/m².
+2. **Calm**: Wind speed < `WIND_SPEED_THRESHOLD_MPH` (default 15.0 mph)
 3. **No rain**: Precipitation = 0 mm/h
-4. **Above freezing**: Temperature > 32°F
+4. **Above minimum temperature**: Temperature > `MIN_TEMPERATURE_F` (default 45°F; was 60°F prior to commit `24ebd12`)
 5. **Daytime**: Between sunrise and sunset
-6. **Sun high enough**: Altitude >= `MIN_SUN_ALTITUDE_DEG`
-7. **Sun facing SE**: Azimuth 90°-180° (hardcoded for SE window)
+6. **Sun high enough**: Altitude >= `MIN_SUN_ALTITUDE_DEG` (default 15°)
+7. **Sun facing window**: Azimuth between 90° and 260° (hardcoded; SE-through-SW arc)
 
 If ANY condition fails, the awning closes. Fail-safe: closes awning if weather API is unavailable.
 
