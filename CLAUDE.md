@@ -17,7 +17,7 @@ nix develop
 python3 awning.py open
 python3 awning_automation.py --dry-run
 
-# Deploy to Orange Pi
+# Deploy to Orange Pi (USER ONLY — requires interactive password)
 ./deploy.sh
 ```
 
@@ -82,6 +82,8 @@ If ANY condition fails, the awning closes. Fail-safe: closes awning if weather A
 - View logs: `tail -f ~/awning.log`
 
 ## Deployment
+
+**🚨 The user runs `./deploy.sh` — Claude must NEVER run it.** Deployment requires interactive sudo/password input on the remote Orange Pi that only the user can provide. Claude's responsibility ends at `git commit` + `git push`; the user handles the actual deploy from their own terminal. Attempting to invoke `deploy.sh` (directly, via `bash -x`, via a sub-agent, via SSH, etc.) WILL fail because Claude cannot supply the password, and the attempt wastes tool budget plus produces misleading error output. When code is pushed and ready, tell the user "ready to deploy" and stop — wait for them to run it.
 
 **Target:** Orange Pi 3 LTS running Debian (`karlhepler@orangepi3-lts`)
 
