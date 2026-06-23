@@ -971,6 +971,13 @@ def is_raining_on_radar(lat: float, lon: float, timeout: int = 5) -> bool:
         # Pixel position within the 256×256 tile
         px = int((x_float - tile_x) * 256)
         py = int((y_float - tile_y) * 256)
+        # Single-tile sampling note: only the tile containing the configured
+        # coordinates is fetched and sampled. At zoom 6 (~610 m/pixel), the
+        # location can sit near a tile boundary (~3 km buffer before the edge
+        # matters). A narrow precipitation band straddling the boundary would
+        # only register if it extends far enough into this tile. Adjacent tile
+        # sampling is intentionally not implemented — acceptable risk for this
+        # use case given the coarse resolution and typical storm-cell width.
 
         # Step 3: fetch tile PNG
         # Path suffix: /256/{z}/{x}/{y}/2/1_1.png

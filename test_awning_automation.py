@@ -854,6 +854,9 @@ class TestWeatherRetryBehavior(unittest.TestCase):
     """
 
     # Shared valid weather JSON that fetch_weather() will accept.
+    # Includes representative hourly and minutely_15 blocks (clear-sky values)
+    # so the fixture is self-contained and reusable in future tests that call
+    # evaluate_rain_gate() or should_open_awning() after fetch_weather().
     _GOOD_JSON = {
         "current": {
             "wind_speed_10m": 5.0,
@@ -868,10 +871,25 @@ class TestWeatherRetryBehavior(unittest.TestCase):
             "cloud_cover_high": 5,
             "is_day": 1,
             "time": "2026-04-17T13:00",
+            "weather_code": 0,
         },
         "daily": {
             "sunrise": ["2026-04-17T06:00"],
             "sunset": ["2026-04-17T20:00"],
+        },
+        # Clear-sky hourly block: 0% precipitation probability for the current hour.
+        "hourly": {
+            "time": ["2026-04-17T13:00"],
+            "precipitation_probability": [0],
+        },
+        # Clear-sky minutely_15 block: three 15-min windows with 0 mm precipitation.
+        "minutely_15": {
+            "time": [
+                "2026-04-17T12:30",
+                "2026-04-17T12:45",
+                "2026-04-17T13:00",
+            ],
+            "precipitation": [0.0, 0.0, 0.0],
         },
     }
 
@@ -1353,6 +1371,47 @@ class TestRainGate(unittest.TestCase):
         self.assertFalse(
             evaluate_rain_gate(w, rain_probability_threshold=20),
             "evaluate_rain_gate must return False when hourly_precip_prob is None (missing data)",
+        )
+
+    # ------------------------------------------------------------------
+    # R-missing_minutely15 — None minutely_15_precip treated conservatively as rain (F-4 remedy)
+    # Exercises awning_automation.py:1080 — the `minutely_15_precip is None` branch.
+    # The _weather() helper converts None to [] at construction time, so this test
+    # constructs the weather dict directly with 'minutely_15_precip': None.
+    # All other signals are clear; only the missing minutely_15 field fires.
+    # ------------------------------------------------------------------
+    def test_R_missing_minutely15_closes_gate(self):
+        """minutely_15_precip=None (missing field) → evaluate_rain_gate=False → closes conservatively."""
+        # Construct dict directly — _weather() helper would convert None to [].
+        w = _weather(
+            precipitation=0,
+            hourly_precip_prob=0,
+            weather_code=0,
+        )
+        w["minutely_15_precip"] = None  # Override: force None into the field directly
+        self.assertFalse(
+            evaluate_rain_gate(w, rain_probability_threshold=20),
+            "evaluate_rain_gate must return False when minutely_15_precip is None (missing data)",
+        )
+
+    # ------------------------------------------------------------------
+    # R-missing_weather_code — None weather_code treated conservatively as rain (F-6 remedy)
+    # Exercises awning_automation.py:1086 — the `weather_code is None` branch.
+    # The _weather() helper defaults weather_code=0, so None is never exercised via _weather().
+    # All other signals are clear; only the missing weather_code field fires.
+    # ------------------------------------------------------------------
+    def test_R_missing_weather_code_closes_gate(self):
+        """weather_code=None (missing field) → evaluate_rain_gate=False → closes conservatively."""
+        # Construct dict directly — _weather() defaults weather_code=0.
+        w = _weather(
+            precipitation=0,
+            hourly_precip_prob=0,
+            minutely_15_precip=[],
+        )
+        w["weather_code"] = None  # Override: force None into the field directly
+        self.assertFalse(
+            evaluate_rain_gate(w, rain_probability_threshold=20),
+            "evaluate_rain_gate must return False when weather_code is None (missing data)",
         )
 
 
