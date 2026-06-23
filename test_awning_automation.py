@@ -29,14 +29,24 @@ def _weather(
     cloud_cover_high=10.0,
     sunrise="2026-04-17T06:00:00",
     sunset="2026-04-17T20:00:00",
+    # Rain gate fields — defaults represent "no rain" across all signals.
+    # weather_code=0: WMO "clear sky" (not in rain/drizzle/thunderstorm set).
+    # hourly_precip_prob=0: 0% ensemble rain probability (well below 20% threshold).
+    # minutely_15_precip=[]: empty recent-history window (no rain in last ~30 min).
+    weather_code=0,
+    hourly_precip_prob=0,
+    minutely_15_precip=None,
 ):
     # cloud_cover feeds Layer 2 (observational sunny gate).
     # cloud_cover_mid feeds Layer 3 (overcast ceiling).
     # Defaults represent a clear-to-partly-cloudy day:
     #   cloud_cover=20%, cloud_cover_mid=5% (well below thresholds).
+    if minutely_15_precip is None:
+        minutely_15_precip = []
     return {
         "wind_speed_10m": wind_speed,
         "precipitation": precipitation,
+        "weather_code": weather_code,
         "temperature": temperature,
         "shortwave_radiation": shortwave_radiation,
         "uv_index": uv_index,
@@ -47,6 +57,8 @@ def _weather(
         "cloud_cover_high": cloud_cover_high,
         "sunrise": sunrise,
         "sunset": sunset,
+        "hourly_precip_prob": hourly_precip_prob,
+        "minutely_15_precip": minutely_15_precip,
     }
 
 
@@ -65,6 +77,7 @@ _THRESHOLDS = dict(
     min_temperature_f=45.0,
     overcast_threshold=95.0,
     min_dni_cirrus=30.0,
+    rain_probability_threshold=20,
 )
 
 # Daytime moment that falls between the default sunrise/sunset strings above
@@ -75,7 +88,7 @@ _DAYTIME = datetime(2026, 4, 17, 13, 0, 0, tzinfo=timezone.utc)
 # Import functions under test
 # ---------------------------------------------------------------------------
 import awning_automation
-from awning_automation import should_open_awning, ConfigurationError, get_thresholds, WeatherAPIError, fetch_weather
+from awning_automation import should_open_awning, ConfigurationError, get_thresholds, WeatherAPIError, fetch_weather, evaluate_rain_gate
 
 
 class TestShouldOpenAwningOrGate(unittest.TestCase):
@@ -814,14 +827,14 @@ class TestGetThresholdsMinTemperatureFValidation(unittest.TestCase):
         """MIN_TEMPERATURE_F=-50 is at the lower bound → no error."""
         env = {**self._REQUIRED_ENV, "MIN_TEMPERATURE_F": "-50"}
         with unittest.mock.patch.dict(os.environ, env):
-            _, _, _, _, _, _, min_temperature_f, _, _ = get_thresholds()
+            _, _, _, _, _, _, min_temperature_f, _, _, _ = get_thresholds()
             self.assertEqual(min_temperature_f, -50.0)
 
     def test_min_temperature_f_at_upper_bound_is_valid(self):
         """MIN_TEMPERATURE_F=120 is at the upper bound → no error."""
         env = {**self._REQUIRED_ENV, "MIN_TEMPERATURE_F": "120"}
         with unittest.mock.patch.dict(os.environ, env):
-            _, _, _, _, _, _, min_temperature_f, _, _ = get_thresholds()
+            _, _, _, _, _, _, min_temperature_f, _, _, _ = get_thresholds()
             self.assertEqual(min_temperature_f, 120.0)
 
 
@@ -954,7 +967,7 @@ class TestWeatherRetryBehavior(unittest.TestCase):
         with patch.object(sys, "argv", ["awning_automation.py"]):
             with patch.object(awning_automation, "setup_logging", return_value=mock_log_path):
                 with patch.object(awning_automation, "load_location_config", return_value=(37.7, -122.4)):
-                    with patch.object(awning_automation, "get_thresholds", return_value=(15, 20, 400, 4, 50, 80, 60, 95, 30)):
+                    with patch.object(awning_automation, "get_thresholds", return_value=(15, 20, 400, 4, 50, 80, 60, 95, 30, 20)):
                         with patch.object(awning_automation, "load_telegram_config", return_value=("fake_token", "fake_chat")):
                             with patch.object(
                                 awning_automation,
@@ -1124,6 +1137,165 @@ class TestGetThresholdsMinDniCirrusWM2Validation(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, env):
             result = get_thresholds()
         self.assertEqual(result[8], 30.0)
+
+
+class TestRainGate(unittest.TestCase):
+    """
+    Tests for evaluate_rain_gate() and its integration into should_open_awning().
+
+    Four cases (R-1 through R-4) cover:
+      R-1: precipitation > 0 → gate closes (single-field baseline regression)
+      R-2: all signals clear → gate opens (happy-path pin)
+      R-3: precipitation=0 but secondary signal fires → gate still closes
+      R-4: divergent dry+sunny case (precipitation=0, DNI=0 but GHI/UV pass) → opens
+    """
+
+    # ------------------------------------------------------------------
+    # R-1 — Rain > 0 closes (single-field baseline regression)
+    # Regression for awning_automation.py:945 — previously the ONLY check.
+    # Even with evaluate_rain_gate the primary signal must still close.
+    # ------------------------------------------------------------------
+    def test_R1_precipitation_fires_rain_gate(self):
+        """R-1: precipitation=0.5 → evaluate_rain_gate returns False → should_open=False."""
+        # Direct unit test of evaluate_rain_gate: precipitation > 0 → close
+        w = _weather(
+            precipitation=0.5,
+            hourly_precip_prob=0,
+            minutely_15_precip=[],
+            weather_code=0,  # "clear sky" WMO code — only precipitation fires
+        )
+        self.assertFalse(
+            evaluate_rain_gate(w, rain_probability_threshold=20),
+            "evaluate_rain_gate must return False when precipitation > 0",
+        )
+
+        # Integration: should_open_awning must honour the gate
+        should_open, reason, conditions = should_open_awning(
+            weather=w,
+            sun_position=_sun(),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        self.assertFalse(
+            conditions["no_rain"],
+            f"conditions['no_rain'] must be False when precipitation > 0. reason={reason!r}",
+        )
+        self.assertFalse(
+            should_open,
+            f"should_open must be False when raining. reason={reason!r}",
+        )
+        self.assertIn(
+            "Raining",
+            reason,
+            f"reason string must mention 'Raining'. Got: {reason!r}",
+        )
+
+    # ------------------------------------------------------------------
+    # R-2 — Zero precipitation opens (no regression on happy path)
+    # All rain signals clear. Pins that the refactor does not break the
+    # open path when conditions are genuinely fine.
+    # ------------------------------------------------------------------
+    def test_R2_no_rain_signals_opens(self):
+        """R-2: precipitation=0.0, all rain signals clear → evaluate_rain_gate=True → opens."""
+        w = _weather(
+            precipitation=0.0,
+            hourly_precip_prob=0,
+            minutely_15_precip=[],
+            weather_code=0,
+        )
+        self.assertTrue(
+            evaluate_rain_gate(w, rain_probability_threshold=20),
+            "evaluate_rain_gate must return True when all signals are clear",
+        )
+
+        should_open, reason, conditions = should_open_awning(
+            weather=w,
+            sun_position=_sun(),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        self.assertTrue(
+            conditions["no_rain"],
+            f"conditions['no_rain'] must be True when no rain signals fire. reason={reason!r}",
+        )
+        self.assertTrue(
+            should_open,
+            f"should_open must be True when all conditions favorable. reason={reason!r}",
+        )
+
+    # ------------------------------------------------------------------
+    # R-3 — Secondary signal fires while precipitation=0 → closes
+    # Models the 2026-06-23 incident: precipitation=0 but ensemble
+    # probability indicates rain is coming. The gate must close.
+    # ------------------------------------------------------------------
+    def test_R3_secondary_signal_fires_while_precip_zero(self):
+        """R-3: precipitation=0 but hourly_precip_prob=30 (>= 20) → evaluate_rain_gate=False → closes."""
+        w = _weather(
+            precipitation=0.0,
+            hourly_precip_prob=30,   # above RAIN_PROBABILITY_THRESHOLD=20
+            minutely_15_precip=[],
+            weather_code=0,
+        )
+        self.assertFalse(
+            evaluate_rain_gate(w, rain_probability_threshold=20),
+            "evaluate_rain_gate must return False when hourly_precip_prob >= threshold",
+        )
+
+        should_open, reason, conditions = should_open_awning(
+            weather=w,
+            sun_position=_sun(),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        self.assertFalse(
+            conditions["no_rain"],
+            f"conditions['no_rain'] must be False when secondary signal fires. reason={reason!r}",
+        )
+        self.assertFalse(
+            should_open,
+            f"should_open must be False when secondary rain signal fires. reason={reason!r}",
+        )
+
+    # ------------------------------------------------------------------
+    # R-4 — Divergent dry+sunny case: rain=0, DNI=0 but GHI/UV pass
+    # Pins that should_open_awning is pure and correct: if rain signals
+    # are all clear, the function reports no_rain=True regardless of DNI
+    # fluctuations. The flapping behavior (open/close/open across runs) is
+    # a main()-layer concern handled by anti-flapping logic (separate card),
+    # not a bug in should_open_awning itself.
+    # ------------------------------------------------------------------
+    def test_R4_dry_sunny_dni_zero_ghi_uv_pass(self):
+        """R-4: precipitation=0, DNI=0 but GHI=700 and UV=7 → no_rain=True → opens (Layer 1 passes via GHI+UV)."""
+        w = _weather(
+            precipitation=0.0,
+            hourly_precip_prob=0,
+            minutely_15_precip=[],
+            weather_code=0,
+            shortwave_radiation=700.0,
+            uv_index=7.0,
+            dni=0.0,             # DNI=0: Layer 2 DNI arm fails; cloud_cover arm rescues
+            cloud_cover=20.0,    # cloud_cover=20% < 80% → Layer 2 passes via cloud arm
+        )
+        self.assertTrue(
+            evaluate_rain_gate(w, rain_probability_threshold=20),
+            "evaluate_rain_gate must return True when all rain signals are clear",
+        )
+
+        should_open, reason, conditions = should_open_awning(
+            weather=w,
+            sun_position=_sun(),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        self.assertTrue(
+            conditions["no_rain"],
+            f"conditions['no_rain'] must be True when no rain signals fire. reason={reason!r}",
+        )
+        self.assertTrue(
+            should_open,
+            f"should_open must be True: Layer 1 passes (GHI=700, UV=7), "
+            f"Layer 2 passes (cloud=20% < 80%), rain signals clear. reason={reason!r}",
+        )
 
 
 if __name__ == "__main__":

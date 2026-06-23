@@ -385,15 +385,15 @@ def load_location_config(env_file: Optional[Path] = None) -> tuple[float, float]
     return latitude, longitude
 
 
-def get_thresholds() -> tuple[float, float, float, float, float, float, float, float, float]:
+def get_thresholds() -> tuple[float, float, float, float, float, float, float, float, float, int]:
     """
     Get weather thresholds from environment variables.
 
     Returns:
         Tuple of (wind_speed_threshold_mph, min_sun_altitude, min_ghi, min_uv_index,
                   min_dni, max_cloud_cover, min_temperature_f, overcast_threshold,
-                  min_dni_cirrus)
-        Types: (float, float, float, float, float, float, float, float, float)
+                  min_dni_cirrus, rain_probability_threshold)
+        Types: (float, float, float, float, float, float, float, float, float, int)
             wind_speed_threshold_mph: float — mph, upper wind limit to open awning
             min_sun_altitude: float — degrees above horizon, lower sun altitude limit
             min_ghi: float — W/m², minimum global horizontal irradiance (shortwave_radiation)
@@ -415,6 +415,9 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
                 DNI >= this value, the overcast ceiling is bypassed (direct sun is arriving
                 despite high cloud_cover_high model estimate); 30 W/m² is well above
                 overcast/rain (4-14) and low enough to catch any real direct-beam sun
+            rain_probability_threshold: int — % ensemble precipitation probability above
+                which the rain gate closes the awning even when current precipitation = 0;
+                20% means "if 6+ of 30 ensemble members predict rain, stay closed"
 
     Raises:
         ConfigurationError: If threshold variables are missing or invalid
@@ -575,7 +578,26 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
             f"than Layer 2, which is logically inconsistent."
         )
 
-    return wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus
+    # Get rain probability threshold (optional, default 20%)
+    # Ensemble-based gate: if hourly.precipitation_probability >= this value,
+    # the rain gate closes the awning even when current precipitation == 0.
+    # 20% means "if 6+ of 30 ensemble members predict rain, stay closed."
+    # Conservative by design — the 2026-06-23 incident showed that a single
+    # current.precipitation field can be 0 during active rain when the model
+    # was initialized before the convective cell formed.
+    rain_prob_str = os.getenv("RAIN_PROBABILITY_THRESHOLD", "20").strip()
+    try:
+        rain_probability_threshold = int(rain_prob_str)
+    except ValueError as e:
+        raise ConfigurationError(
+            f"Invalid RAIN_PROBABILITY_THRESHOLD format: {e}. Must be an integer."
+        ) from e
+    if not (0 <= rain_probability_threshold <= 100):
+        raise ConfigurationError(
+            f"RAIN_PROBABILITY_THRESHOLD must be between 0 and 100, got: {rain_probability_threshold}"
+        )
+
+    return wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold
 
 
 def load_telegram_config() -> tuple[Optional[str], Optional[str]]:
@@ -647,10 +669,12 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
         "latitude": lat,
         "longitude": lon,
         "current": (
-            "wind_speed_10m,precipitation,is_day,temperature_2m,"
+            "wind_speed_10m,precipitation,weather_code,is_day,temperature_2m,"
             "shortwave_radiation,uv_index,direct_normal_irradiance,"
             "cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high"
         ),
+        "hourly": "precipitation_probability",
+        "minutely_15": "precipitation",
         "daily": "sunrise,sunset",
         "wind_speed_unit": "mph",
         "temperature_unit": "fahrenheit",
@@ -712,6 +736,41 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
                 f"Cannot evaluate Layer 3 overcast ceiling without this value."
             )
 
+        # Extract hourly precipitation_probability for the current hour.
+        # The hourly block returns a time-indexed array; we match the current
+        # time's hour-boundary to find the right slot. If the block is absent
+        # or the current-hour slot cannot be found, we default to None so the
+        # rain gate can treat missing data conservatively.
+        hourly_precip_prob: Optional[int] = None
+        if "hourly" in data:
+            hourly = data["hourly"]
+            hourly_times = hourly.get("time", [])
+            hourly_probs = hourly.get("precipitation_probability", [])
+            current_time_str = current.get("time", "")
+            # current_time_str format: "2026-06-23T11:30" — truncate to hour for matching
+            current_hour_prefix = current_time_str[:13]  # "2026-06-23T11"
+            for idx, ts in enumerate(hourly_times):
+                if ts.startswith(current_hour_prefix) and idx < len(hourly_probs):
+                    hourly_precip_prob = hourly_probs[idx]
+                    break
+
+        # Extract minutely_15 precipitation for the last ~3 slots (past ~30-45 min).
+        # Slots are in ascending time order; we want the most-recent past slots.
+        # If the block is absent we return an empty list — the rain gate treats
+        # this conservatively (missing data → assume rain).
+        minutely_15_precip: list = []
+        if "minutely_15" in data:
+            m15 = data["minutely_15"]
+            m15_times = m15.get("time", [])
+            m15_precip = m15.get("precipitation", [])
+            current_time_str = current.get("time", "")
+            # Collect all past/current slots up to current time, keep last 3.
+            past_slots = []
+            for idx, ts in enumerate(m15_times):
+                if ts <= current_time_str and idx < len(m15_precip):
+                    past_slots.append(m15_precip[idx])
+            minutely_15_precip = past_slots[-3:] if past_slots else []
+
         # Extract daily data (sunrise/sunset)
         if "daily" not in data:
             raise WeatherAPIError("Weather API response missing 'daily' field")
@@ -725,6 +784,7 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
         return {
             "wind_speed_10m": current["wind_speed_10m"],
             "precipitation": current["precipitation"],
+            "weather_code": current.get("weather_code"),
             "temperature": current["temperature_2m"],
             "shortwave_radiation": current["shortwave_radiation"],
             "uv_index": current["uv_index"],
@@ -737,6 +797,8 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
             "time": current.get("time", "unknown"),
             "sunrise": daily["sunrise"][0],
             "sunset": daily["sunset"][0],
+            "hourly_precip_prob": hourly_precip_prob,
+            "minutely_15_precip": minutely_15_precip,
         }
 
     except requests.RequestException as e:
@@ -825,6 +887,80 @@ def is_daytime(current_time: datetime, sunrise_str: str, sunset_str: str) -> boo
     return sunrise <= current_time <= sunset
 
 
+# WMO weather codes that indicate rain, drizzle, snow, showers, or thunderstorms.
+# Source: WMO Code Table 4677 / Open-Meteo docs.
+#   51-57: Drizzle (slight/moderate/dense, freezing drizzle)
+#   61-67: Rain (slight/moderate/heavy, freezing rain)
+#   71-77: Snow (slight/moderate/heavy, snow grains, ice crystals)
+#   80-82: Rain showers (slight/moderate/violent)
+#   95-99: Thunderstorm (slight/moderate, with hail)
+_RAIN_WEATHER_CODES = frozenset({
+    51, 53, 55, 56, 57,
+    61, 63, 65, 66, 67,
+    71, 73, 75, 77,
+    80, 81, 82,
+    95, 96, 99,
+})
+
+
+def evaluate_rain_gate(
+    weather: dict,
+    rain_probability_threshold: int = 20,
+) -> bool:
+    """
+    Evaluate whether it is safe (no rain) based on multiple Open-Meteo signals.
+
+    Returns True (safe = no rain) only when ALL configured signals are clear.
+    Returns False (rain detected → close) if ANY signal fires.
+    Treats missing/null fields conservatively as rain (bias to close).
+
+    Signals checked (OR-of-any → close):
+      1. current.precipitation > 0 — direct current-slot precipitation
+      2. hourly.precipitation_probability >= rain_probability_threshold —
+         ensemble-based probability gate; catches rain the deterministic model
+         missed (e.g., fast convective onset after model initialization)
+      3. sum(minutely_15.precipitation[-3 slots]) > 0 — rain in the last ~30-45
+         min from the recent-history lookback window; helps when the current slot
+         just rolled over to 0 but rain was active moments earlier
+      4. current.weather_code in RAIN_WEATHER_CODES — WMO synoptic code gate;
+         a secondary cross-check derived from a different field path than precipitation
+
+    Args:
+        weather: Weather dict from fetch_weather(); must contain 'precipitation'.
+            May optionally contain 'hourly_precip_prob', 'minutely_15_precip',
+            and 'weather_code'. Missing fields are treated as rain (conservative).
+        rain_probability_threshold: % threshold for ensemble precipitation
+            probability (default 20 — from RAIN_PROBABILITY_THRESHOLD env var).
+
+    Returns:
+        True if all signals are clear (no rain); False if any signal fires (rain).
+    """
+    # Signal 1: current precipitation > 0
+    precipitation = weather.get("precipitation")
+    if precipitation is None or precipitation > 0:
+        return False
+
+    # Signal 2: hourly ensemble precipitation probability >= threshold
+    # None means the field was missing from the API response — treat conservatively.
+    hourly_precip_prob = weather.get("hourly_precip_prob")
+    if hourly_precip_prob is None or hourly_precip_prob >= rain_probability_threshold:
+        return False
+
+    # Signal 3: any precipitation in the last ~3 minutely_15 slots (past ~30-45 min)
+    # None means the block was absent — treat conservatively.
+    minutely_15_precip = weather.get("minutely_15_precip")
+    if minutely_15_precip is None or any(v > 0 for v in minutely_15_precip):
+        return False
+
+    # Signal 4: WMO weather_code in rain/drizzle/snow/shower/thunderstorm set
+    # None means the field was absent — treat conservatively.
+    weather_code = weather.get("weather_code")
+    if weather_code is None or weather_code in _RAIN_WEATHER_CODES:
+        return False
+
+    return True
+
+
 def should_open_awning(
     weather: dict,
     sun_position: dict,
@@ -838,6 +974,7 @@ def should_open_awning(
     min_temperature_f: float = 45.0,
     overcast_threshold: float = 95.0,
     min_dni_cirrus: float = 30.0,
+    rain_probability_threshold: int = 20,
 ) -> tuple[bool, str, dict]:
     """
     Determine if awning should be open based on ALL conditions.
@@ -942,7 +1079,7 @@ def should_open_awning(
     is_sunny = sunny_model and sunny_observed and not_overcast
 
     is_calm = wind_speed < wind_threshold
-    no_rain = precipitation == 0
+    no_rain = evaluate_rain_gate(weather, rain_probability_threshold)
     above_freezing = temperature > min_temperature_f
     is_day = is_daytime(current_time, sunrise, sunset)
     sun_high_enough = altitude >= altitude_threshold
@@ -1163,12 +1300,13 @@ def main() -> None:
         logger.info(f"Location: {latitude:.4f}, {longitude:.4f}")
 
         # Get thresholds
-        wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus = get_thresholds()
+        wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold = get_thresholds()
         logger.info(
             f"Thresholds: model=(GHI >= {min_ghi:.0f} W/m² OR UV >= {min_uv_index:.1f}), "
             f"consistency=(DNI >= {min_dni:.0f} W/m² OR cloud < {max_cloud_cover:.0f}%), "
             f"overcast ceiling=cloud < {overcast_threshold:.0f}% (DNI guard >= {min_dni_cirrus:.0f} W/m²), "
-            f"Wind < {wind_threshold} mph, Rain = 0 mm/h, Temp > {min_temperature_f:.0f}°F, "
+            f"Wind < {wind_threshold} mph, Rain precip=0 AND prob < {rain_probability_threshold}%, "
+            f"Temp > {min_temperature_f:.0f}°F, "
             f"Sun altitude >= {altitude_threshold}°, Sun facing window (90°-260°)"
         )
 
@@ -1223,6 +1361,7 @@ def main() -> None:
             min_temperature_f,
             overcast_threshold,
             min_dni_cirrus,
+            rain_probability_threshold,
         )
 
         # Log conditions with checkmarks/crosses
