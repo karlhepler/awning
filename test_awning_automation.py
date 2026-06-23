@@ -10,6 +10,7 @@ import os
 import unittest
 import unittest.mock
 from datetime import datetime, timezone
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Helpers — build minimal weather / sun_position dicts
@@ -88,7 +89,7 @@ _DAYTIME = datetime(2026, 4, 17, 13, 0, 0, tzinfo=timezone.utc)
 # Import functions under test
 # ---------------------------------------------------------------------------
 import awning_automation
-from awning_automation import should_open_awning, ConfigurationError, get_thresholds, WeatherAPIError, fetch_weather, evaluate_rain_gate
+from awning_automation import should_open_awning, ConfigurationError, get_thresholds, WeatherAPIError, fetch_weather, evaluate_rain_gate, apply_hysteresis, read_vote_state, write_vote_state, get_vote_state_path
 
 
 class TestShouldOpenAwningOrGate(unittest.TestCase):
@@ -827,14 +828,14 @@ class TestGetThresholdsMinTemperatureFValidation(unittest.TestCase):
         """MIN_TEMPERATURE_F=-50 is at the lower bound → no error."""
         env = {**self._REQUIRED_ENV, "MIN_TEMPERATURE_F": "-50"}
         with unittest.mock.patch.dict(os.environ, env):
-            _, _, _, _, _, _, min_temperature_f, _, _, _ = get_thresholds()
+            _, _, _, _, _, _, min_temperature_f, _, _, _, _ = get_thresholds()
             self.assertEqual(min_temperature_f, -50.0)
 
     def test_min_temperature_f_at_upper_bound_is_valid(self):
         """MIN_TEMPERATURE_F=120 is at the upper bound → no error."""
         env = {**self._REQUIRED_ENV, "MIN_TEMPERATURE_F": "120"}
         with unittest.mock.patch.dict(os.environ, env):
-            _, _, _, _, _, _, min_temperature_f, _, _, _ = get_thresholds()
+            _, _, _, _, _, _, min_temperature_f, _, _, _, _ = get_thresholds()
             self.assertEqual(min_temperature_f, 120.0)
 
 
@@ -967,7 +968,7 @@ class TestWeatherRetryBehavior(unittest.TestCase):
         with patch.object(sys, "argv", ["awning_automation.py"]):
             with patch.object(awning_automation, "setup_logging", return_value=mock_log_path):
                 with patch.object(awning_automation, "load_location_config", return_value=(37.7, -122.4)):
-                    with patch.object(awning_automation, "get_thresholds", return_value=(15, 20, 400, 4, 50, 80, 60, 95, 30, 20)):
+                    with patch.object(awning_automation, "get_thresholds", return_value=(15, 20, 400, 4, 50, 80, 60, 95, 30, 20, 2)):
                         with patch.object(awning_automation, "load_telegram_config", return_value=("fake_token", "fake_chat")):
                             with patch.object(
                                 awning_automation,
@@ -1442,6 +1443,105 @@ class TestRadarGate(unittest.TestCase):
             gate_result,
             "evaluate_rain_gate must return True (fail-open) when only radar errors and Open-Meteo is clear",
         )
+
+
+class TestAntiFlappingHysteresis(unittest.TestCase):
+    """
+    Tests for the anti-flapping hysteresis layer (H-1 through H-8).
+
+    Covers:
+      H-1: First open vote → action=hold, counter=1
+      H-2: Second open vote hits threshold=2 → action=open, counter=2
+      H-3: Close vote resets counter immediately → action=close, counter=0
+      H-4: Consecutive closes don't accumulate negative → action=close, counter=0
+      H-5: threshold=1 disables hysteresis (immediate open) → action=open, counter=1
+      H-6: State file missing → read_vote_state returns 0 (safe default)
+      H-7: State file corrupt → read_vote_state returns 0 (safe default)
+      H-8: write_vote_state + read_vote_state round-trip → persists count correctly
+    """
+
+    # ------------------------------------------------------------------
+    # H-1 — First open vote: action=hold, counter=1
+    # ------------------------------------------------------------------
+    def test_H1_first_open_vote_holds(self):
+        """H-1: First open vote (current_votes=0, threshold=2) → hold, new_count=1."""
+        action, new_count = apply_hysteresis(should_open=True, current_votes=0, threshold=2)
+        self.assertEqual(action, "hold")
+        self.assertEqual(new_count, 1)
+
+    # ------------------------------------------------------------------
+    # H-2 — Second open vote hits threshold: action=open, counter=2
+    # ------------------------------------------------------------------
+    def test_H2_second_open_vote_opens(self):
+        """H-2: Second open vote (current_votes=1, threshold=2) → open, new_count=2."""
+        action, new_count = apply_hysteresis(should_open=True, current_votes=1, threshold=2)
+        self.assertEqual(action, "open")
+        self.assertEqual(new_count, 2)
+
+    # ------------------------------------------------------------------
+    # H-3 — Close vote resets counter immediately
+    # ------------------------------------------------------------------
+    def test_H3_close_vote_resets_counter(self):
+        """H-3: Close vote with current_votes=1 → close immediately, new_count=0."""
+        action, new_count = apply_hysteresis(should_open=False, current_votes=1, threshold=2)
+        self.assertEqual(action, "close")
+        self.assertEqual(new_count, 0)
+
+    # ------------------------------------------------------------------
+    # H-4 — Consecutive closes don't accumulate negative
+    # ------------------------------------------------------------------
+    def test_H4_repeated_close_stays_at_zero(self):
+        """H-4: Close vote with current_votes=0 → close, new_count stays 0 (not negative)."""
+        action, new_count = apply_hysteresis(should_open=False, current_votes=0, threshold=2)
+        self.assertEqual(action, "close")
+        self.assertEqual(new_count, 0)
+
+    # ------------------------------------------------------------------
+    # H-5 — threshold=1 disables hysteresis (immediate open)
+    # ------------------------------------------------------------------
+    def test_H5_threshold_one_opens_immediately(self):
+        """H-5: threshold=1 means first open vote triggers open immediately."""
+        action, new_count = apply_hysteresis(should_open=True, current_votes=0, threshold=1)
+        self.assertEqual(action, "open")
+        self.assertEqual(new_count, 1)
+
+    # ------------------------------------------------------------------
+    # H-6 — State file missing: read_vote_state returns 0 (safe default)
+    # ------------------------------------------------------------------
+    def test_H6_missing_state_file_returns_zero(self):
+        """H-6: read_vote_state on non-existent path returns 0 (safe default)."""
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            nonexistent = Path(tmp_dir) / "does_not_exist.json"
+            result = read_vote_state(nonexistent)
+        self.assertEqual(result, 0)
+
+    # ------------------------------------------------------------------
+    # H-7 — State file corrupt: read_vote_state returns 0 (safe default)
+    # ------------------------------------------------------------------
+    def test_H7_corrupt_state_file_returns_zero(self):
+        """H-7: read_vote_state on a corrupt JSON file returns 0 (safe default)."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+            fh.write("not valid json {{{{")
+            corrupt_path = Path(fh.name)
+        try:
+            result = read_vote_state(corrupt_path)
+        finally:
+            corrupt_path.unlink(missing_ok=True)
+        self.assertEqual(result, 0)
+
+    # ------------------------------------------------------------------
+    # H-8 — write_vote_state + read_vote_state round-trip
+    # ------------------------------------------------------------------
+    def test_H8_write_read_roundtrip(self):
+        """H-8: write_vote_state(path, 2) then read_vote_state(path) returns 2."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_path = get_vote_state_path(Path(tmp_dir))
+            write_vote_state(state_path, 2)
+            result = read_vote_state(state_path)
+        self.assertEqual(result, 2)
 
 
 if __name__ == "__main__":
