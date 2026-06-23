@@ -62,7 +62,6 @@ from typing import Optional
 import pandas as pd
 import requests
 from dotenv import load_dotenv
-from PIL import Image
 from pvlib import solarposition
 from requests.adapters import HTTPAdapter
 # NOTE: tenacity is retained for Telegram POST retries; weather/Bond migrated to urllib3.Retry.
@@ -992,6 +991,12 @@ def is_raining_on_radar(lat: float, lon: float, timeout: int = 5) -> bool:
         tile_resp.raise_for_status()
 
         # Step 4: decode pixel — alpha=0 means no radar return (no precipitation)
+        # PIL is an optional dependency; if missing, fail open (radar disabled).
+        try:
+            from PIL import Image
+        except ImportError:
+            logger.warning("Pillow is not installed — radar check disabled, failing open")
+            return False
         img = Image.open(io.BytesIO(tile_resp.content)).convert("RGBA")
         _r, _g, _b, alpha = img.getpixel((px, py))
         is_raining = alpha > 0

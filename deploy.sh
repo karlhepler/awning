@@ -85,8 +85,9 @@ sshpass -e ssh "$SERVER" "
 "
 
 # Install Python dependencies
+# NOTE: Keep this list in sync with requirements.txt
 echo "Installing Python dependencies..."
-sshpass -e ssh "$SERVER" "~/$REMOTE_DIR/venv/bin/pip install requests python-dotenv rich pvlib pandas pytz tenacity"
+sshpass -e ssh "$SERVER" "~/$REMOTE_DIR/venv/bin/pip install requests python-dotenv rich pvlib pandas pytz tenacity Pillow"
 
 # Copy Python scripts
 echo "Copying scripts..."

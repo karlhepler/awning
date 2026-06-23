@@ -1560,6 +1560,44 @@ class TestRadarGate(unittest.TestCase):
             "evaluate_rain_gate must return True (fail-open) when only radar errors and Open-Meteo is clear",
         )
 
+    # ------------------------------------------------------------------
+    # RV-missing-pillow — PIL unavailable → is_raining_on_radar False (fail-open)
+    # Pillow is an optional dependency. When it is missing (e.g. the Pi venv
+    # does not have it installed), the radar check must be silently skipped
+    # and return False — the automation must continue on Open-Meteo signals.
+    # A missing optional dependency must NEVER crash the module or awning controller.
+    # ------------------------------------------------------------------
+    def test_radar_missing_pillow_fails_open(self):
+        """Pillow absent (PIL raises ImportError) → is_raining_on_radar=False without raising."""
+        import sys
+        from unittest.mock import patch, MagicMock
+        from awning_automation import is_raining_on_radar
+
+        # Serve valid metadata and a tile response so the function reaches the
+        # PIL import. The tile content doesn't matter — PIL never gets to open it.
+        import json as _json
+        meta_resp = MagicMock()
+        meta_resp.raise_for_status.return_value = None
+        meta_resp.json.return_value = self._META_JSON
+
+        tile_resp = MagicMock()
+        tile_resp.raise_for_status.return_value = None
+        tile_resp.content = b"fake-png-bytes"
+
+        mock_get = MagicMock(side_effect=[meta_resp, tile_resp])
+
+        # Simulate Pillow being uninstalled by making `import PIL` raise ImportError.
+        # We patch sys.modules so that `from PIL import Image` inside the function
+        # raises ImportError, exactly as it would on a Pi without Pillow.
+        with patch("awning_automation.requests.get", mock_get):
+            with patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+                result = is_raining_on_radar(35.778, -78.838)
+
+        self.assertFalse(
+            result,
+            "is_raining_on_radar must return False (fail-open) when Pillow is not installed",
+        )
+
 
 class TestAntiFlappingHysteresis(unittest.TestCase):
     """
