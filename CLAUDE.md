@@ -42,7 +42,9 @@ Bond Bridge awning controller - sends HTTP commands to control a motorized awnin
 **Weather Automation (`awning_automation.py`):**
 - Automatically opens/closes awning based on weather and sun conditions
 - Uses Open-Meteo API (free, no API key) for weather data
+- Cross-checks live RainViewer NEXRAD radar (free, no API key) as an independent rain signal; decodes radar tiles with Pillow (PIL). The PIL import is lazy and fails open, so a missing Pillow never crashes the automation — radar simply disables and the Open-Meteo signals continue to guard.
 - Uses pvlib for solar position calculations (NREL SPA algorithm)
+- Applies anti-flapping hysteresis to the open/close decision (see § Weather Automation → Decision Logic)
 - Imports `awning_controller` for awning control
 
 **Configuration Loading:**
@@ -70,13 +72,25 @@ Bond Bridge awning controller - sends HTTP commands to control a motorized awnin
    - **Consistency layer**: DNI >= `MIN_DNI_WM2` (default 50 W/m²) OR total cloud cover < `MAX_CLOUD_COVER_PCT` (default 80%)
    - **Overcast ceiling**: max(cloud_cover_mid, cloud_cover_high) < threshold (default 95%) OR DNI >= `MIN_DNI_CIRRUS_WM2` (default 30 W/m²). The DNI guard bypasses the ceiling when direct irradiance proves the sun is reaching the ground — added after the 2026-05-12 incident where Open-Meteo's `cloud_cover_high` field hallucinated 100% on a clear day with DNI=905 W/m².
 2. **Calm**: Wind speed < `WIND_SPEED_THRESHOLD_MPH` (default 15.0 mph)
-3. **No rain**: Precipitation = 0 mm/h
+3. **No rain (multi-signal gate)**: the awning closes if ANY rain signal fires, and a missing/null signal is treated as rain (bias toward closed):
+   - Open-Meteo `precipitation` > 0 mm
+   - Open-Meteo `precipitation_probability` (current hour) >= `RAIN_PROBABILITY_THRESHOLD` (default 20%)
+   - Open-Meteo `minutely_15` precipitation in the last ~30 min > 0 (recent-rain lookback)
+   - Open-Meteo `weather_code` is a drizzle/rain/snow/shower/thunderstorm WMO code
+   - **RainViewer NEXRAD radar** shows precipitation over the configured `LATITUDE`/`LONGITUDE`. This is a live radar observation, independent of the Open-Meteo forecast model, so it catches storms the hourly model has not yet ingested. The radar check fails open: any fetch/parse error (or a missing Pillow dependency) returns "no radar rain" so it can never wedge the awning closed. Added after the 2026-06-23 incident, where Open-Meteo reported `precipitation=0` and `DNI=486 W/m²` (full sun) during a confirmed downpour and the single-field `precipitation == 0` gate let the awning open. A single radar tile is sampled (no adjacent-tile lookup); see the in-code note for the tile-boundary caveat.
 4. **Above minimum temperature**: Temperature > `MIN_TEMPERATURE_F` (default 45°F; was 60°F prior to commit `24ebd12`)
 5. **Daytime**: Between sunrise and sunset
 6. **Sun high enough**: Altitude >= `MIN_SUN_ALTITUDE_DEG` (default 15°)
 7. **Sun facing window**: Azimuth between 90° and 260° (hardcoded; SE-through-SW arc)
 
 If ANY condition fails, the awning closes. Fail-safe: closes awning if weather API is unavailable.
+
+**Anti-flapping hysteresis (applied to the open/close decision):**
+- The condition evaluation above produces an "open" or "close" vote each run.
+- **Close is immediate:** any "close" vote closes the awning and resets the open-vote counter to 0.
+- **Open is debounced:** opening requires `OPEN_VOTE_THRESHOLD` (default 2) consecutive "open" votes; below the threshold the awning is held closed.
+- Because each cron run is a separate process, the consecutive-vote counter persists in a state file beside the logs (`awning-open-votes.json`), written atomically.
+- This prevents the open→close→open thrashing that noisy sensor readings (e.g. swinging DNI) would otherwise cause. Added alongside the 2026-06-23 multi-signal rain work.
 
 **Logging:**
 - Daily log rotation in `logs/` directory as `awning-YYYY-MM-DD.log`
@@ -94,7 +108,7 @@ If ANY condition fails, the awning closes. Fail-safe: closes awning if weather A
 1. Discovers Bond Bridge IP via mDNS (using `BOND_ID` from `.env`)
 2. Sends Telegram notification (deploy start)
 3. Creates Python venv on remote if needed
-4. Installs dependencies via pip
+4. Installs dependencies via pip — **`deploy.sh` carries its own hardcoded package list** (`requests python-dotenv rich pvlib pandas pytz tenacity Pillow`); it does NOT read `requirements.txt`. 🚨 When adding a new runtime dependency you MUST add it to BOTH `requirements.txt` (for local/Nix dev) AND the pip-install line in `deploy.sh` (for the Pi), or the deploy will crash on import.
 5. Copies scripts and `.env` to `~/.config/awning/`
 6. Configures cron job (every 15 minutes)
 7. Runs dry-run verification
@@ -129,6 +143,8 @@ See `.env.example` for full documentation. Key variables:
 - `MIN_TEMPERATURE_F` - Min temperature °F to open awning (default: 45)
 - `OVERCAST_THRESHOLD_PCT` - Layer 3 hard ceiling: max(cloud_cover_mid, cloud_cover_high) must be below this % (default: 95)
 - `MIN_DNI_CIRRUS_WM2` - Layer 3 DNI guard: bypasses overcast ceiling when DNI >= this W/m² (default: 30)
+- `RAIN_PROBABILITY_THRESHOLD` - Min Open-Meteo precipitation-probability % (current hour) that closes the rain gate (default: 20)
+- `OPEN_VOTE_THRESHOLD` - Consecutive "open" votes required before the awning opens, for anti-flapping hysteresis (default: 2)
 
 **Optional:**
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` - For notifications
