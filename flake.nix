@@ -19,6 +19,7 @@
           pandas
           pytz
           tenacity
+          pillow
           pytest
         ]);
 

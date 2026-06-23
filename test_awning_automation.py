@@ -1298,5 +1298,151 @@ class TestRainGate(unittest.TestCase):
         )
 
 
+class TestRadarGate(unittest.TestCase):
+    """
+    Tests for is_raining_on_radar() and its integration into evaluate_rain_gate().
+
+    All HTTP calls and PNG loading are mocked — no real network requests are made.
+    Three cases:
+      RV-1: precip pixel (alpha > 0) → is_raining_on_radar True → gate closes
+      RV-2: transparent pixel (alpha = 0) → is_raining_on_radar False → gate stays open
+      RV-3: fetch exception → is_raining_on_radar False (fail-open)
+    """
+
+    # Minimal RainViewer weather-maps.json metadata response
+    _META_JSON = {
+        "version": "2.0",
+        "generated": 1719164400,
+        "host": "https://tilecache.rainviewer.com",
+        "radar": {
+            "past": [
+                {"time": 1719163800, "path": "/v2/radar/1719163800"},
+                {"time": 1719164400, "path": "/v2/radar/1719164400"},
+            ],
+            "nowcast": [],
+        },
+    }
+
+    @staticmethod
+    def _make_png_bytes(r: int, g: int, b: int, a: int) -> bytes:
+        """Create a 1×1 PNG (scaled to 256×256 via resize) for testing pixel checks.
+
+        We actually create a 256×256 solid-color PNG so getpixel works correctly
+        regardless of what pixel coordinates the tile math produces.
+        """
+        from PIL import Image as PILImage
+        import io as _io
+        img = PILImage.new("RGBA", (256, 256), (r, g, b, a))
+        buf = _io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    def _mock_requests(self, meta_json: dict, tile_png_bytes: bytes):
+        """Return a mock for requests.get that serves meta JSON then tile PNG."""
+        import json
+        import unittest.mock as mock
+
+        meta_resp = mock.MagicMock()
+        meta_resp.raise_for_status.return_value = None
+        meta_resp.json.return_value = meta_json
+
+        tile_resp = mock.MagicMock()
+        tile_resp.raise_for_status.return_value = None
+        tile_resp.content = tile_png_bytes
+
+        # First call → metadata, second call → tile
+        mock_get = mock.MagicMock(side_effect=[meta_resp, tile_resp])
+        return mock_get
+
+    # ------------------------------------------------------------------
+    # RV-1 — Precip pixel (alpha > 0) → is_raining_on_radar True → gate closes
+    # A solid non-transparent pixel anywhere in the tile means radar return.
+    # The rain gate must return False (close the awning).
+    # ------------------------------------------------------------------
+    def test_RV1_precip_pixel_closes_gate(self):
+        """RV-1: non-transparent pixel (alpha=200) → is_raining_on_radar=True → gate closes."""
+        from unittest.mock import patch
+        from awning_automation import is_raining_on_radar, evaluate_rain_gate
+
+        png_bytes = self._make_png_bytes(r=0, g=100, b=200, a=200)  # alpha > 0 = rain
+
+        with patch("awning_automation.requests.get", self._mock_requests(self._META_JSON, png_bytes)):
+            result = is_raining_on_radar(35.778, -78.838)
+
+        self.assertTrue(result, "Expected is_raining_on_radar=True for non-transparent pixel")
+
+        # Integration: evaluate_rain_gate must close when radar fires
+        # All Open-Meteo signals are clear; only radar should trigger close
+        w = _weather(
+            precipitation=0.0,
+            hourly_precip_prob=0,
+            minutely_15_precip=[],
+            weather_code=0,
+        )
+        with patch("awning_automation.requests.get", self._mock_requests(self._META_JSON, png_bytes)):
+            gate_result = evaluate_rain_gate(w, rain_probability_threshold=20, lat=35.778, lon=-78.838)
+
+        self.assertFalse(gate_result, "evaluate_rain_gate must return False when radar detects rain")
+
+    # ------------------------------------------------------------------
+    # RV-2 — Transparent pixel (alpha = 0) → is_raining_on_radar False
+    # A fully transparent pixel means no radar return at that location.
+    # The gate should remain open (True = no rain).
+    # ------------------------------------------------------------------
+    def test_RV2_transparent_pixel_gate_stays_open(self):
+        """RV-2: transparent pixel (alpha=0) → is_raining_on_radar=False → gate stays open."""
+        from unittest.mock import patch
+        from awning_automation import is_raining_on_radar, evaluate_rain_gate
+
+        png_bytes = self._make_png_bytes(r=0, g=0, b=0, a=0)  # fully transparent = no rain
+
+        with patch("awning_automation.requests.get", self._mock_requests(self._META_JSON, png_bytes)):
+            result = is_raining_on_radar(35.778, -78.838)
+
+        self.assertFalse(result, "Expected is_raining_on_radar=False for transparent pixel")
+
+        # Integration: gate should stay open when all signals are clear
+        w = _weather(
+            precipitation=0.0,
+            hourly_precip_prob=0,
+            minutely_15_precip=[],
+            weather_code=0,
+        )
+        with patch("awning_automation.requests.get", self._mock_requests(self._META_JSON, png_bytes)):
+            gate_result = evaluate_rain_gate(w, rain_probability_threshold=20, lat=35.778, lon=-78.838)
+
+        self.assertTrue(gate_result, "evaluate_rain_gate must return True when no rain signals fire")
+
+    # ------------------------------------------------------------------
+    # RV-3 — Fetch exception → is_raining_on_radar False (fail-open)
+    # A RainViewer outage must not keep the awning permanently closed.
+    # Any exception during fetch returns False so Open-Meteo signals still guard.
+    # ------------------------------------------------------------------
+    def test_RV3_fetch_exception_fail_open(self):
+        """RV-3: requests.get raises exception → is_raining_on_radar=False (fail-open)."""
+        from unittest.mock import patch
+        from awning_automation import is_raining_on_radar, evaluate_rain_gate
+
+        with patch("awning_automation.requests.get", side_effect=Exception("simulated network error")):
+            result = is_raining_on_radar(35.778, -78.838)
+
+        self.assertFalse(result, "Expected is_raining_on_radar=False on fetch exception (fail-open)")
+
+        # Integration: gate stays open on radar exception when Open-Meteo signals are clear
+        w = _weather(
+            precipitation=0.0,
+            hourly_precip_prob=0,
+            minutely_15_precip=[],
+            weather_code=0,
+        )
+        with patch("awning_automation.requests.get", side_effect=Exception("simulated network error")):
+            gate_result = evaluate_rain_gate(w, rain_probability_threshold=20, lat=35.778, lon=-78.838)
+
+        self.assertTrue(
+            gate_result,
+            "evaluate_rain_gate must return True (fail-open) when only radar errors and Open-Meteo is clear",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

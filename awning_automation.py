@@ -48,7 +48,9 @@ sub-minute windows, so the 15-minute cron cadence is the effective sampling inte
 Designed to run as a cron job or Kubernetes scheduled job.
 """
 
+import io
 import logging
+import math
 import os
 import sys
 from datetime import date, datetime, timedelta, timezone
@@ -58,6 +60,7 @@ from typing import Optional
 import pandas as pd
 import requests
 from dotenv import load_dotenv
+from PIL import Image
 from pvlib import solarposition
 from requests.adapters import HTTPAdapter
 # NOTE: tenacity is retained for Telegram POST retries; weather/Bond migrated to urllib3.Retry.
@@ -887,6 +890,102 @@ def is_daytime(current_time: datetime, sunrise_str: str, sunset_str: str) -> boo
     return sunrise <= current_time <= sunset
 
 
+# Zoom level for RainViewer tile requests.
+# Zoom 6 yields ~156 km/pixel tiles covering roughly 2.5° lat/lon per tile.
+# That is adequate resolution for a point precipitation check: a 256×256 pixel
+# tile at zoom 6 gives ~610 m/pixel at the equator.
+_RAINVIEWER_TILE_ZOOM = 6
+_RAINVIEWER_MAPS_URL = "https://api.rainviewer.com/public/weather-maps.json"
+
+
+def is_raining_on_radar(lat: float, lon: float, timeout: int = 5) -> bool:
+    """
+    Check if NEXRAD radar shows active precipitation at the given lat/lon.
+
+    Uses the RainViewer API (free, no API key) which aggregates real NEXRAD
+    WSR-88D radar returns. Lag is ~8-15 minutes (NEXRAD scan cycle + RainViewer
+    processing), which is vastly better than HRRR's 1-3 hour model init cycle.
+
+    Algorithm:
+      1. Fetch the latest radar frame metadata from RainViewer.
+      2. Compute the Web Mercator (XYZ) tile covering the location.
+      3. Fetch the 256×256 PNG tile.
+      4. Extract the pixel for the exact lat/lon within the tile.
+      5. Return True if the pixel alpha > 0 (non-transparent = precipitation).
+
+    Fail-open semantics: any exception or timeout returns False.
+    A RainViewer outage cannot keep the awning permanently closed — the
+    Open-Meteo signals in evaluate_rain_gate() still guard independently.
+
+    Args:
+        lat: Latitude of the location to check.
+        lon: Longitude of the location to check.
+        timeout: HTTP request timeout in seconds (default 5).
+
+    Returns:
+        True if radar shows active precipitation; False otherwise or on error.
+    """
+    try:
+        # Step 1: fetch latest radar frame metadata
+        meta_resp = requests.get(_RAINVIEWER_MAPS_URL, timeout=timeout)
+        meta_resp.raise_for_status()
+        meta = meta_resp.json()
+
+        past_frames = meta.get("radar", {}).get("past", [])
+        if not past_frames:
+            logger.warning("RainViewer: no past radar frames available — skipping radar check")
+            return False
+
+        latest_path = past_frames[-1]["path"]
+
+        # Step 2: compute XYZ tile coordinates (Web Mercator / EPSG:3857)
+        z = _RAINVIEWER_TILE_ZOOM
+        lat_rad = math.radians(lat)
+        n = 2 ** z
+        x_float = (lon + 180.0) / 360.0 * n
+        y_float = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n
+        tile_x = int(x_float)
+        tile_y = int(y_float)
+        # Pixel position within the 256×256 tile
+        px = int((x_float - tile_x) * 256)
+        py = int((y_float - tile_y) * 256)
+
+        # Step 3: fetch tile PNG
+        # Path suffix: /256/{z}/{x}/{y}/2/1_1.png
+        #   256   — tile size in pixels
+        #   2     — Meteored color scheme
+        #   1_1   — smooth=1, snow=1 (snow returns also count as precipitation)
+        tile_url = (
+            f"https://tilecache.rainviewer.com{latest_path}"
+            f"/256/{z}/{tile_x}/{tile_y}/2/1_1.png"
+        )
+        tile_resp = requests.get(tile_url, timeout=timeout)
+        tile_resp.raise_for_status()
+
+        # Step 4: decode pixel — alpha=0 means no radar return (no precipitation)
+        img = Image.open(io.BytesIO(tile_resp.content)).convert("RGBA")
+        _r, _g, _b, alpha = img.getpixel((px, py))
+        is_raining = alpha > 0
+
+        if is_raining:
+            logger.info(
+                f"RainViewer: radar return at ({lat:.3f}, {lon:.3f}) — rain detected"
+            )
+        else:
+            logger.debug(
+                f"RainViewer: no radar return at ({lat:.3f}, {lon:.3f})"
+            )
+
+        return is_raining
+
+    except requests.RequestException as e:
+        logger.warning(f"RainViewer API error: {e} — skipping radar check")
+        return False
+    except Exception as e:
+        logger.warning(f"RainViewer parse error: {e} — skipping radar check")
+        return False
+
+
 # WMO weather codes that indicate rain, drizzle, snow, showers, or thunderstorms.
 # Source: WMO Code Table 4677 / Open-Meteo docs.
 #   51-57: Drizzle (slight/moderate/dense, freezing drizzle)
@@ -906,9 +1005,11 @@ _RAIN_WEATHER_CODES = frozenset({
 def evaluate_rain_gate(
     weather: dict,
     rain_probability_threshold: int = 20,
+    lat: Optional[float] = None,
+    lon: Optional[float] = None,
 ) -> bool:
     """
-    Evaluate whether it is safe (no rain) based on multiple Open-Meteo signals.
+    Evaluate whether it is safe (no rain) based on multiple signals.
 
     Returns True (safe = no rain) only when ALL configured signals are clear.
     Returns False (rain detected → close) if ANY signal fires.
@@ -924,6 +1025,9 @@ def evaluate_rain_gate(
          just rolled over to 0 but rain was active moments earlier
       4. current.weather_code in RAIN_WEATHER_CODES — WMO synoptic code gate;
          a secondary cross-check derived from a different field path than precipitation
+      5. is_raining_on_radar(lat, lon) — RainViewer NEXRAD radar tile check;
+         a real-time observation independent of NWP model init lag.
+         Skipped (fail-open) when lat/lon are not provided or on any fetch error.
 
     Args:
         weather: Weather dict from fetch_weather(); must contain 'precipitation'.
@@ -931,6 +1035,8 @@ def evaluate_rain_gate(
             and 'weather_code'. Missing fields are treated as rain (conservative).
         rain_probability_threshold: % threshold for ensemble precipitation
             probability (default 20 — from RAIN_PROBABILITY_THRESHOLD env var).
+        lat: Latitude for radar check (optional). When None, radar check is skipped.
+        lon: Longitude for radar check (optional). When None, radar check is skipped.
 
     Returns:
         True if all signals are clear (no rain); False if any signal fires (rain).
@@ -958,6 +1064,13 @@ def evaluate_rain_gate(
     if weather_code is None or weather_code in _RAIN_WEATHER_CODES:
         return False
 
+    # Signal 5: RainViewer NEXRAD radar — real-time observation independent of NWP.
+    # Fail-open: is_raining_on_radar returns False on any error/timeout, so a
+    # RainViewer outage cannot keep the awning closed. Skipped when lat/lon absent.
+    if lat is not None and lon is not None:
+        if is_raining_on_radar(lat, lon):
+            return False
+
     return True
 
 
@@ -975,6 +1088,8 @@ def should_open_awning(
     overcast_threshold: float = 95.0,
     min_dni_cirrus: float = 30.0,
     rain_probability_threshold: int = 20,
+    lat: Optional[float] = None,
+    lon: Optional[float] = None,
 ) -> tuple[bool, str, dict]:
     """
     Determine if awning should be open based on ALL conditions.
@@ -1079,7 +1194,7 @@ def should_open_awning(
     is_sunny = sunny_model and sunny_observed and not_overcast
 
     is_calm = wind_speed < wind_threshold
-    no_rain = evaluate_rain_gate(weather, rain_probability_threshold)
+    no_rain = evaluate_rain_gate(weather, rain_probability_threshold, lat=lat, lon=lon)
     above_freezing = temperature > min_temperature_f
     is_day = is_daytime(current_time, sunrise, sunset)
     sun_high_enough = altitude >= altitude_threshold
@@ -1362,6 +1477,8 @@ def main() -> None:
             overcast_threshold,
             min_dni_cirrus,
             rain_probability_threshold,
+            lat=latitude,
+            lon=longitude,
         )
 
         # Log conditions with checkmarks/crosses
