@@ -1298,6 +1298,63 @@ class TestRainGate(unittest.TestCase):
             f"Layer 2 passes (cloud=20% < 80%), rain signals clear. reason={reason!r}",
         )
 
+    # ------------------------------------------------------------------
+    # R-minutely15 — Recent rain in 15-min lookback closes gate (F-1 remedy)
+    # Exercises awning_automation.py:1080 — the `any(v > 0 ...)` branch.
+    # Precipitation=0 and hourly_precip_prob=0 and weather_code=0 are all
+    # clear; only the minutely_15 lookback fires.
+    # ------------------------------------------------------------------
+    def test_R_minutely15_recent_rain_closes_gate(self):
+        """minutely_15_precip=[0.0, 0.3, 0.0] (rain ~30 min ago) → evaluate_rain_gate=False → closes."""
+        w = _weather(
+            precipitation=0,
+            hourly_precip_prob=0,
+            minutely_15_precip=[0.0, 0.3, 0.0],  # non-zero value fires Signal 3
+            weather_code=0,
+        )
+        self.assertFalse(
+            evaluate_rain_gate(w, rain_probability_threshold=20),
+            "evaluate_rain_gate must return False when minutely_15_precip contains a non-zero value",
+        )
+
+    # ------------------------------------------------------------------
+    # R-weather_code — WMO rain code closes gate (F-2 remedy)
+    # Exercises awning_automation.py:1086 — the `weather_code in _RAIN_WEATHER_CODES` branch.
+    # WMO code 63 = moderate rain (continuous); precipitation=0 and all other
+    # signals clear so only the weather_code signal fires.
+    # ------------------------------------------------------------------
+    def test_R_rain_weather_code_closes_gate(self):
+        """weather_code=63 (moderate rain WMO) → evaluate_rain_gate=False → closes."""
+        w = _weather(
+            precipitation=0,
+            hourly_precip_prob=0,
+            minutely_15_precip=[],
+            weather_code=63,  # WMO "moderate rain (continuous)" — in _RAIN_WEATHER_CODES
+        )
+        self.assertFalse(
+            evaluate_rain_gate(w, rain_probability_threshold=20),
+            "evaluate_rain_gate must return False when weather_code is in _RAIN_WEATHER_CODES",
+        )
+
+    # ------------------------------------------------------------------
+    # R-missing_prob — None hourly_precip_prob treated conservatively as rain (F-3 remedy)
+    # Exercises awning_automation.py:1074 — the `hourly_precip_prob is None` branch.
+    # All other signals (precipitation, minutely_15, weather_code) are clear;
+    # only the missing probability field fires.
+    # ------------------------------------------------------------------
+    def test_R_missing_hourly_precip_prob_closes_gate(self):
+        """hourly_precip_prob=None (missing field) → evaluate_rain_gate=False → closes conservatively."""
+        w = _weather(
+            precipitation=0,
+            hourly_precip_prob=None,  # missing field — conservative path at line 1074
+            minutely_15_precip=[],
+            weather_code=0,
+        )
+        self.assertFalse(
+            evaluate_rain_gate(w, rain_probability_threshold=20),
+            "evaluate_rain_gate must return False when hourly_precip_prob is None (missing data)",
+        )
+
 
 class TestRadarGate(unittest.TestCase):
     """
