@@ -828,14 +828,14 @@ class TestGetThresholdsMinTemperatureFValidation(unittest.TestCase):
         """MIN_TEMPERATURE_F=-50 is at the lower bound → no error."""
         env = {**self._REQUIRED_ENV, "MIN_TEMPERATURE_F": "-50"}
         with unittest.mock.patch.dict(os.environ, env):
-            _, _, _, _, _, _, min_temperature_f, _, _, _, _ = get_thresholds()
+            _, _, _, _, _, _, min_temperature_f, _, _, _, _, _, _ = get_thresholds()
             self.assertEqual(min_temperature_f, -50.0)
 
     def test_min_temperature_f_at_upper_bound_is_valid(self):
         """MIN_TEMPERATURE_F=120 is at the upper bound → no error."""
         env = {**self._REQUIRED_ENV, "MIN_TEMPERATURE_F": "120"}
         with unittest.mock.patch.dict(os.environ, env):
-            _, _, _, _, _, _, min_temperature_f, _, _, _, _ = get_thresholds()
+            _, _, _, _, _, _, min_temperature_f, _, _, _, _, _, _ = get_thresholds()
             self.assertEqual(min_temperature_f, 120.0)
 
 
@@ -986,7 +986,7 @@ class TestWeatherRetryBehavior(unittest.TestCase):
         with patch.object(sys, "argv", ["awning_automation.py"]):
             with patch.object(awning_automation, "setup_logging", return_value=mock_log_path):
                 with patch.object(awning_automation, "load_location_config", return_value=(37.7, -122.4)):
-                    with patch.object(awning_automation, "get_thresholds", return_value=(15, 20, 400, 4, 50, 80, 60, 95, 30, 20, 2)):
+                    with patch.object(awning_automation, "get_thresholds", return_value=(15, 20, 400, 4, 50, 80, 60, 95, 30, 20, 2, 400.0, 15.0)):
                         with patch.object(awning_automation, "load_telegram_config", return_value=("fake_token", "fake_chat")):
                             with patch.object(
                                 awning_automation,
@@ -1596,6 +1596,183 @@ class TestRadarGate(unittest.TestCase):
         self.assertFalse(
             result,
             "is_raining_on_radar must return False (fail-open) when Pillow is not installed",
+        )
+
+    # ------------------------------------------------------------------
+    # RV-veto-1 — Reproduce 2026-06-24: radar fires + high DNI + low cloud → gate stays open
+    # Incident: DNI=784 W/m², cloud_cover=3%, radar pixel A=110 (biological clutter).
+    # With the clear-sky veto (radar_veto_dni=400, radar_veto_cloud_pct=15), the radar
+    # hit must be suppressed and the gate must return True (no rain → awning may open).
+    # ------------------------------------------------------------------
+    def test_RV_veto1_clear_sky_suppresses_radar_hit(self):
+        """RV-veto-1: radar fires + DNI high + cloud low → veto suppresses → gate stays open."""
+        from unittest.mock import patch
+        from awning_automation import evaluate_rain_gate
+
+        # Non-transparent brownish-gray clutter pixel (matches 2026-06-24 incident pixel)
+        png_bytes = self._make_png_bytes(r=158, g=147, b=117, a=110)
+
+        # All Open-Meteo signals are clear; radar fires but DNI/cloud veto applies
+        w = _weather(
+            precipitation=0.0,
+            hourly_precip_prob=0,
+            minutely_15_precip=[],
+            weather_code=0,
+            dni=784.0,         # high direct-sun irradiance — provably clear sky
+            cloud_cover=3.0,   # very low cloud cover — provably clear sky
+        )
+
+        with patch("awning_automation.requests.get", self._mock_requests(self._META_JSON, png_bytes)):
+            gate_result = evaluate_rain_gate(
+                w,
+                rain_probability_threshold=20,
+                lat=35.778,
+                lon=-78.838,
+                radar_veto_dni=400.0,
+                radar_veto_cloud_pct=15.0,
+            )
+
+        self.assertTrue(
+            gate_result,
+            "evaluate_rain_gate must return True (no rain) when radar fires but clear-sky veto applies "
+            "(DNI=784 >= 400 AND cloud_cover=3% < 15%)",
+        )
+
+    # ------------------------------------------------------------------
+    # RV-veto-2 — Over-suppression guard: radar fires + DNI LOW → veto does NOT fire
+    # Even if cloud_cover is low, if DNI is below the veto threshold (e.g. 50 W/m²),
+    # the veto must NOT suppress the radar signal — gate closes.
+    # ------------------------------------------------------------------
+    def test_RV_veto2_low_dni_veto_does_not_fire(self):
+        """RV-veto-2: radar fires + DNI low (50 W/m²) → veto does not suppress → gate closes."""
+        from unittest.mock import patch
+        from awning_automation import evaluate_rain_gate
+
+        png_bytes = self._make_png_bytes(r=0, g=100, b=200, a=200)  # precipitation pixel
+
+        w = _weather(
+            precipitation=0.0,
+            hourly_precip_prob=0,
+            minutely_15_precip=[],
+            weather_code=0,
+            dni=50.0,          # low DNI — overcast/light rain territory
+            cloud_cover=10.0,  # cloud_cover below 15%, but DNI doesn't qualify
+        )
+
+        with patch("awning_automation.requests.get", self._mock_requests(self._META_JSON, png_bytes)):
+            gate_result = evaluate_rain_gate(
+                w,
+                rain_probability_threshold=20,
+                lat=35.778,
+                lon=-78.838,
+                radar_veto_dni=400.0,
+                radar_veto_cloud_pct=15.0,
+            )
+
+        self.assertFalse(
+            gate_result,
+            "evaluate_rain_gate must return False (rain) when radar fires and DNI is too low for veto",
+        )
+
+    # ------------------------------------------------------------------
+    # RV-veto-3 — Over-suppression guard: radar fires + cloud HIGH → veto does NOT fire
+    # Even if DNI is high, if cloud_cover is at or above the veto threshold (e.g. 20%),
+    # the veto must NOT suppress the radar signal — gate closes.
+    # ------------------------------------------------------------------
+    def test_RV_veto3_high_cloud_veto_does_not_fire(self):
+        """RV-veto-3: radar fires + cloud_cover high (20%) → veto does not suppress → gate closes."""
+        from unittest.mock import patch
+        from awning_automation import evaluate_rain_gate
+
+        png_bytes = self._make_png_bytes(r=0, g=100, b=200, a=200)  # precipitation pixel
+
+        w = _weather(
+            precipitation=0.0,
+            hourly_precip_prob=0,
+            minutely_15_precip=[],
+            weather_code=0,
+            dni=500.0,         # high DNI — qualifies for veto threshold
+            cloud_cover=20.0,  # cloud_cover >= 15% — veto does not apply
+        )
+
+        with patch("awning_automation.requests.get", self._mock_requests(self._META_JSON, png_bytes)):
+            gate_result = evaluate_rain_gate(
+                w,
+                rain_probability_threshold=20,
+                lat=35.778,
+                lon=-78.838,
+                radar_veto_dni=400.0,
+                radar_veto_cloud_pct=15.0,
+            )
+
+        self.assertFalse(
+            gate_result,
+            "evaluate_rain_gate must return False (rain) when radar fires and cloud_cover >= veto threshold",
+        )
+
+    # ------------------------------------------------------------------
+    # RV-veto-4 — Other rain signals unaffected: precipitation > 0 closes gate regardless of DNI
+    # The clear-sky veto must ONLY affect Signal 5 (radar). If Signal 1 (precipitation > 0)
+    # fires, the gate must still close even when DNI and cloud conditions would qualify for veto.
+    # ------------------------------------------------------------------
+    def test_RV_veto4_precipitation_signal_unaffected_by_veto(self):
+        """RV-veto-4: precipitation=0.5 closes gate even when DNI+cloud qualify for veto."""
+        from awning_automation import evaluate_rain_gate
+
+        # No radar mock needed — precipitation fires first (Signal 1)
+        w = _weather(
+            precipitation=0.5,   # active rain signal
+            hourly_precip_prob=0,
+            minutely_15_precip=[],
+            weather_code=0,
+            dni=784.0,         # high DNI — would qualify for veto
+            cloud_cover=3.0,   # low cloud — would qualify for veto
+        )
+
+        gate_result = evaluate_rain_gate(
+            w,
+            rain_probability_threshold=20,
+            lat=35.778,
+            lon=-78.838,
+            radar_veto_dni=400.0,
+            radar_veto_cloud_pct=15.0,
+        )
+
+        self.assertFalse(
+            gate_result,
+            "evaluate_rain_gate must return False when precipitation > 0, even if clear-sky veto conditions hold",
+        )
+
+    # ------------------------------------------------------------------
+    # RV-veto-5 — Other rain signals unaffected: high rain probability closes gate regardless of veto
+    # Signal 2 (hourly_precip_prob >= threshold) must still close the gate even when the
+    # clear-sky veto conditions hold on DNI and cloud_cover.
+    # ------------------------------------------------------------------
+    def test_RV_veto5_rain_probability_signal_unaffected_by_veto(self):
+        """RV-veto-5: high rain probability closes gate even when DNI+cloud qualify for veto."""
+        from awning_automation import evaluate_rain_gate
+
+        w = _weather(
+            precipitation=0.0,
+            hourly_precip_prob=30,  # >= 20% threshold — fires Signal 2
+            minutely_15_precip=[],
+            weather_code=0,
+            dni=784.0,
+            cloud_cover=3.0,
+        )
+
+        gate_result = evaluate_rain_gate(
+            w,
+            rain_probability_threshold=20,
+            lat=35.778,
+            lon=-78.838,
+            radar_veto_dni=400.0,
+            radar_veto_cloud_pct=15.0,
+        )
+
+        self.assertFalse(
+            gate_result,
+            "evaluate_rain_gate must return False when rain probability >= threshold, even if clear-sky veto conditions hold",
         )
 
 

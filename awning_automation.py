@@ -389,15 +389,16 @@ def load_location_config(env_file: Optional[Path] = None) -> tuple[float, float]
     return latitude, longitude
 
 
-def get_thresholds() -> tuple[float, float, float, float, float, float, float, float, float, int, int]:
+def get_thresholds() -> tuple[float, float, float, float, float, float, float, float, float, int, int, float, float]:
     """
     Get weather thresholds from environment variables.
 
     Returns:
         Tuple of (wind_speed_threshold_mph, min_sun_altitude, min_ghi, min_uv_index,
                   min_dni, max_cloud_cover, min_temperature_f, overcast_threshold,
-                  min_dni_cirrus, rain_probability_threshold, open_vote_threshold)
-        Types: (float, float, float, float, float, float, float, float, float, int, int)
+                  min_dni_cirrus, rain_probability_threshold, open_vote_threshold,
+                  radar_veto_dni, radar_veto_cloud_pct)
+        Types: (float, float, float, float, float, float, float, float, float, int, int, float, float)
             wind_speed_threshold_mph: float — mph, upper wind limit to open awning
             min_sun_altitude: float — degrees above horizon, lower sun altitude limit
             min_ghi: float — W/m², minimum global horizontal irradiance (shortwave_radiation)
@@ -425,6 +426,15 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
             open_vote_threshold: int — number of consecutive "open" votes required before
                 the awning actually opens; close votes are immediate (reset to 0); default 2
                 means two consecutive 15-min cron runs must agree before opening
+            radar_veto_dni: float — W/m², DNI floor for the clear-sky radar veto; when
+                DNI >= this value AND cloud_cover < radar_veto_cloud_pct, a RainViewer radar
+                hit is suppressed because independent measurements prove the sky is clear.
+                Real rain brings clouds, so these conditions cannot both hold during genuine
+                precipitation. Default 650 W/m² (safely above the 486 W/m² known-bad DNI
+                from the 2026-06-23 downpour, yet below typical clear-sky values of 790-860+).
+            radar_veto_cloud_pct: float — % total cloud cover ceiling for the clear-sky
+                radar veto; the veto only fires when BOTH DNI >= radar_veto_dni AND
+                cloud_cover < this value. Default 15% (provably clear sky).
 
     Raises:
         ConfigurationError: If threshold variables are missing or invalid
@@ -621,7 +631,47 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
             f"OPEN_VOTE_THRESHOLD must be between 1 and 10, got: {open_vote_threshold}"
         )
 
-    return wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold, open_vote_threshold
+    # Get radar veto DNI threshold (optional, default 650 W/m²)
+    # Clear-sky radar veto: when DNI >= this value AND cloud_cover < radar_veto_cloud_pct,
+    # a RainViewer radar hit is suppressed. Real rain produces clouds that reduce DNI well
+    # below this level (typical rainy DNI: 4-30 W/m²). Default 650 W/m² sits safely above
+    # the 486 W/m² DNI that Open-Meteo reported during the 2026-06-23 downpour (the known-bad
+    # reading that could have incorrectly triggered the veto during genuine rain), while still
+    # engaging on real clear-sky days where DNI typically runs 790-860+ W/m².
+    # The 2026-06-24 incident: DNI=784 W/m², cloud_cover=3% while radar showed a clutter
+    # echo (biological scatter / anomalous propagation common on hot clear-air summer days).
+    radar_veto_dni_str = os.getenv("RADAR_VETO_DNI_WM2", "650").strip()
+    try:
+        radar_veto_dni = float(radar_veto_dni_str)
+    except ValueError as e:
+        raise ConfigurationError(
+            f"Invalid RADAR_VETO_DNI_WM2 format: {e}. Must be a number."
+        ) from e
+    if radar_veto_dni <= 0:
+        raise ConfigurationError(
+            f"RADAR_VETO_DNI_WM2 must be > 0; a value of 0 would always veto the radar "
+            f"signal (DNI is always >= 0), effectively disabling the radar arm. "
+            f"Received: {radar_veto_dni}"
+        )
+
+    # Get radar veto cloud cover threshold (optional, default 15%)
+    # Clear-sky radar veto: the veto fires only when BOTH DNI >= radar_veto_dni AND
+    # cloud_cover < this value. Default 15% is "provably clear sky" — well below the
+    # partly-cloudy range (20-60%) and the Layer 2 MAX_CLOUD_COVER_PCT gate (80%).
+    radar_veto_cloud_str = os.getenv("RADAR_VETO_CLOUD_PCT", "15").strip()
+    try:
+        radar_veto_cloud_pct = float(radar_veto_cloud_str)
+    except ValueError as e:
+        raise ConfigurationError(
+            f"Invalid RADAR_VETO_CLOUD_PCT format: {e}. Must be a number."
+        ) from e
+    if not (0 < radar_veto_cloud_pct < 100):
+        raise ConfigurationError(
+            f"RADAR_VETO_CLOUD_PCT must be between 0 and 100 (exclusive), got: {radar_veto_cloud_pct}. "
+            f"A value of 0 would disable the veto entirely; 100 would veto even under full cloud cover."
+        )
+
+    return wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold, open_vote_threshold, radar_veto_dni, radar_veto_cloud_pct
 
 
 def load_telegram_config() -> tuple[Optional[str], Optional[str]]:
@@ -1041,6 +1091,8 @@ def evaluate_rain_gate(
     rain_probability_threshold: int = 20,
     lat: Optional[float] = None,
     lon: Optional[float] = None,
+    radar_veto_dni: float = 650.0,
+    radar_veto_cloud_pct: float = 15.0,
 ) -> bool:
     """
     Evaluate whether it is safe (no rain) based on multiple signals.
@@ -1062,15 +1114,29 @@ def evaluate_rain_gate(
       5. is_raining_on_radar(lat, lon) — RainViewer NEXRAD radar tile check;
          a real-time observation independent of NWP model init lag.
          Skipped (fail-open) when lat/lon are not provided or on any fetch error.
+         Clear-sky veto: if dni >= radar_veto_dni AND cloud_cover < radar_veto_cloud_pct,
+         the radar hit is suppressed because independent measurements prove the sky is
+         clear. Real rain brings clouds (DNI drops, cloud cover rises), so this veto
+         cannot engage during genuine precipitation. Added after the 2026-06-24 incident
+         where NEXRAD clear-air-mode clutter (biological echoes, R=158,G=147,B=117,A=110)
+         closed the awning at DNI=784 W/m² and cloud_cover=3%.
 
     Args:
         weather: Weather dict from fetch_weather(); must contain 'precipitation'.
             May optionally contain 'hourly_precip_prob', 'minutely_15_precip',
-            and 'weather_code'. Missing fields are treated as rain (conservative).
+            'weather_code', 'dni', and 'cloud_cover'. Missing fields are treated
+            as rain (conservative), except dni/cloud_cover which are treated
+            conservatively for the veto (veto does not fire when missing).
         rain_probability_threshold: % threshold for ensemble precipitation
             probability (default 20 — from RAIN_PROBABILITY_THRESHOLD env var).
         lat: Latitude for radar check (optional). When None, radar check is skipped.
         lon: Longitude for radar check (optional). When None, radar check is skipped.
+        radar_veto_dni: W/m², DNI floor for the clear-sky radar veto (default 650 —
+            from RADAR_VETO_DNI_WM2 env var). When DNI >= this AND cloud_cover <
+            radar_veto_cloud_pct, a radar hit is suppressed.
+        radar_veto_cloud_pct: % total cloud cover ceiling for the clear-sky radar
+            veto (default 15 — from RADAR_VETO_CLOUD_PCT env var). Veto fires only
+            when BOTH DNI >= radar_veto_dni AND cloud_cover < this value.
 
     Returns:
         True if all signals are clear (no rain); False if any signal fires (rain).
@@ -1101,9 +1167,28 @@ def evaluate_rain_gate(
     # Signal 5: RainViewer NEXRAD radar — real-time observation independent of NWP.
     # Fail-open: is_raining_on_radar returns False on any error/timeout, so a
     # RainViewer outage cannot keep the awning closed. Skipped when lat/lon absent.
+    #
+    # Clear-sky veto: suppress the radar signal when Open-Meteo independently proves
+    # the sky is clear (dni >= radar_veto_dni AND cloud_cover < radar_veto_cloud_pct).
+    # Real rain brings clouds — DNI drops to 4-30 W/m² and cloud cover rises above
+    # 15% — so this veto cannot engage during genuine precipitation. Only clutter
+    # echoes (biological scatter, anomalous propagation, ground clutter) occur at
+    # high-DNI, low-cloud-cover conditions. Mirrors the Layer 3 DNI guard added after
+    # the 2026-05-12 incident. Added after the 2026-06-24 incident (NEXRAD clear-air-
+    # mode clutter at DNI=784 W/m², cloud_cover=3% closed the awning on a clear day).
     if lat is not None and lon is not None:
         if is_raining_on_radar(lat, lon):
-            return False
+            dni = weather.get("dni", 0.0)
+            cloud_cover = weather.get("cloud_cover", 100.0)
+            if dni >= radar_veto_dni and cloud_cover < radar_veto_cloud_pct:
+                import logging as _logging
+                _logging.getLogger(__name__).info(
+                    f"RainViewer radar hit vetoed — clear sky "
+                    f"(DNI {dni:.0f} W/m² >= {radar_veto_dni:.0f}, "
+                    f"cloud_cover {cloud_cover:.0f}% < {radar_veto_cloud_pct:.0f}%)"
+                )
+            else:
+                return False
 
     return True
 
@@ -1124,6 +1209,8 @@ def should_open_awning(
     rain_probability_threshold: int = 20,
     lat: Optional[float] = None,
     lon: Optional[float] = None,
+    radar_veto_dni: float = 650.0,
+    radar_veto_cloud_pct: float = 15.0,
 ) -> tuple[bool, str, dict]:
     """
     Determine if awning should be open based on ALL conditions.
@@ -1228,7 +1315,14 @@ def should_open_awning(
     is_sunny = sunny_model and sunny_observed and not_overcast
 
     is_calm = wind_speed < wind_threshold
-    no_rain = evaluate_rain_gate(weather, rain_probability_threshold, lat=lat, lon=lon)
+    no_rain = evaluate_rain_gate(
+        weather,
+        rain_probability_threshold,
+        lat=lat,
+        lon=lon,
+        radar_veto_dni=radar_veto_dni,
+        radar_veto_cloud_pct=radar_veto_cloud_pct,
+    )
     above_freezing = temperature > min_temperature_f
     is_day = is_daytime(current_time, sunrise, sunset)
     sun_high_enough = altitude >= altitude_threshold
@@ -1544,7 +1638,7 @@ def main() -> None:
         logger.info(f"Location: {latitude:.4f}, {longitude:.4f}")
 
         # Get thresholds
-        wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold, open_vote_threshold = get_thresholds()
+        wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold, open_vote_threshold, radar_veto_dni, radar_veto_cloud_pct = get_thresholds()
         logger.info(
             f"Thresholds: model=(GHI >= {min_ghi:.0f} W/m² OR UV >= {min_uv_index:.1f}), "
             f"consistency=(DNI >= {min_dni:.0f} W/m² OR cloud < {max_cloud_cover:.0f}%), "
@@ -1552,7 +1646,8 @@ def main() -> None:
             f"Wind < {wind_threshold} mph, Rain precip=0 AND prob < {rain_probability_threshold}%, "
             f"Temp > {min_temperature_f:.0f}°F, "
             f"Sun altitude >= {altitude_threshold}°, Sun facing window (90°-260°), "
-            f"open_vote_threshold={open_vote_threshold}"
+            f"open_vote_threshold={open_vote_threshold}, "
+            f"radar_veto=(DNI >= {radar_veto_dni:.0f} W/m² AND cloud < {radar_veto_cloud_pct:.0f}%)"
         )
 
         # Load Telegram config (optional)
@@ -1609,6 +1704,8 @@ def main() -> None:
             rain_probability_threshold,
             lat=latitude,
             lon=longitude,
+            radar_veto_dni=radar_veto_dni,
+            radar_veto_cloud_pct=radar_veto_cloud_pct,
         )
 
         # Log conditions with checkmarks/crosses

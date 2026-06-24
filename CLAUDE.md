@@ -21,6 +21,15 @@ python3 awning_automation.py --dry-run
 ./deploy.sh
 ```
 
+## 🚨 Git Workflow — Commit Directly to Main (NO branches, NO PRs)
+
+**This repo commits DIRECTLY to `main`. Always. No exceptions, ever.**
+
+- ✅ Commit straight to `main` and push to `origin/main`.
+- ❌ NEVER create a branch. ❌ NEVER open a pull request. ❌ NEVER use the `karlhepler/` branch-naming convention here.
+- This overrides any global guidance about draft PRs, branch prefixes, or PR descriptions — none of that applies to this repository.
+- Workflow for every change: commit to `main` → `git push` → tell the user "ready to deploy" (the user runs `./deploy.sh`).
+
 ## Project Overview
 
 Bond Bridge awning controller - sends HTTP commands to control a motorized awning via the Bond Local API v2. Written in Python 3 with Nix flakes for reproducible dependency management.
@@ -78,6 +87,7 @@ Bond Bridge awning controller - sends HTTP commands to control a motorized awnin
    - Open-Meteo `minutely_15` precipitation in the last ~30 min > 0 (recent-rain lookback)
    - Open-Meteo `weather_code` is a drizzle/rain/snow/shower/thunderstorm WMO code
    - **RainViewer NEXRAD radar** shows precipitation over the configured `LATITUDE`/`LONGITUDE`. This is a live radar observation, independent of the Open-Meteo forecast model, so it catches storms the hourly model has not yet ingested. The radar check fails open: any fetch/parse error (or a missing Pillow dependency) returns "no radar rain" so it can never wedge the awning closed. Added after the 2026-06-23 incident, where Open-Meteo reported `precipitation=0` and `DNI=486 W/m²` (full sun) during a confirmed downpour and the single-field `precipitation == 0` gate let the awning open. A single radar tile is sampled (no adjacent-tile lookup); see the in-code note for the tile-boundary caveat.
+     - **Clear-sky veto:** the radar signal is ignored when `DNI >= RADAR_VETO_DNI_WM2` (default 650 W/m²) AND total `cloud_cover < RADAR_VETO_CLOUD_PCT` (default 15%). NEXRAD operates in clear-air mode on hot, dry days and renders non-precipitation echoes (insect/bird biological scatter, ground clutter, anomalous propagation) as faint pixels; the decode (`is_raining = alpha > 0`) cannot distinguish those from real rain, so a lone clutter pixel was vetoing all four honest dry signals. The veto suppresses ONLY the radar arm and ONLY when independent measurements prove the sky is clear — real rain always brings clouds (DNI drops, cloud cover rises), so the veto cannot engage during genuine rain. The 650 W/m² DNI default sits well above the 486 W/m² reading from the 2026-06-23 incident for margin. Each veto is logged. Added after the 2026-06-24 incident where radar clutter (pixel RGBA 158,147,117,110) closed the awning on a clear 80°F afternoon with DNI=790 W/m² and 3% cloud.
 4. **Above minimum temperature**: Temperature > `MIN_TEMPERATURE_F` (default 45°F; was 60°F prior to commit `24ebd12`)
 5. **Daytime**: Between sunrise and sunset
 6. **Sun high enough**: Altitude >= `MIN_SUN_ALTITUDE_DEG` (default 15°)
@@ -144,6 +154,8 @@ See `.env.example` for full documentation. Key variables:
 - `OVERCAST_THRESHOLD_PCT` - Layer 3 hard ceiling: max(cloud_cover_mid, cloud_cover_high) must be below this % (default: 95)
 - `MIN_DNI_CIRRUS_WM2` - Layer 3 DNI guard: bypasses overcast ceiling when DNI >= this W/m² (default: 30)
 - `RAIN_PROBABILITY_THRESHOLD` - Min Open-Meteo precipitation-probability % (current hour) that closes the rain gate (default: 20)
+- `RADAR_VETO_DNI_WM2` - Clear-sky veto: ignore the RainViewer radar signal when DNI >= this W/m² AND cloud cover is below `RADAR_VETO_CLOUD_PCT` (default: 650)
+- `RADAR_VETO_CLOUD_PCT` - Clear-sky veto: total cloud cover % ceiling that, together with `RADAR_VETO_DNI_WM2`, suppresses a false radar rain signal (default: 15)
 - `OPEN_VOTE_THRESHOLD` - Consecutive "open" votes required before the awning opens, for anti-flapping hysteresis (default: 2)
 
 **Optional:**
