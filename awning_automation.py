@@ -427,9 +427,11 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
                 Real rain brings clouds, so these conditions cannot both hold during genuine
                 precipitation. Default 650 W/m² (safely above the 486 W/m² known-bad DNI
                 from the 2026-06-23 downpour, yet below typical clear-sky values of 790-860+).
-            radar_veto_cloud_pct: float — % total cloud cover ceiling for the clear-sky
-                radar veto; the veto only fires when BOTH DNI >= radar_veto_dni AND
-                cloud_cover < this value. Default 15% (provably clear sky).
+            radar_veto_cloud_pct: float — % rain-bearing (low/mid) cloud cover ceiling
+                for the clear-sky radar veto; the veto only fires when BOTH DNI >=
+                radar_veto_dni AND max(cloud_cover_low, cloud_cover_mid) < this value.
+                High cirrus is excluded — it does not produce rain and can push total
+                cloud cover above this threshold on provably sunny days. Default 15%.
 
     Raises:
         ConfigurationError: If threshold variables are missing or invalid
@@ -610,14 +612,16 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
         )
 
     # Get radar veto DNI threshold (optional, default 650 W/m²)
-    # Clear-sky radar veto: when DNI >= this value AND cloud_cover < radar_veto_cloud_pct,
-    # a RainViewer radar hit is suppressed. Real rain produces clouds that reduce DNI well
-    # below this level (typical rainy DNI: 4-30 W/m²). Default 650 W/m² sits safely above
-    # the 486 W/m² DNI that Open-Meteo reported during the 2026-06-23 downpour (the known-bad
-    # reading that could have incorrectly triggered the veto during genuine rain), while still
-    # engaging on real clear-sky days where DNI typically runs 790-860+ W/m².
-    # The 2026-06-24 incident: DNI=784 W/m², cloud_cover=3% while radar showed a clutter
-    # echo (biological scatter / anomalous propagation common on hot clear-air summer days).
+    # Clear-sky radar veto: when DNI >= this value AND max(cloud_cover_low, cloud_cover_mid)
+    # < radar_veto_cloud_pct, a RainViewer radar hit is suppressed. Real rain produces low/mid
+    # clouds that reduce DNI well below this level (typical rainy DNI: 4-30 W/m²).
+    # Default 650 W/m² sits safely above the 486 W/m² DNI that Open-Meteo reported during
+    # the 2026-06-23 downpour (the known-bad reading that could have incorrectly triggered
+    # the veto during genuine rain), while still engaging on real clear-sky days where DNI
+    # typically runs 790-860+ W/m². The 2026-06-24 cirrus incident: DNI=888 W/m²,
+    # cloud_cover_low=2%, cloud_cover_mid=0%, cloud_cover_high=51% (thin cirrus) while
+    # radar showed a clutter echo — total cloud cover was 22-52% but rain-bearing layer
+    # max(low, mid)=2% was well below 15%, so the veto now correctly engages.
     radar_veto_dni_str = os.getenv("RADAR_VETO_DNI_WM2", "650").strip()
     try:
         radar_veto_dni = float(radar_veto_dni_str)
@@ -634,8 +638,11 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
 
     # Get radar veto cloud cover threshold (optional, default 15%)
     # Clear-sky radar veto: the veto fires only when BOTH DNI >= radar_veto_dni AND
-    # cloud_cover < this value. Default 15% is "provably clear sky" — well below the
-    # partly-cloudy range (20-60%) and the Layer 2 MAX_CLOUD_COVER_PCT gate (80%).
+    # max(cloud_cover_low, cloud_cover_mid) < this value. Only rain-bearing (low/mid)
+    # cloud layers are checked — high cirrus does not produce rain and can push total
+    # cloud cover above 15% on a provably sunny day (2026-06-24 cirrus incident).
+    # Default 15% is "provably clear sky" — well below the partly-cloudy range
+    # (20-60%) and the Layer 2 MAX_CLOUD_COVER_PCT gate (80%).
     radar_veto_cloud_str = os.getenv("RADAR_VETO_CLOUD_PCT", "15").strip()
     try:
         radar_veto_cloud_pct = float(radar_veto_cloud_str)
@@ -1092,12 +1099,15 @@ def evaluate_rain_gate(
       5. is_raining_on_radar(lat, lon) — RainViewer NEXRAD radar tile check;
          a real-time observation independent of NWP model init lag.
          Skipped (fail-open) when lat/lon are not provided or on any fetch error.
-         Clear-sky veto: if dni >= radar_veto_dni AND cloud_cover < radar_veto_cloud_pct,
-         the radar hit is suppressed because independent measurements prove the sky is
-         clear. Real rain brings clouds (DNI drops, cloud cover rises), so this veto
-         cannot engage during genuine precipitation. Added after the 2026-06-24 incident
-         where NEXRAD clear-air-mode clutter (biological echoes, R=158,G=147,B=117,A=110)
-         closed the awning at DNI=784 W/m² and cloud_cover=3%.
+         Clear-sky veto: if dni >= radar_veto_dni AND max(cloud_cover_low, cloud_cover_mid)
+         < radar_veto_cloud_pct, the radar hit is suppressed because independent
+         measurements prove the sky is clear. Only rain-bearing (low/mid) cloud layers
+         are checked — high cirrus does not produce rain and can push total cloud cover
+         above the threshold on a sunny day. Real rain falls from low/mid clouds which
+         would push max(cloud_cover_low, cloud_cover_mid) above 15% AND collapse DNI,
+         so this veto cannot engage during genuine precipitation. Added after the
+         2026-06-24 cirrus incident (NEXRAD clutter at DNI=888 W/m², low=2%, mid=0%,
+         high=51%).
 
     Args:
         weather: Weather dict from fetch_weather(); must contain 'precipitation'.
@@ -1112,9 +1122,12 @@ def evaluate_rain_gate(
         radar_veto_dni: W/m², DNI floor for the clear-sky radar veto (default 650 —
             from RADAR_VETO_DNI_WM2 env var). When DNI >= this AND cloud_cover <
             radar_veto_cloud_pct, a radar hit is suppressed.
-        radar_veto_cloud_pct: % total cloud cover ceiling for the clear-sky radar
-            veto (default 15 — from RADAR_VETO_CLOUD_PCT env var). Veto fires only
-            when BOTH DNI >= radar_veto_dni AND cloud_cover < this value.
+        radar_veto_cloud_pct: % rain-bearing (low/mid) cloud cover ceiling for the
+            clear-sky radar veto (default 15 — from RADAR_VETO_CLOUD_PCT env var).
+            Veto fires only when BOTH DNI >= radar_veto_dni AND
+            max(cloud_cover_low, cloud_cover_mid) < this value. High cirrus is
+            excluded because it does not produce rain and can push total cloud cover
+            above the threshold on provably sunny days.
 
     Returns:
         True if all signals are clear (no rain); False if any signal fires (rain).
@@ -1147,23 +1160,30 @@ def evaluate_rain_gate(
     # RainViewer outage cannot keep the awning closed. Skipped when lat/lon absent.
     #
     # Clear-sky veto: suppress the radar signal when Open-Meteo independently proves
-    # the sky is clear (dni >= radar_veto_dni AND cloud_cover < radar_veto_cloud_pct).
-    # Real rain brings clouds — DNI drops to 4-30 W/m² and cloud cover rises above
-    # 15% — so this veto cannot engage during genuine precipitation. Only clutter
-    # echoes (biological scatter, anomalous propagation, ground clutter) occur at
-    # high-DNI, low-cloud-cover conditions. Mirrors the Layer 3 DNI guard added after
-    # the 2026-05-12 incident. Added after the 2026-06-24 incident (NEXRAD clear-air-
-    # mode clutter at DNI=784 W/m², cloud_cover=3% closed the awning on a clear day).
+    # the sky is clear (dni >= radar_veto_dni AND max(cloud_cover_low, cloud_cover_mid)
+    # < radar_veto_cloud_pct). Only rain-bearing (low/mid) cloud layers are checked —
+    # high cirrus does NOT produce rain and can push TOTAL cloud cover above 15% on a
+    # provably sunny day (2026-06-24 incident: DNI=888, low=2%, mid=0%, high=51%).
+    # Real rain falls from low/mid clouds (nimbostratus, stratus, cumulonimbus) which
+    # would push max(cloud_cover_low, cloud_cover_mid) well above 15% AND collapse DNI
+    # far below 650, so this veto cannot engage during genuine precipitation.
+    # Only clutter echoes (biological scatter, anomalous propagation, ground clutter)
+    # occur at high-DNI, low-rain-bearing-cloud conditions.
+    # Added after the 2026-06-24 cirrus incident where NEXRAD clear-air-mode clutter
+    # closed the awning on a sunny afternoon with DNI=888 W/m², low=2%, mid=0%, high=51%.
     if lat is not None and lon is not None:
         if is_raining_on_radar(lat, lon):
             dni = weather.get("dni", 0.0)
-            cloud_cover = weather.get("cloud_cover", 100.0)
-            if dni >= radar_veto_dni and cloud_cover < radar_veto_cloud_pct:
+            cloud_cover_low = weather.get("cloud_cover_low", 100.0)
+            cloud_cover_mid = weather.get("cloud_cover_mid", 100.0)
+            rain_bearing_cloud = max(cloud_cover_low, cloud_cover_mid)
+            if dni >= radar_veto_dni and rain_bearing_cloud < radar_veto_cloud_pct:
                 import logging as _logging
                 _logging.getLogger(__name__).info(
                     f"RainViewer radar hit vetoed — clear sky "
                     f"(DNI {dni:.0f} W/m² >= {radar_veto_dni:.0f}, "
-                    f"cloud_cover {cloud_cover:.0f}% < {radar_veto_cloud_pct:.0f}%)"
+                    f"max(cloud_low={cloud_cover_low:.0f}%, cloud_mid={cloud_cover_mid:.0f}%)"
+                    f"={rain_bearing_cloud:.0f}% < {radar_veto_cloud_pct:.0f}%)"
                 )
             else:
                 return False

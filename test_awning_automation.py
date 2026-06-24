@@ -1675,12 +1675,13 @@ class TestRadarGate(unittest.TestCase):
         )
 
     # ------------------------------------------------------------------
-    # RV-veto-3 — Over-suppression guard: radar fires + cloud HIGH → veto does NOT fire
-    # Even if DNI is high, if cloud_cover is at or above the veto threshold (e.g. 20%),
-    # the veto must NOT suppress the radar signal — gate closes.
+    # RV-veto-3 — Over-suppression guard: radar fires + rain-bearing cloud HIGH → veto does NOT fire
+    # Even if DNI is high, if max(cloud_cover_low, cloud_cover_mid) is at or above the
+    # veto threshold (e.g. 20%), the veto must NOT suppress the radar signal — gate closes.
+    # Note: total cloud_cover is no longer the check — only rain-bearing (low/mid) layers matter.
     # ------------------------------------------------------------------
     def test_RV_veto3_high_cloud_veto_does_not_fire(self):
-        """RV-veto-3: radar fires + cloud_cover high (20%) → veto does not suppress → gate closes."""
+        """RV-veto-3: radar fires + rain-bearing cloud_cover_low=20% → veto does not suppress → gate closes."""
         from unittest.mock import patch
         from awning_automation import evaluate_rain_gate
 
@@ -1691,8 +1692,10 @@ class TestRadarGate(unittest.TestCase):
             hourly_precip_prob=0,
             minutely_15_precip=[],
             weather_code=0,
-            dni=500.0,         # high DNI — qualifies for veto threshold
-            cloud_cover=20.0,  # cloud_cover >= 15% — veto does not apply
+            dni=500.0,           # high DNI — qualifies for veto DNI arm
+            cloud_cover=20.0,
+            cloud_cover_low=20.0,  # rain-bearing low cloud >= 15% — veto does not apply
+            cloud_cover_mid=0.0,
         )
 
         with patch("awning_automation.requests.get", self._mock_requests(self._META_JSON, png_bytes)):
@@ -1707,7 +1710,7 @@ class TestRadarGate(unittest.TestCase):
 
         self.assertFalse(
             gate_result,
-            "evaluate_rain_gate must return False (rain) when radar fires and cloud_cover >= veto threshold",
+            "evaluate_rain_gate must return False (rain) when radar fires and max(cloud_low=20%, cloud_mid=0%)=20% >= veto threshold",
         )
 
     # ------------------------------------------------------------------
@@ -1773,6 +1776,135 @@ class TestRadarGate(unittest.TestCase):
         self.assertFalse(
             gate_result,
             "evaluate_rain_gate must return False when rain probability >= threshold, even if clear-sky veto conditions hold",
+        )
+
+    # ------------------------------------------------------------------
+    # RV-cirrus-1 — Regression for 2026-06-24 CIRRUS incident:
+    # Today's failure: DNI=888, cloud_cover_low=2, cloud_cover_mid=0, cloud_cover_high=51.
+    # Total cloud cover was 22-52% (cirrus pushed it up), which defeated the OLD veto
+    # (which checked TOTAL cloud_cover < 15%). The awning was incorrectly closed.
+    #
+    # NEW veto checks max(cloud_cover_low, cloud_cover_mid) < 15% (rain-bearing layers only):
+    # max(2, 0) = 2% < 15% AND DNI=888 >= 650 → veto ENGAGES → radar hit suppressed → gate open.
+    # ------------------------------------------------------------------
+    def test_RV_cirrus1_cirrus_high_cloud_veto_engages_opens_awning(self):
+        """RV-cirrus-1 CIRRUS regression: DNI=888, low=2%, mid=0%, high=51% → rain-bearing veto engages → gate open."""
+        from unittest.mock import patch
+        from awning_automation import evaluate_rain_gate
+
+        # Clutter pixel with alpha > 0 (same as the brownish-gray biological echo from
+        # the 2026-06-24 incident — RGBA 158,147,117,110)
+        png_bytes = self._make_png_bytes(r=158, g=147, b=117, a=110)
+
+        # Reproduce today's failure exactly: DNI=888, thin cirrus (high=51%) but
+        # rain-bearing layers near-zero (low=2%, mid=0%)
+        w = _weather(
+            precipitation=0.0,
+            hourly_precip_prob=0,
+            minutely_15_precip=[],
+            weather_code=0,
+            dni=888.0,
+            cloud_cover=22.0,       # total cloud cover — 22% (cirrus inflates this)
+            cloud_cover_low=2.0,    # rain-bearing: near-zero
+            cloud_cover_mid=0.0,    # rain-bearing: zero
+            cloud_cover_high=51.0,  # thin cirrus — NOT rain-bearing
+        )
+
+        with patch("awning_automation.requests.get", self._mock_requests(self._META_JSON, png_bytes)):
+            gate_result = evaluate_rain_gate(
+                w,
+                rain_probability_threshold=20,
+                lat=35.778,
+                lon=-78.838,
+                radar_veto_dni=650.0,
+                radar_veto_cloud_pct=15.0,
+            )
+
+        self.assertTrue(
+            gate_result,
+            "evaluate_rain_gate must return True (no rain) when radar fires but rain-bearing "
+            "cirrus veto applies: DNI=888 >= 650 AND max(cloud_low=2%, cloud_mid=0%)=2% < 15%. "
+            "High cirrus (51%) must NOT block the veto.",
+        )
+
+    # ------------------------------------------------------------------
+    # RV-cirrus-2 — Safety guard: rain-bearing low cloud defeats the veto
+    # Even with very high DNI, if cloud_cover_low or cloud_cover_mid is elevated
+    # (indicating actual rain-producing clouds), the veto must NOT engage and
+    # the radar rain signal must close the gate.
+    # ------------------------------------------------------------------
+    def test_RV_cirrus2_rain_bearing_low_cloud_defeats_veto(self):
+        """RV-cirrus-2 CIRRUS safety guard: cloud_cover_low=40% → max(low,mid)=40% >= 15% → veto does NOT engage → gate closes."""
+        from unittest.mock import patch
+        from awning_automation import evaluate_rain_gate
+
+        png_bytes = self._make_png_bytes(r=0, g=100, b=200, a=200)  # precipitation pixel
+
+        w = _weather(
+            precipitation=0.0,
+            hourly_precip_prob=0,
+            minutely_15_precip=[],
+            weather_code=0,
+            dni=888.0,           # DNI is high (would qualify for DNI arm of veto)
+            cloud_cover=50.0,
+            cloud_cover_low=40.0,   # rain-bearing layer elevated — real clouds present
+            cloud_cover_mid=0.0,
+            cloud_cover_high=10.0,
+        )
+
+        with patch("awning_automation.requests.get", self._mock_requests(self._META_JSON, png_bytes)):
+            gate_result = evaluate_rain_gate(
+                w,
+                rain_probability_threshold=20,
+                lat=35.778,
+                lon=-78.838,
+                radar_veto_dni=650.0,
+                radar_veto_cloud_pct=15.0,
+            )
+
+        self.assertFalse(
+            gate_result,
+            "evaluate_rain_gate must return False (rain) when cloud_cover_low=40% means "
+            "max(cloud_low=40%, cloud_mid=0%)=40% >= 15% — rain-bearing clouds present, veto must NOT fire.",
+        )
+
+    # ------------------------------------------------------------------
+    # RV-cirrus-3 — Safety guard: rain-bearing mid cloud defeats the veto
+    # Same as RV-cirrus-2 but mid layer is elevated instead of low.
+    # ------------------------------------------------------------------
+    def test_RV_cirrus3_rain_bearing_mid_cloud_defeats_veto(self):
+        """RV-cirrus-3 CIRRUS safety guard: cloud_cover_mid=40% → max(low,mid)=40% >= 15% → veto does NOT engage → gate closes."""
+        from unittest.mock import patch
+        from awning_automation import evaluate_rain_gate
+
+        png_bytes = self._make_png_bytes(r=0, g=100, b=200, a=200)  # precipitation pixel
+
+        w = _weather(
+            precipitation=0.0,
+            hourly_precip_prob=0,
+            minutely_15_precip=[],
+            weather_code=0,
+            dni=888.0,
+            cloud_cover=50.0,
+            cloud_cover_low=0.0,
+            cloud_cover_mid=40.0,   # rain-bearing layer elevated — altostratus/altocumulus
+            cloud_cover_high=10.0,
+        )
+
+        with patch("awning_automation.requests.get", self._mock_requests(self._META_JSON, png_bytes)):
+            gate_result = evaluate_rain_gate(
+                w,
+                rain_probability_threshold=20,
+                lat=35.778,
+                lon=-78.838,
+                radar_veto_dni=650.0,
+                radar_veto_cloud_pct=15.0,
+            )
+
+        self.assertFalse(
+            gate_result,
+            "evaluate_rain_gate must return False (rain) when cloud_cover_mid=40% means "
+            "max(cloud_low=0%, cloud_mid=40%)=40% >= 15% — rain-bearing clouds present, veto must NOT fire.",
         )
 
 
