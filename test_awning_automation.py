@@ -89,7 +89,7 @@ _DAYTIME = datetime(2026, 4, 17, 13, 0, 0, tzinfo=timezone.utc)
 # Import functions under test
 # ---------------------------------------------------------------------------
 import awning_automation
-from awning_automation import should_open_awning, ConfigurationError, get_thresholds, WeatherAPIError, fetch_weather, evaluate_rain_gate, apply_hysteresis, read_vote_state, write_vote_state, get_vote_state_path
+from awning_automation import should_open_awning, ConfigurationError, get_thresholds, WeatherAPIError, fetch_weather, evaluate_rain_gate
 
 
 class TestShouldOpenAwningOrGate(unittest.TestCase):
@@ -828,14 +828,14 @@ class TestGetThresholdsMinTemperatureFValidation(unittest.TestCase):
         """MIN_TEMPERATURE_F=-50 is at the lower bound → no error."""
         env = {**self._REQUIRED_ENV, "MIN_TEMPERATURE_F": "-50"}
         with unittest.mock.patch.dict(os.environ, env):
-            _, _, _, _, _, _, min_temperature_f, _, _, _, _, _, _ = get_thresholds()
+            _, _, _, _, _, _, min_temperature_f, _, _, _, _, _ = get_thresholds()
             self.assertEqual(min_temperature_f, -50.0)
 
     def test_min_temperature_f_at_upper_bound_is_valid(self):
         """MIN_TEMPERATURE_F=120 is at the upper bound → no error."""
         env = {**self._REQUIRED_ENV, "MIN_TEMPERATURE_F": "120"}
         with unittest.mock.patch.dict(os.environ, env):
-            _, _, _, _, _, _, min_temperature_f, _, _, _, _, _, _ = get_thresholds()
+            _, _, _, _, _, _, min_temperature_f, _, _, _, _, _ = get_thresholds()
             self.assertEqual(min_temperature_f, 120.0)
 
 
@@ -986,7 +986,7 @@ class TestWeatherRetryBehavior(unittest.TestCase):
         with patch.object(sys, "argv", ["awning_automation.py"]):
             with patch.object(awning_automation, "setup_logging", return_value=mock_log_path):
                 with patch.object(awning_automation, "load_location_config", return_value=(37.7, -122.4)):
-                    with patch.object(awning_automation, "get_thresholds", return_value=(15, 20, 400, 4, 50, 80, 60, 95, 30, 20, 2, 400.0, 15.0)):
+                    with patch.object(awning_automation, "get_thresholds", return_value=(15, 20, 400, 4, 50, 80, 60, 95, 30, 20, 400.0, 15.0)):
                         with patch.object(awning_automation, "load_telegram_config", return_value=("fake_token", "fake_chat")):
                             with patch.object(
                                 awning_automation,
@@ -1776,103 +1776,71 @@ class TestRadarGate(unittest.TestCase):
         )
 
 
-class TestAntiFlappingHysteresis(unittest.TestCase):
+class TestImmediateOpenClose(unittest.TestCase):
     """
-    Tests for the anti-flapping hysteresis layer (H-1 through H-8).
+    Tests confirming that the automation acts immediately on current conditions.
 
-    Covers:
-      H-1: First open vote → action=hold, counter=1
-      H-2: Second open vote hits threshold=2 → action=open, counter=2
-      H-3: Close vote resets counter immediately → action=close, counter=0
-      H-4: Consecutive closes don't accumulate negative → action=close, counter=0
-      H-5: threshold=1 disables hysteresis (immediate open) → action=open, counter=1
-      H-6: State file missing → read_vote_state returns 0 (safe default)
-      H-7: State file corrupt → read_vote_state returns 0 (safe default)
-      H-8: write_vote_state + read_vote_state round-trip → persists count correctly
+    No vote debounce, no state file. When all conditions are met, the awning
+    opens on a single run. When any condition fails, the awning closes on that run.
     """
 
     # ------------------------------------------------------------------
-    # H-1 — First open vote: action=hold, counter=1
+    # I-1 — All conditions met: should_open_awning returns True immediately
+    # No threshold, no vote counting. A single run with all conditions met
+    # must produce should_open=True so main() opens the awning right away.
     # ------------------------------------------------------------------
-    def test_H1_first_open_vote_holds(self):
-        """H-1: First open vote (current_votes=0, threshold=2) → hold, new_count=1."""
-        action, new_count = apply_hysteresis(should_open=True, current_votes=0, threshold=2)
-        self.assertEqual(action, "hold")
-        self.assertEqual(new_count, 1)
+    def test_I1_all_conditions_met_opens_immediately(self):
+        """I-1: All 7 conditions met on a single run → should_open=True immediately."""
+        should_open, reason, conditions = should_open_awning(
+            weather=_weather(
+                shortwave_radiation=700.0,
+                uv_index=7.0,
+                dni=450.0,
+                cloud_cover=20.0,
+                wind_speed=5.0,
+                precipitation=0.0,
+                temperature=65.0,
+                weather_code=0,
+                hourly_precip_prob=0,
+                minutely_15_precip=[],
+            ),
+            sun_position=_sun(azimuth=150.0, altitude=35.0),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        self.assertTrue(
+            should_open,
+            f"Expected should_open=True (immediate open) on first run when all conditions met. "
+            f"reason={reason!r}",
+        )
+        self.assertTrue(all(conditions.values()), f"All conditions must be True. Got: {conditions!r}")
 
     # ------------------------------------------------------------------
-    # H-2 — Second open vote hits threshold: action=open, counter=2
+    # I-2 — Close condition: should_open_awning returns False immediately
+    # When any condition fails (here: rain), the function returns False so
+    # main() closes the awning on that single run.
     # ------------------------------------------------------------------
-    def test_H2_second_open_vote_opens(self):
-        """H-2: Second open vote (current_votes=1, threshold=2) → open, new_count=2."""
-        action, new_count = apply_hysteresis(should_open=True, current_votes=1, threshold=2)
-        self.assertEqual(action, "open")
-        self.assertEqual(new_count, 2)
-
-    # ------------------------------------------------------------------
-    # H-3 — Close vote resets counter immediately
-    # ------------------------------------------------------------------
-    def test_H3_close_vote_resets_counter(self):
-        """H-3: Close vote with current_votes=1 → close immediately, new_count=0."""
-        action, new_count = apply_hysteresis(should_open=False, current_votes=1, threshold=2)
-        self.assertEqual(action, "close")
-        self.assertEqual(new_count, 0)
-
-    # ------------------------------------------------------------------
-    # H-4 — Consecutive closes don't accumulate negative
-    # ------------------------------------------------------------------
-    def test_H4_repeated_close_stays_at_zero(self):
-        """H-4: Close vote with current_votes=0 → close, new_count stays 0 (not negative)."""
-        action, new_count = apply_hysteresis(should_open=False, current_votes=0, threshold=2)
-        self.assertEqual(action, "close")
-        self.assertEqual(new_count, 0)
-
-    # ------------------------------------------------------------------
-    # H-5 — threshold=1 disables hysteresis (immediate open)
-    # ------------------------------------------------------------------
-    def test_H5_threshold_one_opens_immediately(self):
-        """H-5: threshold=1 means first open vote triggers open immediately."""
-        action, new_count = apply_hysteresis(should_open=True, current_votes=0, threshold=1)
-        self.assertEqual(action, "open")
-        self.assertEqual(new_count, 1)
-
-    # ------------------------------------------------------------------
-    # H-6 — State file missing: read_vote_state returns 0 (safe default)
-    # ------------------------------------------------------------------
-    def test_H6_missing_state_file_returns_zero(self):
-        """H-6: read_vote_state on non-existent path returns 0 (safe default)."""
-        import tempfile, os
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            nonexistent = Path(tmp_dir) / "does_not_exist.json"
-            result = read_vote_state(nonexistent)
-        self.assertEqual(result, 0)
-
-    # ------------------------------------------------------------------
-    # H-7 — State file corrupt: read_vote_state returns 0 (safe default)
-    # ------------------------------------------------------------------
-    def test_H7_corrupt_state_file_returns_zero(self):
-        """H-7: read_vote_state on a corrupt JSON file returns 0 (safe default)."""
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
-            fh.write("not valid json {{{{")
-            corrupt_path = Path(fh.name)
-        try:
-            result = read_vote_state(corrupt_path)
-        finally:
-            corrupt_path.unlink(missing_ok=True)
-        self.assertEqual(result, 0)
-
-    # ------------------------------------------------------------------
-    # H-8 — write_vote_state + read_vote_state round-trip
-    # ------------------------------------------------------------------
-    def test_H8_write_read_roundtrip(self):
-        """H-8: write_vote_state(path, 2) then read_vote_state(path) returns 2."""
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            state_path = get_vote_state_path(Path(tmp_dir))
-            write_vote_state(state_path, 2)
-            result = read_vote_state(state_path)
-        self.assertEqual(result, 2)
+    def test_I2_close_condition_closes_immediately(self):
+        """I-2: Rain detected on a single run → should_open=False immediately."""
+        should_open, reason, conditions = should_open_awning(
+            weather=_weather(
+                shortwave_radiation=700.0,
+                uv_index=7.0,
+                dni=450.0,
+                cloud_cover=20.0,
+                wind_speed=5.0,
+                precipitation=1.0,  # rain → no_rain=False
+                temperature=65.0,
+            ),
+            sun_position=_sun(azimuth=150.0, altitude=35.0),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        self.assertFalse(
+            should_open,
+            f"Expected should_open=False immediately when it is raining. reason={reason!r}",
+        )
+        self.assertFalse(conditions["no_rain"], "Expected no_rain=False when precipitation > 0")
 
 
 if __name__ == "__main__":

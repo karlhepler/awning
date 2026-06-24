@@ -49,12 +49,10 @@ Designed to run as a cron job or Kubernetes scheduled job.
 """
 
 import io
-import json
 import logging
 import math
 import os
 import sys
-import tempfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -389,16 +387,16 @@ def load_location_config(env_file: Optional[Path] = None) -> tuple[float, float]
     return latitude, longitude
 
 
-def get_thresholds() -> tuple[float, float, float, float, float, float, float, float, float, int, int, float, float]:
+def get_thresholds() -> tuple[float, float, float, float, float, float, float, float, float, int, float, float]:
     """
     Get weather thresholds from environment variables.
 
     Returns:
         Tuple of (wind_speed_threshold_mph, min_sun_altitude, min_ghi, min_uv_index,
                   min_dni, max_cloud_cover, min_temperature_f, overcast_threshold,
-                  min_dni_cirrus, rain_probability_threshold, open_vote_threshold,
+                  min_dni_cirrus, rain_probability_threshold,
                   radar_veto_dni, radar_veto_cloud_pct)
-        Types: (float, float, float, float, float, float, float, float, float, int, int, float, float)
+        Types: (float, float, float, float, float, float, float, float, float, int, float, float)
             wind_speed_threshold_mph: float — mph, upper wind limit to open awning
             min_sun_altitude: float — degrees above horizon, lower sun altitude limit
             min_ghi: float — W/m², minimum global horizontal irradiance (shortwave_radiation)
@@ -423,9 +421,6 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
             rain_probability_threshold: int — % ensemble precipitation probability above
                 which the rain gate closes the awning even when current precipitation = 0;
                 20% means "if 6+ of 30 ensemble members predict rain, stay closed"
-            open_vote_threshold: int — number of consecutive "open" votes required before
-                the awning actually opens; close votes are immediate (reset to 0); default 2
-                means two consecutive 15-min cron runs must agree before opening
             radar_veto_dni: float — W/m², DNI floor for the clear-sky radar veto; when
                 DNI >= this value AND cloud_cover < radar_veto_cloud_pct, a RainViewer radar
                 hit is suppressed because independent measurements prove the sky is clear.
@@ -614,23 +609,6 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
             f"RAIN_PROBABILITY_THRESHOLD must be between 0 and 100, got: {rain_probability_threshold}"
         )
 
-    # Get open-vote threshold for anti-flapping hysteresis (optional, default 2)
-    # Consecutive "open" votes required before the awning actually opens.
-    # A close vote always fires immediately (safety-critical) and resets the counter.
-    # N=2 covers one noisy blip at 15-min cadence (30-min confirmation window).
-    # N=1 disables hysteresis (every open vote triggers immediately).
-    open_vote_str = os.getenv("OPEN_VOTE_THRESHOLD", "2").strip()
-    try:
-        open_vote_threshold = int(open_vote_str)
-    except ValueError as e:
-        raise ConfigurationError(
-            f"Invalid OPEN_VOTE_THRESHOLD format: {e}. Must be an integer."
-        ) from e
-    if not (1 <= open_vote_threshold <= 10):
-        raise ConfigurationError(
-            f"OPEN_VOTE_THRESHOLD must be between 1 and 10, got: {open_vote_threshold}"
-        )
-
     # Get radar veto DNI threshold (optional, default 650 W/m²)
     # Clear-sky radar veto: when DNI >= this value AND cloud_cover < radar_veto_cloud_pct,
     # a RainViewer radar hit is suppressed. Real rain produces clouds that reduce DNI well
@@ -671,7 +649,7 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
             f"A value of 0 would disable the veto entirely; 100 would veto even under full cloud cover."
         )
 
-    return wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold, open_vote_threshold, radar_veto_dni, radar_veto_cloud_pct
+    return wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold, radar_veto_dni, radar_veto_cloud_pct
 
 
 def load_telegram_config() -> tuple[Optional[str], Optional[str]]:
@@ -1510,101 +1488,6 @@ def _format_friendly_telegram_message(
     )
 
 
-def apply_hysteresis(
-    should_open: bool,
-    current_votes: int,
-    threshold: int,
-) -> tuple[str, int]:
-    """
-    Apply asymmetric hysteresis to an open/close vote.
-
-    Close is immediate (safety-critical); open requires N consecutive votes.
-
-    Args:
-        should_open: Whether current conditions say the awning should open.
-        current_votes: Accumulated consecutive open-vote count from prior runs.
-        threshold: Number of consecutive open votes required before opening.
-
-    Returns:
-        Tuple of (action, new_vote_count) where action is 'open' | 'close' | 'hold'.
-        - 'close': should_open is False — close immediately, counter reset to 0.
-        - 'hold':  should_open is True but votes < threshold — stay closed, counter +1.
-        - 'open':  should_open is True and votes+1 >= threshold — open, counter kept.
-    """
-    if not should_open:
-        return "close", 0
-    new_votes = current_votes + 1
-    if new_votes >= threshold:
-        return "open", new_votes
-    return "hold", new_votes
-
-
-def get_vote_state_path(log_dir: Path) -> Path:
-    """
-    Return the path for the open-vote state file alongside the log directory.
-
-    Args:
-        log_dir: Directory where log files are stored.
-
-    Returns:
-        Path to awning-open-votes.json within that directory.
-    """
-    return log_dir / "awning-open-votes.json"
-
-
-def read_vote_state(state_path: Path) -> int:
-    """
-    Read the consecutive open-vote count from disk.
-
-    Returns 0 on any error (file missing, corrupt JSON, wrong schema).  The
-    safe default is "no prior open votes" — the awning stays closed on doubt.
-
-    Args:
-        state_path: Path to the vote-state JSON file.
-
-    Returns:
-        Consecutive open vote count (>= 0).
-    """
-    try:
-        data = json.loads(state_path.read_text())
-        count = int(data["consecutive_open_votes"])
-        return max(count, 0)
-    except Exception:
-        return 0
-
-
-def write_vote_state(state_path: Path, count: int) -> None:
-    """
-    Persist the consecutive open-vote count to disk atomically.
-
-    Uses a temp-file + os.replace pattern so the file is never partially
-    written (POSIX rename is atomic on the same filesystem).
-
-    Args:
-        state_path: Destination path for the vote-state JSON file.
-        count: Consecutive open-vote count to persist.
-    """
-    payload = {
-        "consecutive_open_votes": count,
-        "last_updated": datetime.now(timezone.utc).isoformat(),
-    }
-    # Write to a sibling temp file, then atomically rename into place.
-    dir_ = state_path.parent
-    dir_.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=dir_, prefix=".vote-tmp-")
-    try:
-        with os.fdopen(fd, "w") as fh:
-            json.dump(payload, fh)
-        os.replace(tmp, state_path)
-    except Exception:
-        # Clean up orphaned temp file on failure; re-raise so the caller knows.
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
 def main() -> None:
     """Main entry point for awning automation."""
     # Parse command-line arguments
@@ -1638,7 +1521,7 @@ def main() -> None:
         logger.info(f"Location: {latitude:.4f}, {longitude:.4f}")
 
         # Get thresholds
-        wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold, open_vote_threshold, radar_veto_dni, radar_veto_cloud_pct = get_thresholds()
+        wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold, radar_veto_dni, radar_veto_cloud_pct = get_thresholds()
         logger.info(
             f"Thresholds: model=(GHI >= {min_ghi:.0f} W/m² OR UV >= {min_uv_index:.1f}), "
             f"consistency=(DNI >= {min_dni:.0f} W/m² OR cloud < {max_cloud_cover:.0f}%), "
@@ -1646,7 +1529,6 @@ def main() -> None:
             f"Wind < {wind_threshold} mph, Rain precip=0 AND prob < {rain_probability_threshold}%, "
             f"Temp > {min_temperature_f:.0f}°F, "
             f"Sun altitude >= {altitude_threshold}°, Sun facing window (90°-260°), "
-            f"open_vote_threshold={open_vote_threshold}, "
             f"radar_veto=(DNI >= {radar_veto_dni:.0f} W/m² AND cloud < {radar_veto_cloud_pct:.0f}%)"
         )
 
@@ -1731,41 +1613,22 @@ def main() -> None:
             # Only check state in dry-run mode (for reporting)
             current_state = controller.get_state()
             is_open = current_state == 1
-            vote_state_path = get_vote_state_path(log_path.parent)
-            current_votes = read_vote_state(vote_state_path)
-            action, new_votes = apply_hysteresis(should_open, current_votes, open_vote_threshold)
             logger.info(f"Current awning state: {'OPEN' if is_open else 'CLOSED'}")
             logger.info(f"Would set awning to: {'OPEN' if should_open else 'CLOSED'}")
-            logger.info(
-                f"Hysteresis: vote {current_votes} → {new_votes}/{open_vote_threshold}, "
-                f"action={action} (dry-run: no state written)"
-            )
             logger.info("Dry-run complete (no action taken)")
             return
 
         # Get state before action
         state_before = controller.get_state()
 
-        # Apply anti-flapping hysteresis: close is immediate; open requires N consecutive votes
-        vote_state_path = get_vote_state_path(log_path.parent)
-        current_votes = read_vote_state(vote_state_path)
-        action, new_votes = apply_hysteresis(should_open, current_votes, open_vote_threshold)
-        write_vote_state(vote_state_path, new_votes)
-
-        if action == "close":
-            logger.info("Closing awning...")
-            controller.close()
-            logger.info("Awning set to CLOSED")
-        elif action == "open":
-            logger.info(f"Open vote {new_votes}/{open_vote_threshold} reached — opening awning...")
+        if should_open:
+            logger.info("Opening awning...")
             controller.open()
             logger.info("Awning set to OPEN")
         else:
-            # action == "hold": open vote accumulating, do not change awning state
-            logger.info(
-                f"Holding closed (open vote {new_votes}/{open_vote_threshold} — "
-                f"waiting for {open_vote_threshold - new_votes} more consecutive open vote(s))"
-            )
+            logger.info("Closing awning...")
+            controller.close()
+            logger.info("Awning set to CLOSED")
 
         # Get state after action and notify only if it changed
         state_after = controller.get_state()

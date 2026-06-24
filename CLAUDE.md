@@ -53,7 +53,6 @@ Bond Bridge awning controller - sends HTTP commands to control a motorized awnin
 - Uses Open-Meteo API (free, no API key) for weather data
 - Cross-checks live RainViewer NEXRAD radar (free, no API key) as an independent rain signal; decodes radar tiles with Pillow (PIL). The PIL import is lazy and fails open, so a missing Pillow never crashes the automation — radar simply disables and the Open-Meteo signals continue to guard.
 - Uses pvlib for solar position calculations (NREL SPA algorithm)
-- Applies anti-flapping hysteresis to the open/close decision (see § Weather Automation → Decision Logic)
 - Imports `awning_controller` for awning control
 
 **Configuration Loading:**
@@ -95,12 +94,7 @@ Bond Bridge awning controller - sends HTTP commands to control a motorized awnin
 
 If ANY condition fails, the awning closes. Fail-safe: closes awning if weather API is unavailable.
 
-**Anti-flapping hysteresis (applied to the open/close decision):**
-- The condition evaluation above produces an "open" or "close" vote each run.
-- **Close is immediate:** any "close" vote closes the awning and resets the open-vote counter to 0.
-- **Open is debounced:** opening requires `OPEN_VOTE_THRESHOLD` (default 2) consecutive "open" votes; below the threshold the awning is held closed.
-- Because each cron run is a separate process, the consecutive-vote counter persists in a state file beside the logs (`awning-open-votes.json`), written atomically.
-- This prevents the open→close→open thrashing that noisy sensor readings (e.g. swinging DNI) would otherwise cause. Added alongside the 2026-06-23 multi-signal rain work.
+**Each cron run acts immediately on the current conditions** — all conditions met opens the awning, any condition failing closes it, with no debounce or vote-counting between runs. (An earlier anti-flapping hysteresis that required two consecutive "open" votes was removed on 2026-06-24: Open-Meteo's irradiance/cloud data is hourly so it does not jitter between 15-min runs, rain-driven close is already immediate, and the RainViewer clear-sky veto removed the main flap source — so the debounce only added a ~30-minute open lag.)
 
 **Logging:**
 - Daily log rotation in `logs/` directory as `awning-YYYY-MM-DD.log`
@@ -156,7 +150,6 @@ See `.env.example` for full documentation. Key variables:
 - `RAIN_PROBABILITY_THRESHOLD` - Min Open-Meteo precipitation-probability % (current hour) that closes the rain gate (default: 20)
 - `RADAR_VETO_DNI_WM2` - Clear-sky veto: ignore the RainViewer radar signal when DNI >= this W/m² AND cloud cover is below `RADAR_VETO_CLOUD_PCT` (default: 650)
 - `RADAR_VETO_CLOUD_PCT` - Clear-sky veto: total cloud cover % ceiling that, together with `RADAR_VETO_DNI_WM2`, suppresses a false radar rain signal (default: 15)
-- `OPEN_VOTE_THRESHOLD` - Consecutive "open" votes required before the awning opens, for anti-flapping hysteresis (default: 2)
 
 **Optional:**
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` - For notifications
