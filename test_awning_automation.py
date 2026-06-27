@@ -1116,6 +1116,49 @@ class TestFetchWeatherNullCloudCoverMidHigh(unittest.TestCase):
             self.assertIn("null", str(ctx.exception).lower())
             self.assertIn("cloud_cover_high", str(ctx.exception))
 
+    # ------------------------------------------------------------------
+    # Test — Null cloud_cover_low raises WeatherAPIError (rain-gate veto input).
+    # cloud_cover_low feeds max(cloud_cover_low, cloud_cover_mid) in the
+    # provably-clear forecast veto and the radar clear-sky veto. A JSON null
+    # must raise WeatherAPIError (fail-safe close path) rather than flowing
+    # through to max(None, cloud_cover_mid) and raising a silent TypeError
+    # that bypasses the fail-safe (fail-open bug).
+    # ------------------------------------------------------------------
+    def test_null_cloud_cover_low_raises_weather_api_error(self):
+        """fetch_weather() must raise WeatherAPIError when cloud_cover_low is null."""
+        from unittest.mock import patch, MagicMock
+
+        null_response = {
+            "current": {
+                "wind_speed_10m": 5.0,
+                "precipitation": 0.0,
+                "temperature_2m": 65.0,
+                "shortwave_radiation": 500.0,
+                "uv_index": 6.0,
+                "direct_normal_irradiance": 400.0,
+                "cloud_cover": 20,
+                "cloud_cover_low": None,  # JSON null
+                "cloud_cover_mid": 5,
+                "cloud_cover_high": 5,
+                "is_day": 1,
+                "time": "2026-04-17T13:00",
+            },
+            "daily": {
+                "sunrise": ["2026-04-17T06:00"],
+                "sunset": ["2026-04-17T20:00"],
+            },
+        }
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = null_response
+        mock_response.raise_for_status.return_value = None
+
+        with patch.object(awning_automation._weather_session, "get", return_value=mock_response):
+            with self.assertRaises(WeatherAPIError) as ctx:
+                fetch_weather(37.7, -122.4)
+            self.assertIn("null", str(ctx.exception).lower())
+            self.assertIn("cloud_cover_low", str(ctx.exception))
+
 
 class TestGetThresholdsMinDniCirrusWM2Validation(unittest.TestCase):
     """Tests for MIN_DNI_CIRRUS_WM2 validation in get_thresholds()."""
@@ -1243,21 +1286,26 @@ class TestRainGate(unittest.TestCase):
         )
 
     # ------------------------------------------------------------------
-    # R-3 — Secondary signal fires while precipitation=0 → closes
-    # Models the 2026-06-23 incident: precipitation=0 but ensemble
-    # probability indicates rain is coming. The gate must close.
+    # R-3 — Secondary signal fires while precipitation=0 → closes (genuine rain scenario)
+    # Models the 2026-06-23 incident: precipitation=0 but ensemble probability
+    # indicates rain. The gate must close when rain-bearing clouds ARE present
+    # (provably-clear forecast veto does NOT engage because clouds are elevated).
     # ------------------------------------------------------------------
     def test_R3_secondary_signal_fires_while_precip_zero(self):
-        """R-3: precipitation=0 but hourly_precip_prob=30 (>= 20) → evaluate_rain_gate=False → closes."""
+        """R-3: precip=0, prob=30 >= 20, but rain-bearing clouds present → gate closes (forecast veto does not engage)."""
         w = _weather(
             precipitation=0.0,
             hourly_precip_prob=30,   # above RAIN_PROBABILITY_THRESHOLD=20
             minutely_15_precip=[],
             weather_code=0,
+            # Rain-bearing clouds present → max(cloud_low, cloud_mid) >= 15%
+            # → forecast_veto=False → Signal 2 fires normally
+            cloud_cover_low=60.0,
+            cloud_cover_mid=30.0,
         )
         self.assertFalse(
             evaluate_rain_gate(w, rain_probability_threshold=20),
-            "evaluate_rain_gate must return False when hourly_precip_prob >= threshold",
+            "evaluate_rain_gate must return False when hourly_precip_prob >= threshold and rain-bearing clouds present",
         )
 
         should_open, reason, conditions = should_open_awning(
@@ -1337,21 +1385,23 @@ class TestRainGate(unittest.TestCase):
 
     # ------------------------------------------------------------------
     # R-weather_code — WMO rain code closes gate (F-2 remedy)
-    # Exercises awning_automation.py:1086 — the `weather_code in _RAIN_WEATHER_CODES` branch.
-    # WMO code 63 = moderate rain (continuous); precipitation=0 and all other
-    # signals clear so only the weather_code signal fires.
+    # WMO code 63 = moderate rain (continuous). Rain-bearing clouds must be
+    # present for the forecast signal to fire (otherwise forecast veto suppresses it).
     # ------------------------------------------------------------------
     def test_R_rain_weather_code_closes_gate(self):
-        """weather_code=63 (moderate rain WMO) → evaluate_rain_gate=False → closes."""
+        """weather_code=63 (moderate rain WMO) + rain-bearing clouds present → evaluate_rain_gate=False → closes."""
         w = _weather(
             precipitation=0,
             hourly_precip_prob=0,
             minutely_15_precip=[],
             weather_code=63,  # WMO "moderate rain (continuous)" — in _RAIN_WEATHER_CODES
+            # Rain-bearing clouds present → forecast_veto=False → Signal 4 fires
+            cloud_cover_low=55.0,
+            cloud_cover_mid=40.0,
         )
         self.assertFalse(
             evaluate_rain_gate(w, rain_probability_threshold=20),
-            "evaluate_rain_gate must return False when weather_code is in _RAIN_WEATHER_CODES",
+            "evaluate_rain_gate must return False when weather_code is in _RAIN_WEATHER_CODES and rain-bearing clouds present",
         )
 
     # ------------------------------------------------------------------
@@ -1396,9 +1446,10 @@ class TestRainGate(unittest.TestCase):
 
     # ------------------------------------------------------------------
     # R-missing_weather_code — None weather_code treated conservatively as rain (F-6 remedy)
-    # Exercises awning_automation.py:1086 — the `weather_code is None` branch.
+    # Exercises the `weather_code is None` branch.
     # The _weather() helper defaults weather_code=0, so None is never exercised via _weather().
     # All other signals are clear; only the missing weather_code field fires.
+    # Note: None is missing data (not a forecast value), so the forecast veto does not apply.
     # ------------------------------------------------------------------
     def test_R_missing_weather_code_closes_gate(self):
         """weather_code=None (missing field) → evaluate_rain_gate=False → closes conservatively."""
@@ -1412,6 +1463,167 @@ class TestRainGate(unittest.TestCase):
         self.assertFalse(
             evaluate_rain_gate(w, rain_probability_threshold=20),
             "evaluate_rain_gate must return False when weather_code is None (missing data)",
+        )
+
+    # ------------------------------------------------------------------
+    # Inverse of regression test: actual observed precip DOES close even with
+    # clear-sky conditions (Signal 1 is observed and never suppressed).
+    # ------------------------------------------------------------------
+    def test_actual_precip_closes_even_with_clear_sky(self):
+        """Inverse: actual precip > 0 closes gate even if rain-bearing clouds are low (observed signal, never vetoed)."""
+        w = _weather(
+            precipitation=0.3,        # observed precipitation — Signal 1 fires
+            hourly_precip_prob=0,
+            minutely_15_precip=[],
+            weather_code=0,
+            cloud_cover_low=5.0,
+            cloud_cover_mid=2.0,      # max = 5% < 15% — would trigger forecast veto
+            dni=800.0,                # high DNI
+        )
+        self.assertFalse(
+            evaluate_rain_gate(w, rain_probability_threshold=20),
+            "Gate must close when actual precipitation > 0, regardless of cloud/DNI conditions.",
+        )
+
+    # ------------------------------------------------------------------
+    # Inverse: observed minutely_15 rain closes gate even with clear-sky veto active.
+    # Signal 3 is observed (actual measured precipitation), not a forecast.
+    # ------------------------------------------------------------------
+    def test_minutely15_observed_rain_closes_with_clear_sky(self):
+        """Inverse: minutely_15 actual rain (Signal 3) closes gate even when forecast veto would apply."""
+        w = _weather(
+            precipitation=0.0,
+            hourly_precip_prob=0,
+            minutely_15_precip=[0.0, 0.8, 0.2],  # actual recent rain
+            weather_code=0,
+            cloud_cover_low=8.0,
+            cloud_cover_mid=3.0,   # max = 8% < 15% — forecast veto active
+        )
+        self.assertFalse(
+            evaluate_rain_gate(w, rain_probability_threshold=20),
+            "Gate must close when minutely_15 shows actual recent rain (observed signal, never vetoed).",
+        )
+
+    # ------------------------------------------------------------------
+    # Safety mirror: genuine thunderstorm with rain-bearing clouds closes.
+    # precipitation=0 (gauge dry), prob=35 (above threshold), weather_code=95
+    # (WMO thunderstorm), cloud_cover_low=40, cloud_cover_mid=30.
+    # max(40, 30)=40 >= 15 → forecast_veto=False → Signals 2 and 4 fire.
+    # should_open=False AND conditions['no_rain'] is False.
+    # ------------------------------------------------------------------
+    def test_genuine_thunderstorm_closes_awning(self):
+        """Safety mirror: precip=0, prob=35, weather_code=95 + rain-bearing clouds → no_rain=False → awning closes."""
+        w = _weather(
+            precipitation=0,
+            hourly_precip_prob=35,   # above 20% threshold — Signal 2 fires
+            minutely_15_precip=[],
+            weather_code=95,         # WMO thunderstorm — Signal 4 fires
+            cloud_cover_low=40.0,    # rain-bearing clouds present
+            cloud_cover_mid=30.0,    # max(40, 30)=40 >= 15 → forecast_veto=False
+        )
+        should_open, reason, conditions = should_open_awning(
+            weather=w,
+            sun_position=_sun(),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        self.assertFalse(
+            conditions["no_rain"],
+            f"conditions['no_rain'] must be False when thunderstorm signals fire with rain-bearing clouds. reason={reason!r}",
+        )
+        self.assertFalse(
+            should_open,
+            f"should_open must be False for genuine thunderstorm. reason={reason!r}",
+        )
+
+    # ------------------------------------------------------------------
+    # Boundary: forecast veto does NOT engage at exactly max_rain_cloud=15.0%.
+    # The condition is strict < (less-than), so max(15.0, 0.0)=15.0 is NOT
+    # less than 15.0 → forecast_veto=False → Signal 2 (prob=30 >= 20) fires.
+    # ------------------------------------------------------------------
+    def test_veto_does_not_engage_at_threshold_cloud(self):
+        """Boundary: cloud_cover_low=15.0 → max(15.0, 0.0)=15.0 NOT < 15 → forecast veto off → gate closes."""
+        w = _weather(
+            precipitation=0,
+            hourly_precip_prob=30,   # Signal 2 would fire if veto absent
+            minutely_15_precip=[],
+            weather_code=0,
+            cloud_cover_low=15.0,    # exactly at threshold — veto does NOT engage
+            cloud_cover_mid=0.0,
+        )
+        self.assertFalse(
+            evaluate_rain_gate(w, rain_probability_threshold=20, radar_veto_cloud_pct=15.0),
+            "evaluate_rain_gate must return False when max(cloud_low=15.0, cloud_mid=0.0)=15.0 is NOT < 15.0 "
+            "(strict less-than: veto cannot engage at exactly the threshold)",
+        )
+
+    # ------------------------------------------------------------------
+    # Missing cloud fields default to 100.0 → veto cannot engage → gate closes.
+    # When cloud_cover_low and cloud_cover_mid are absent from the dict,
+    # evaluate_rain_gate defaults them to 100.0. max(100, 100)=100 >= 15
+    # → forecast_veto=False → Signal 2 (prob=30) fires → returns False.
+    # This is the conservative bias-to-close behaviour for incomplete data.
+    # ------------------------------------------------------------------
+    def test_missing_cloud_fields_veto_does_not_engage(self):
+        """Missing cloud_cover_low and cloud_cover_mid → default 100.0 → veto cannot engage → gate closes."""
+        # Build dict directly without cloud_cover_low / cloud_cover_mid keys
+        w = {
+            "wind_speed_10m": 5.0,
+            "precipitation": 0,
+            "weather_code": 0,
+            "temperature": 65.0,
+            "shortwave_radiation": 500.0,
+            "uv_index": 6.0,
+            "dni": 450.0,
+            "cloud_cover": 20.0,
+            # cloud_cover_low and cloud_cover_mid intentionally absent
+            "cloud_cover_high": 10.0,
+            "sunrise": "2026-04-17T06:00:00",
+            "sunset": "2026-04-17T20:00:00",
+            "hourly_precip_prob": 30,   # above threshold — fires if veto absent
+            "minutely_15_precip": [],
+        }
+        self.assertFalse(
+            evaluate_rain_gate(w, rain_probability_threshold=20, radar_veto_cloud_pct=15.0),
+            "evaluate_rain_gate must return False when cloud fields are absent (default 100.0 → max >= 15 → veto off → Signal 2 fires)",
+        )
+
+    # ------------------------------------------------------------------
+    # Log attribution: evaluate_rain_gate emits 'Rain signals:' on every call,
+    # and 'Forecast veto engaged' when the veto fires.
+    # ------------------------------------------------------------------
+    def test_rain_signals_log_attribution(self):
+        """evaluate_rain_gate must log 'Rain signals:' on every call and 'Forecast veto engaged' when veto fires."""
+        import logging
+
+        # Scenario that triggers the forecast veto:
+        # precip=0, prob=30 >= 20, weather_code=0, max(cloud_low=10, cloud_mid=5)=10 < 15
+        # → forecast_veto=True → Signals 2 and 4 suppressed → gate returns True
+        w = _weather(
+            precipitation=0,
+            hourly_precip_prob=30,
+            minutely_15_precip=[],
+            weather_code=0,
+            cloud_cover_low=10.0,
+            cloud_cover_mid=5.0,
+        )
+
+        with self.assertLogs("awning_automation", level="INFO") as log_ctx:
+            result = evaluate_rain_gate(w, rain_probability_threshold=20, radar_veto_cloud_pct=15.0)
+
+        # Gate should return True — forecast signals suppressed by veto
+        self.assertTrue(result, "Forecast veto scenario should leave gate open (True)")
+
+        all_messages = "\n".join(log_ctx.output)
+        self.assertIn(
+            "Rain signals:",
+            all_messages,
+            "evaluate_rain_gate must emit a 'Rain signals:' log line on every call",
+        )
+        self.assertIn(
+            "Forecast veto engaged",
+            all_messages,
+            "evaluate_rain_gate must emit 'Forecast veto engaged' when the veto fires",
         )
 
 
@@ -1747,12 +1959,13 @@ class TestRadarGate(unittest.TestCase):
         )
 
     # ------------------------------------------------------------------
-    # RV-veto-5 — Other rain signals unaffected: high rain probability closes gate regardless of veto
-    # Signal 2 (hourly_precip_prob >= threshold) must still close the gate even when the
-    # clear-sky veto conditions hold on DNI and cloud_cover.
+    # RV-veto-5 — Rain probability closes gate when rain-bearing clouds ARE present
+    # Signal 2 (hourly_precip_prob >= threshold) closes the gate when rain-bearing
+    # low/mid clouds are elevated (forecast veto does NOT engage). This confirms that
+    # the forecast veto cannot suppress a signal when actual rain conditions exist.
     # ------------------------------------------------------------------
-    def test_RV_veto5_rain_probability_signal_unaffected_by_veto(self):
-        """RV-veto-5: high rain probability closes gate even when DNI+cloud qualify for veto."""
+    def test_RV_veto5_rain_probability_closes_when_rain_bearing_clouds_present(self):
+        """RV-veto-5: high rain probability + rain-bearing clouds present → forecast veto cannot engage → gate closes."""
         from awning_automation import evaluate_rain_gate
 
         w = _weather(
@@ -1760,8 +1973,10 @@ class TestRadarGate(unittest.TestCase):
             hourly_precip_prob=30,  # >= 20% threshold — fires Signal 2
             minutely_15_precip=[],
             weather_code=0,
-            dni=784.0,
-            cloud_cover=3.0,
+            dni=200.0,
+            cloud_cover=70.0,
+            cloud_cover_low=50.0,   # rain-bearing low cloud elevated
+            cloud_cover_mid=30.0,   # rain-bearing mid cloud elevated
         )
 
         gate_result = evaluate_rain_gate(
@@ -1775,7 +1990,42 @@ class TestRadarGate(unittest.TestCase):
 
         self.assertFalse(
             gate_result,
-            "evaluate_rain_gate must return False when rain probability >= threshold, even if clear-sky veto conditions hold",
+            "evaluate_rain_gate must return False when rain probability >= threshold and "
+            "rain-bearing clouds present (max(cloud_low=50%, cloud_mid=30%)=50% >= 15% → forecast veto does not engage)",
+        )
+
+    # ------------------------------------------------------------------
+    # RV-veto-5b — Forecast veto suppresses Signal 2 under clear-sky conditions.
+    # Restores the forecast-veto-vs-Signal-2 coverage dimension: precipitation=0,
+    # prob=30 >= 20, weather_code=0, cloud_cover_low=10, cloud_cover_mid=5, dni=784.
+    # max(10, 5)=10 < 15 AND precip=0 → forecast_veto=True → Signal 2 suppressed.
+    # All other signals clear → gate returns True (no rain).
+    # ------------------------------------------------------------------
+    def test_RV_veto5_forecast_veto_suppresses_signal2_with_clear_sky(self):
+        """RV-veto-5b: prob=30 + clear sky (cloud_low=10, cloud_mid=5, precip=0) → forecast veto suppresses Signal 2 → gate open."""
+        from awning_automation import evaluate_rain_gate
+
+        w = _weather(
+            precipitation=0.0,
+            hourly_precip_prob=30,  # above threshold — would fire Signal 2 without veto
+            minutely_15_precip=[],
+            weather_code=0,
+            cloud_cover_low=10.0,   # rain-bearing: low
+            cloud_cover_mid=5.0,    # rain-bearing: low; max(10, 5)=10 < 15 → forecast_veto=True
+            dni=784.0,              # high DNI — provably clear sky
+        )
+
+        gate_result = evaluate_rain_gate(
+            w,
+            rain_probability_threshold=20,
+            radar_veto_cloud_pct=15.0,
+            # No lat/lon: radar check skipped; only forecast signals are in play
+        )
+
+        self.assertTrue(
+            gate_result,
+            "evaluate_rain_gate must return True when prob=30 fires Signal 2 but "
+            "forecast veto engages (precip=0 AND max(cloud_low=10%, cloud_mid=5%)=10% < 15%)",
         )
 
     # ------------------------------------------------------------------
@@ -1973,6 +2223,62 @@ class TestImmediateOpenClose(unittest.TestCase):
             f"Expected should_open=False immediately when it is raining. reason={reason!r}",
         )
         self.assertFalse(conditions["no_rain"], "Expected no_rain=False when precipitation > 0")
+
+
+class TestForecastVetoRegression(unittest.TestCase):
+    """
+    Regression tests for the 2026-06-27 provably-clear forecast veto.
+
+    At 11:00 the sky was nearly clear but a forecast signal closed the gate.
+    The forecast veto must suppress all NWP-only signals when actual
+    precipitation == 0 AND max(cloud_cover_low, cloud_cover_mid) < 15%.
+    """
+
+    def test_forecast_rain_with_clear_sky_does_not_close(self):
+        """
+        Regression 2026-06-27 11:00 false close.
+
+        At 11:00 the sky was nearly clear (cloud_low=10%, cloud_mid=2%, DNI=263,
+        precip=0.0 mm/h) but the rain gate flipped to 'Rain' and stayed stuck.
+        The culprit was a forecast signal (precipitation_probability or weather_code)
+        that ticked up at the hour boundary while there were no rain-bearing clouds.
+
+        The provably-clear forecast veto must suppress all forecast-only signals when
+        actual precipitation == 0 AND max(cloud_cover_low, cloud_cover_mid) < 15%.
+        Rain cannot fall from air with no low/mid clouds regardless of model forecast.
+        """
+        w = _weather(
+            precipitation=0.0,
+            hourly_precip_prob=35,    # well above 20% threshold — forecast says rain
+            minutely_15_precip=[],
+            weather_code=95,          # WMO thunderstorm code (in _RAIN_WEATHER_CODES)
+            cloud_cover_low=10.0,     # 11:00 scenario — no rain-bearing clouds
+            cloud_cover_mid=2.0,      # max(10%, 2%) = 10% < 15% → forecast_veto=True
+            dni=263.0,                # moderate DNI (11:00 AM reading)
+        )
+
+        # Direct gate check: forecast veto must suppress signals 2 and 4
+        result = evaluate_rain_gate(w, rain_probability_threshold=20)
+        assert result, (
+            "evaluate_rain_gate must return True (no rain) when actual precip=0, "
+            "sky is provably clear (max(cloud_low=10%, cloud_mid=2%)=10% < 15%), "
+            "and only forecast signals fire — provably-clear forecast veto must suppress them."
+        )
+
+        # Integration: should_open_awning must not close for rain in this scenario
+        should_open, reason, conditions = should_open_awning(
+            weather=w,
+            sun_position=_sun(),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        assert conditions["no_rain"], (
+            f"no_rain must be True: forecast signals suppressed by provably-clear veto. reason={reason!r}"
+        )
+        # The awning may close for other reasons (DNI=263 low, cloud checks) but NOT for rain.
+        assert "Raining" not in reason, (
+            f"Reason must not cite rain as a close reason. reason={reason!r}"
+        )
 
 
 if __name__ == "__main__":

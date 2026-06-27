@@ -770,6 +770,7 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
         uv_index = current["uv_index"]
         direct_normal_irradiance = current.get("direct_normal_irradiance")
         cloud_cover_val = current.get("cloud_cover")
+        cloud_cover_low_val = current.get("cloud_cover_low")
         cloud_cover_mid_val = current.get("cloud_cover_mid")
         cloud_cover_high_val = current.get("cloud_cover_high")
         if shortwave_radiation is None or uv_index is None:
@@ -783,6 +784,11 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
                 f"Weather API returned null for cross-check field(s): "
                 f"direct_normal_irradiance={direct_normal_irradiance}, cloud_cover={cloud_cover_val}. "
                 f"Cannot evaluate Layer 2/3 sunny gate without these values."
+            )
+        if cloud_cover_low_val is None:
+            raise WeatherAPIError(
+                f"Weather API returned null for cloud_cover_low. "
+                f"Cannot evaluate rain-bearing cloud cover without this value."
             )
         if cloud_cover_mid_val is None:
             raise WeatherAPIError(
@@ -1078,6 +1084,7 @@ def evaluate_rain_gate(
     lon: Optional[float] = None,
     radar_veto_dni: float = 650.0,
     radar_veto_cloud_pct: float = 15.0,
+    _attribution: Optional[list] = None,
 ) -> bool:
     """
     Evaluate whether it is safe (no rain) based on multiple signals.
@@ -1086,107 +1093,234 @@ def evaluate_rain_gate(
     Returns False (rain detected → close) if ANY signal fires.
     Treats missing/null fields conservatively as rain (bias to close).
 
-    Signals checked (OR-of-any → close):
+    Signals are divided into two categories:
+
+    OBSERVED signals (close on any positive reading; never suppressed):
       1. current.precipitation > 0 — direct current-slot precipitation
-      2. hourly.precipitation_probability >= rain_probability_threshold —
-         ensemble-based probability gate; catches rain the deterministic model
-         missed (e.g., fast convective onset after model initialization)
-      3. sum(minutely_15.precipitation[-3 slots]) > 0 — rain in the last ~30-45
-         min from the recent-history lookback window; helps when the current slot
-         just rolled over to 0 but rain was active moments earlier
-      4. current.weather_code in RAIN_WEATHER_CODES — WMO synoptic code gate;
-         a secondary cross-check derived from a different field path than precipitation
+      3. sum(minutely_15.precipitation[-3 slots]) > 0 — recent actual precipitation
+         in the last ~30-45 min from the minutely_15 lookback window
       5. is_raining_on_radar(lat, lon) — RainViewer NEXRAD radar tile check;
-         a real-time observation independent of NWP model init lag.
-         Skipped (fail-open) when lat/lon are not provided or on any fetch error.
-         Clear-sky veto: if dni >= radar_veto_dni AND max(cloud_cover_low, cloud_cover_mid)
-         < radar_veto_cloud_pct, the radar hit is suppressed because independent
-         measurements prove the sky is clear. Only rain-bearing (low/mid) cloud layers
-         are checked — high cirrus does not produce rain and can push total cloud cover
-         above the threshold on a sunny day. Real rain falls from low/mid clouds which
-         would push max(cloud_cover_low, cloud_cover_mid) above 15% AND collapse DNI,
-         so this veto cannot engage during genuine precipitation. Added after the
-         2026-06-24 cirrus incident (NEXRAD clutter at DNI=888 W/m², low=2%, mid=0%,
-         high=51%).
+         a real-time observation independent of NWP model init lag. Subject to the
+         existing clear-sky radar veto (see below).
+
+    FORECAST signals (subject to the provably-clear forecast veto):
+      2. hourly.precipitation_probability >= rain_probability_threshold —
+         ensemble-based probability from the NWP model
+      4. current.weather_code in RAIN_WEATHER_CODES — WMO synoptic code from the
+         NWP model; a secondary cross-check from a different field path
+
+    Provably-clear forecast veto (Signals 2 and 4 only):
+      When actual precipitation == 0 AND max(cloud_cover_low, cloud_cover_mid)
+      < radar_veto_cloud_pct, forecast signals are suppressed. Rain cannot fall
+      from air with no rain-bearing clouds regardless of what the NWP model
+      predicts — only observed wetness (Signals 1, 3, 5) closes in this state.
+      Real rain always produces elevated low/mid cloud cover, so this veto cannot
+      engage during genuine precipitation. Added after the 2026-06-27 incident
+      where a forecast signal (prob or weather_code) closed the awning at 11:00
+      while cloud_low=10%, cloud_mid=2%, precipitation=0.0 mm (bone dry, clear).
+
+    Clear-sky radar veto (Signal 5 only):
+      If dni >= radar_veto_dni AND max(cloud_cover_low, cloud_cover_mid)
+      < radar_veto_cloud_pct, a radar hit is suppressed because independent
+      measurements prove the sky is clear. Only rain-bearing (low/mid) cloud layers
+      are checked — high cirrus does not produce rain and can push total cloud cover
+      above the threshold on a sunny day. Real rain falls from low/mid clouds which
+      would push max(cloud_cover_low, cloud_cover_mid) above the threshold AND
+      collapse DNI, so this veto cannot engage during genuine precipitation. Added
+      after the 2026-06-24 cirrus incident (NEXRAD clutter at DNI=888 W/m², low=2%,
+      mid=0%, high=51%).
+
+    On EVERY call, logs one line prefixed 'Rain signals:' with the value or status
+    of each signal and whether the provably-clear forecast veto engaged. When the
+    gate closes, also logs which signal(s) fired and their values so the Decision
+    log message can attribute the close precisely.
 
     Args:
         weather: Weather dict from fetch_weather(); must contain 'precipitation'.
             May optionally contain 'hourly_precip_prob', 'minutely_15_precip',
-            'weather_code', 'dni', and 'cloud_cover'. Missing fields are treated
-            as rain (conservative), except dni/cloud_cover which are treated
-            conservatively for the veto (veto does not fire when missing).
+            'weather_code', 'dni', 'cloud_cover_low', 'cloud_cover_mid'. Missing
+            fields are treated as rain (conservative) except for the veto inputs.
         rain_probability_threshold: % threshold for ensemble precipitation
             probability (default 20 — from RAIN_PROBABILITY_THRESHOLD env var).
         lat: Latitude for radar check (optional). When None, radar check is skipped.
         lon: Longitude for radar check (optional). When None, radar check is skipped.
         radar_veto_dni: W/m², DNI floor for the clear-sky radar veto (default 650 —
-            from RADAR_VETO_DNI_WM2 env var). When DNI >= this AND cloud_cover <
-            radar_veto_cloud_pct, a radar hit is suppressed.
-        radar_veto_cloud_pct: % rain-bearing (low/mid) cloud cover ceiling for the
-            clear-sky radar veto (default 15 — from RADAR_VETO_CLOUD_PCT env var).
-            Veto fires only when BOTH DNI >= radar_veto_dni AND
-            max(cloud_cover_low, cloud_cover_mid) < this value. High cirrus is
-            excluded because it does not produce rain and can push total cloud cover
-            above the threshold on provably sunny days.
+            from RADAR_VETO_DNI_WM2 env var). When DNI >= this AND rain-bearing
+            cloud < radar_veto_cloud_pct, a radar hit is suppressed.
+        radar_veto_cloud_pct: % rain-bearing (low/mid) cloud cover ceiling shared
+            by both the forecast veto and the radar veto (default 15 — from
+            RADAR_VETO_CLOUD_PCT env var). Forecast veto: fires when
+            max(cloud_low, cloud_mid) < this value (rain-bearing clouds absent).
+            Radar veto: fires when BOTH DNI >= radar_veto_dni AND
+            max(cloud_low, cloud_mid) < this value.
+        _attribution: Optional list; if provided, a human-readable string describing
+            which signal(s) closed the gate is appended. Used by should_open_awning()
+            to build the Decision log message with exact signal attribution.
 
     Returns:
         True if all signals are clear (no rain); False if any signal fires (rain).
     """
-    # Signal 1: current precipitation > 0
+    # Gather all weather values up front for both logic and the diagnostic log line.
     precipitation = weather.get("precipitation")
-    if precipitation is None or precipitation > 0:
-        return False
-
-    # Signal 2: hourly ensemble precipitation probability >= threshold
-    # None means the field was missing from the API response — treat conservatively.
     hourly_precip_prob = weather.get("hourly_precip_prob")
-    if hourly_precip_prob is None or hourly_precip_prob >= rain_probability_threshold:
-        return False
-
-    # Signal 3: any precipitation in the last ~3 minutely_15 slots (past ~30-45 min)
-    # None means the block was absent — treat conservatively.
     minutely_15_precip = weather.get("minutely_15_precip")
-    if minutely_15_precip is None or any(v > 0 for v in minutely_15_precip):
-        return False
-
-    # Signal 4: WMO weather_code in rain/drizzle/snow/shower/thunderstorm set
-    # None means the field was absent — treat conservatively.
     weather_code = weather.get("weather_code")
-    if weather_code is None or weather_code in _RAIN_WEATHER_CODES:
-        return False
+    dni = weather.get("dni", 0.0)
+    cloud_cover_low = weather.get("cloud_cover_low", 100.0)
+    cloud_cover_mid = weather.get("cloud_cover_mid", 100.0)
+    rain_bearing_cloud = max(cloud_cover_low, cloud_cover_mid)
 
-    # Signal 5: RainViewer NEXRAD radar — real-time observation independent of NWP.
-    # Fail-open: is_raining_on_radar returns False on any error/timeout, so a
-    # RainViewer outage cannot keep the awning closed. Skipped when lat/lon absent.
-    #
-    # Clear-sky veto: suppress the radar signal when Open-Meteo independently proves
-    # the sky is clear (dni >= radar_veto_dni AND max(cloud_cover_low, cloud_cover_mid)
-    # < radar_veto_cloud_pct). Only rain-bearing (low/mid) cloud layers are checked —
-    # high cirrus does NOT produce rain and can push TOTAL cloud cover above 15% on a
-    # provably sunny day (2026-06-24 incident: DNI=888, low=2%, mid=0%, high=51%).
-    # Real rain falls from low/mid clouds (nimbostratus, stratus, cumulonimbus) which
-    # would push max(cloud_cover_low, cloud_cover_mid) well above 15% AND collapse DNI
-    # far below 650, so this veto cannot engage during genuine precipitation.
-    # Only clutter echoes (biological scatter, anomalous propagation, ground clutter)
-    # occur at high-DNI, low-rain-bearing-cloud conditions.
-    # Added after the 2026-06-24 cirrus incident where NEXRAD clear-air-mode clutter
-    # closed the awning on a sunny afternoon with DNI=888 W/m², low=2%, mid=0%, high=51%.
-    if lat is not None and lon is not None:
+    # Signal 1: current precipitation (OBSERVED — never suppressed by any veto).
+    # None means field missing — treat conservatively as rain.
+    sig1_fires = precipitation is None or precipitation > 0
+    precip_display = "None" if precipitation is None else f"{precipitation:.2f}"
+    sig1_str = f"precip={precip_display}mm{'(fires)' if sig1_fires else ''}"
+
+    # Provably-clear forecast veto: after Signal 1 clears (precipitation == 0),
+    # suppress FORECAST signals (2 and 4) when rain-bearing clouds are absent.
+    # Rain cannot fall from air without low/mid clouds; a forecast that says "rain
+    # likely" while there are no rain-bearing clouds is a false positive for the
+    # current observation window. Only observed wetness (Signals 1, 3, 5) closes.
+    # Condition: max(cloud_cover_low, cloud_cover_mid) < radar_veto_cloud_pct.
+    # Real rain always elevates low/mid clouds → veto cannot engage during genuine rain.
+    forecast_veto = (not sig1_fires) and (rain_bearing_cloud < radar_veto_cloud_pct)
+
+    # Signal 2: hourly precip probability (FORECAST — subject to forecast_veto).
+    # None means field missing from API — treat conservatively.
+    sig2_vetoed = False
+    if hourly_precip_prob is None:
+        sig2_fires = True
+        sig2_str = "prob=None(missing,fires)"
+    elif hourly_precip_prob >= rain_probability_threshold:
+        if forecast_veto:
+            sig2_fires = False
+            sig2_vetoed = True
+            sig2_str = (
+                f"prob={hourly_precip_prob}%(above threshold,"
+                f"VETOED:no_rain_clouds={rain_bearing_cloud:.0f}%)"
+            )
+        else:
+            sig2_fires = True
+            sig2_str = f"prob={hourly_precip_prob}%(fires)"
+    else:
+        sig2_fires = False
+        sig2_str = f"prob={hourly_precip_prob}%(clear)"
+
+    # Signal 3: minutely_15 recent precipitation (OBSERVED — never suppressed).
+    # None means block absent — treat conservatively.
+    if minutely_15_precip is None:
+        sig3_fires = True
+        sig3_str = "m15=None(missing,fires)"
+    elif any(v > 0 for v in minutely_15_precip):
+        sig3_fires = True
+        m15_total = sum(minutely_15_precip)
+        sig3_str = f"m15={m15_total:.2f}mm(fires)"
+    else:
+        sig3_fires = False
+        sig3_str = "m15=0(clear)"
+
+    # Signal 4: WMO weather_code (FORECAST — subject to forecast_veto).
+    # None means field absent — treat conservatively.
+    sig4_vetoed = False
+    if weather_code is None:
+        sig4_fires = True
+        sig4_str = "code=None(missing,fires)"
+    elif weather_code in _RAIN_WEATHER_CODES:
+        if forecast_veto:
+            sig4_fires = False
+            sig4_vetoed = True
+            sig4_str = (
+                f"code={weather_code}(rain_wmo,"
+                f"VETOED:no_rain_clouds={rain_bearing_cloud:.0f}%)"
+            )
+        else:
+            sig4_fires = True
+            sig4_str = f"code={weather_code}(rain_wmo,fires)"
+    else:
+        sig4_fires = False
+        sig4_str = f"code={weather_code}(clear)"
+
+    if sig2_vetoed or sig4_vetoed:
+        logger.info(
+            f"Forecast veto engaged — rain-bearing clouds absent "
+            f"(max(cloud_low={cloud_cover_low:.0f}%,cloud_mid={cloud_cover_mid:.0f}%)"
+            f"={rain_bearing_cloud:.0f}% < {radar_veto_cloud_pct:.0f}%): "
+            f"forecast probability and weather_code signals suppressed"
+        )
+
+    # Signal 5: RainViewer NEXRAD radar (OBSERVED — existing clear-sky radar veto).
+    # Skipped when fast-path signals 1-4 have already determined the result, to
+    # avoid a network call when the answer is already known. Fail-open: any error
+    # returns False so a RainViewer outage cannot wedge the awning closed.
+    fast_path_fires = sig1_fires or sig2_fires or sig3_fires or sig4_fires
+    sig5_fires = False
+    sig5_str = "radar=skipped"
+    radar_vetoed = False
+
+    if not fast_path_fires and lat is not None and lon is not None:
         if is_raining_on_radar(lat, lon):
-            dni = weather.get("dni", 0.0)
-            cloud_cover_low = weather.get("cloud_cover_low", 100.0)
-            cloud_cover_mid = weather.get("cloud_cover_mid", 100.0)
-            rain_bearing_cloud = max(cloud_cover_low, cloud_cover_mid)
+            # Radar clear-sky veto: BOTH DNI >= radar_veto_dni AND
+            # max(cloud_low, cloud_mid) < radar_veto_cloud_pct must hold.
+            # Rain collapses DNI and elevates low/mid cloud → both fail during
+            # genuine precipitation. Added after the 2026-06-24 clutter incident.
             if dni >= radar_veto_dni and rain_bearing_cloud < radar_veto_cloud_pct:
-                import logging as _logging
-                _logging.getLogger(__name__).info(
+                radar_vetoed = True
+                sig5_str = (
+                    f"radar=vetoed(DNI={dni:.0f}>={radar_veto_dni:.0f},"
+                    f"cloud={rain_bearing_cloud:.0f}%<{radar_veto_cloud_pct:.0f}%)"
+                )
+                logger.info(
                     f"RainViewer radar hit vetoed — clear sky "
                     f"(DNI {dni:.0f} W/m² >= {radar_veto_dni:.0f}, "
                     f"max(cloud_low={cloud_cover_low:.0f}%, cloud_mid={cloud_cover_mid:.0f}%)"
                     f"={rain_bearing_cloud:.0f}% < {radar_veto_cloud_pct:.0f}%)"
                 )
             else:
-                return False
+                sig5_fires = True
+                sig5_str = f"radar=rain(alpha>0)"
+        else:
+            sig5_str = "radar=clear"
+    elif lat is None or lon is None:
+        sig5_str = "radar=no_coords"
+    # else: fast_path_fires=True → radar=skipped (already set above)
+
+    # Log all signal values on EVERY call — single diagnostic line for attribution.
+    forecast_veto_str = (
+        f"forecast_veto=True(max_rain_cloud={rain_bearing_cloud:.0f}%<{radar_veto_cloud_pct:.0f}%)"
+        if forecast_veto else
+        f"forecast_veto=False(max_rain_cloud={rain_bearing_cloud:.0f}%)"
+    )
+    logger.info(
+        f"Rain signals: {sig1_str}, {sig2_str}, {sig3_str}, {sig4_str}, "
+        f"{sig5_str}, {forecast_veto_str}"
+    )
+
+    # Collect fired signals and build attribution string.
+    fired = []
+    if sig1_fires:
+        fired.append(f"actual_precip={precip_display}mm")
+    if sig2_fires:
+        fired.append(
+            f"prob={hourly_precip_prob if hourly_precip_prob is not None else 'None'}"
+            f"%>={rain_probability_threshold}%"
+        )
+    if sig3_fires:
+        m15_total_str = (
+            "None(missing)" if minutely_15_precip is None
+            else f"{sum(minutely_15_precip):.2f}mm"
+        )
+        fired.append(f"minutely15={m15_total_str}")
+    if sig4_fires:
+        fired.append(f"weather_code={weather_code}(WMO_rain)")
+    if sig5_fires:
+        fired.append("radar(NEXRAD)")
+
+    if fired:
+        attribution = ", ".join(fired)
+        logger.info(f"Rain gate closed by: {attribution}")
+        if _attribution is not None:
+            _attribution.append(attribution)
+        return False
 
     return True
 
@@ -1313,6 +1447,7 @@ def should_open_awning(
     is_sunny = sunny_model and sunny_observed and not_overcast
 
     is_calm = wind_speed < wind_threshold
+    rain_attribution: list = []
     no_rain = evaluate_rain_gate(
         weather,
         rain_probability_threshold,
@@ -1320,6 +1455,7 @@ def should_open_awning(
         lon=lon,
         radar_veto_dni=radar_veto_dni,
         radar_veto_cloud_pct=radar_veto_cloud_pct,
+        _attribution=rain_attribution,
     )
     above_freezing = temperature > min_temperature_f
     is_day = is_daytime(current_time, sunrise, sunset)
@@ -1396,7 +1532,8 @@ def should_open_awning(
     if not is_calm:
         reasons.append(f"Too windy ({wind_speed} >= {wind_threshold} mph)")
     if not no_rain:
-        reasons.append(f"Raining ({precipitation} mm/h)")
+        attr = rain_attribution[0] if rain_attribution else f"actual_precip={precipitation}mm"
+        reasons.append(f"Raining ({attr})")
     if not above_freezing:
         reasons.append(f"Too cold ({temperature}°F <= {min_temperature_f:.0f}°F)")
     if not is_day:
