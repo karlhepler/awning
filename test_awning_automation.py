@@ -2158,6 +2158,153 @@ class TestRadarGate(unittest.TestCase):
         )
 
 
+    # ------------------------------------------------------------------
+    # test_radar_single_clutter_pixel_does_not_close
+    # A lone non-zero-alpha pixel at the target location should NOT close the
+    # awning. NEXRAD clear-air-mode produces single-pixel clutter echoes
+    # (biological scatter, ground clutter, anomalous propagation); requiring
+    # at least _RADAR_MIN_WET_PIXELS (=2) in the 3×3 neighborhood suppresses
+    # these lone false positives.
+    # ------------------------------------------------------------------
+    def test_radar_single_clutter_pixel_does_not_close(self):
+        """Single lone clutter pixel at target location → wet_count=1 < 2 → is_raining=False."""
+        import math
+        from unittest.mock import patch
+        from awning_automation import is_raining_on_radar, evaluate_rain_gate, _RAINVIEWER_TILE_ZOOM
+        from PIL import Image as PILImage
+        import io as _io
+
+        lat, lon = 35.778, -78.838
+        z = _RAINVIEWER_TILE_ZOOM
+        lat_rad = math.radians(lat)
+        n = 2 ** z
+        x_float = (lon + 180.0) / 360.0 * n
+        y_float = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n
+        tile_x = int(x_float)
+        tile_y = int(y_float)
+        px = int((x_float - tile_x) * 256)
+        py = int((y_float - tile_y) * 256)
+
+        # Build a 256×256 PNG that is fully transparent EXCEPT for exactly one
+        # pixel at the target location — a lone clutter echo.
+        img = PILImage.new("RGBA", (256, 256), (0, 0, 0, 0))
+        img.putpixel((px, py), (158, 147, 117, 110))  # faint brownish clutter pixel
+        buf = _io.BytesIO()
+        img.save(buf, format="PNG")
+        png_bytes = buf.getvalue()
+
+        with patch("awning_automation.requests.get", self._mock_requests(self._META_JSON, png_bytes)):
+            result = is_raining_on_radar(lat, lon)
+
+        self.assertFalse(
+            result,
+            "is_raining_on_radar must return False for a single lone clutter pixel "
+            "(wet_count=1 < _RADAR_MIN_WET_PIXELS=2).",
+        )
+
+        # Integration: evaluate_rain_gate must stay open when only a lone clutter pixel fires
+        w = _weather(
+            precipitation=0.0,
+            hourly_precip_prob=0,
+            minutely_15_precip=[],
+            weather_code=0,
+        )
+        with patch("awning_automation.requests.get", self._mock_requests(self._META_JSON, png_bytes)):
+            gate_result = evaluate_rain_gate(
+                w,
+                rain_probability_threshold=20,
+                lat=lat,
+                lon=lon,
+            )
+
+        self.assertTrue(
+            gate_result,
+            "evaluate_rain_gate must return True (no rain) when radar reports only "
+            "a single lone clutter pixel in the 3×3 neighborhood.",
+        )
+
+    # ------------------------------------------------------------------
+    # test_radar_neighborhood_precipitation_closes
+    # A cluster of >=2 non-transparent pixels in the 3×3 neighborhood
+    # represents a real precipitation cell and must close the awning.
+    # Real precipitation cells light up many adjacent radar pixels, so
+    # the >=2 threshold is trivially met.
+    # ------------------------------------------------------------------
+    def test_radar_neighborhood_precipitation_closes(self):
+        """Cluster of >=2 wet pixels in 3×3 neighborhood → is_raining=True → gate closes."""
+        import math
+        from unittest.mock import patch
+        from awning_automation import is_raining_on_radar, evaluate_rain_gate, _RAINVIEWER_TILE_ZOOM
+        from PIL import Image as PILImage
+        import io as _io
+
+        lat, lon = 35.778, -78.838
+        z = _RAINVIEWER_TILE_ZOOM
+        lat_rad = math.radians(lat)
+        n = 2 ** z
+        x_float = (lon + 180.0) / 360.0 * n
+        y_float = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n
+        tile_x = int(x_float)
+        tile_y = int(y_float)
+        px = int((x_float - tile_x) * 256)
+        py = int((y_float - tile_y) * 256)
+
+        # Build a 256×256 PNG where the TARGET pixel (px, py) is fully transparent
+        # and exactly 2 NEIGHBOR pixels within the 3×3 window are wet.
+        # This makes the test genuinely differentiating:
+        #   - OLD single-pixel decode: reads alpha at (px, py) = 0 → returns False (WRONG).
+        #   - NEW neighborhood decode: counts 2 wet neighbors → returns True (CORRECT).
+        # For lat=35.778, lon=-78.838 at zoom 6, px≈252 and py≈92, both well
+        # within the tile interior. Edge guards handle the px==0 / px==255 extremes.
+        if 0 < px < 255:
+            n1_x, n1_y = px - 1, py
+            n2_x, n2_y = px + 1, py
+        elif px == 0:
+            n1_x, n1_y = px + 1, py
+            n2_x, n2_y = px + 1, py + 1 if py < 255 else py - 1
+        else:  # px == 255
+            n1_x, n1_y = px - 1, py
+            n2_x, n2_y = px - 1, py + 1 if py < 255 else py - 1
+
+        img = PILImage.new("RGBA", (256, 256), (0, 0, 0, 0))
+        img.putpixel((px, py), (0, 0, 0, 0))              # target pixel intentionally transparent
+        img.putpixel((n1_x, n1_y), (0, 100, 200, 200))   # first wet neighbor — rain return
+        img.putpixel((n2_x, n2_y), (0, 100, 200, 200))   # second wet neighbor — rain return
+        buf = _io.BytesIO()
+        img.save(buf, format="PNG")
+        png_bytes = buf.getvalue()
+
+        with patch("awning_automation.requests.get", self._mock_requests(self._META_JSON, png_bytes)):
+            result = is_raining_on_radar(lat, lon)
+
+        self.assertTrue(
+            result,
+            "is_raining_on_radar must return True when 2 adjacent radar pixels in "
+            "the 3×3 neighborhood are non-transparent (wet_count=2 >= _RADAR_MIN_WET_PIXELS=2).",
+        )
+
+        # Integration: evaluate_rain_gate must close when radar neighborhood detects rain
+        w = _weather(
+            precipitation=0.0,
+            hourly_precip_prob=0,
+            minutely_15_precip=[],
+            weather_code=0,
+        )
+        with patch("awning_automation.requests.get", self._mock_requests(self._META_JSON, png_bytes)):
+            gate_result = evaluate_rain_gate(
+                w,
+                rain_probability_threshold=20,
+                lat=lat,
+                lon=lon,
+            )
+
+        self.assertFalse(
+            gate_result,
+            "evaluate_rain_gate must return False (rain) when radar neighborhood "
+            "shows >=2 wet pixels (precipitation cell).",
+        )
+
+
 class TestImmediateOpenClose(unittest.TestCase):
     """
     Tests confirming that the automation acts immediately on current conditions.

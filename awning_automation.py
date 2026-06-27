@@ -959,6 +959,14 @@ def is_daytime(current_time: datetime, sunrise_str: str, sunset_str: str) -> boo
 _RAINVIEWER_TILE_ZOOM = 6
 _RAINVIEWER_MAPS_URL = "https://api.rainviewer.com/public/weather-maps.json"
 
+# Minimum number of non-transparent pixels required within a 3×3 neighborhood
+# around the target pixel before reporting radar rain. A lone non-zero-alpha pixel
+# is almost always NEXRAD clear-air-mode clutter (biological scatter, ground
+# clutter, anomalous propagation); real precipitation cells light up many adjacent
+# pixels and trivially exceed this threshold. Kept as an inline constant because
+# this is an internal algorithm parameter that does not need to vary by deployment.
+_RADAR_MIN_WET_PIXELS = 2
+
 
 def is_raining_on_radar(lat: float, lon: float, timeout: int = 5) -> bool:
     """
@@ -972,8 +980,9 @@ def is_raining_on_radar(lat: float, lon: float, timeout: int = 5) -> bool:
       1. Fetch the latest radar frame metadata from RainViewer.
       2. Compute the Web Mercator (XYZ) tile covering the location.
       3. Fetch the 256×256 PNG tile.
-      4. Extract the pixel for the exact lat/lon within the tile.
-      5. Return True if the pixel alpha > 0 (non-transparent = precipitation).
+      4. Sample a 3x3 neighborhood around the target pixel within the tile.
+      5. Return True if at least _RADAR_MIN_WET_PIXELS non-transparent pixels
+         are found in the neighborhood.
 
     Fail-open semantics: any exception or timeout returns False.
     A RainViewer outage cannot keep the awning permanently closed — the
@@ -1031,7 +1040,14 @@ def is_raining_on_radar(lat: float, lon: float, timeout: int = 5) -> bool:
         tile_resp = requests.get(tile_url, timeout=timeout)
         tile_resp.raise_for_status()
 
-        # Step 4: decode pixel — alpha=0 means no radar return (no precipitation)
+        # Step 4: count non-transparent pixels in a 3×3 neighborhood around the
+        # target pixel, sampled within the already-fetched tile bounds. A lone
+        # non-zero-alpha pixel is almost always NEXRAD clear-air-mode clutter
+        # (biological scatter, ground clutter, anomalous propagation); real
+        # precipitation cells light up multiple adjacent radar pixels and trivially
+        # exceed the _RADAR_MIN_WET_PIXELS threshold. When the target pixel is near
+        # a tile edge, only the portion of the 3×3 window that falls inside the tile
+        # is sampled — no adjacent-tile fetching.
         # PIL is an optional dependency; if missing, fail open (radar disabled).
         try:
             from PIL import Image
@@ -1039,16 +1055,28 @@ def is_raining_on_radar(lat: float, lon: float, timeout: int = 5) -> bool:
             logger.warning("Pillow is not installed — radar check disabled, failing open")
             return False
         img = Image.open(io.BytesIO(tile_resp.content)).convert("RGBA")
-        _r, _g, _b, alpha = img.getpixel((px, py))
-        is_raining = alpha > 0
+        img_width, img_height = img.size  # always 256×256 for this tile format
+        wet_pixel_count = 0
+        for dy in range(-1, 2):
+            for dx in range(-1, 2):
+                nx = px + dx
+                ny = py + dy
+                if 0 <= nx < img_width and 0 <= ny < img_height:
+                    _, _, _, a = img.getpixel((nx, ny))
+                    if a > 0:
+                        wet_pixel_count += 1
+        is_raining = wet_pixel_count >= _RADAR_MIN_WET_PIXELS
 
         if is_raining:
             logger.info(
-                f"RainViewer: radar return at ({lat:.3f}, {lon:.3f}) — rain detected"
+                f"RainViewer: radar return at ({lat:.3f}, {lon:.3f}) — "
+                f"{wet_pixel_count} wet pixels in 3×3 neighborhood → rain detected"
             )
         else:
             logger.debug(
-                f"RainViewer: no radar return at ({lat:.3f}, {lon:.3f})"
+                f"RainViewer: no radar return at ({lat:.3f}, {lon:.3f}) — "
+                f"{wet_pixel_count} wet pixel(s) in 3×3 neighborhood "
+                f"(need >= {_RADAR_MIN_WET_PIXELS})"
             )
 
         return is_raining
@@ -1277,7 +1305,7 @@ def evaluate_rain_gate(
                 )
             else:
                 sig5_fires = True
-                sig5_str = f"radar=rain(alpha>0)"
+                sig5_str = f"radar=rain(wet_pixels>={_RADAR_MIN_WET_PIXELS})"
         else:
             sig5_str = "radar=clear"
     elif lat is None or lon is None:
