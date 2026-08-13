@@ -396,6 +396,16 @@ def load_location_config(env_file: Optional[Path] = None) -> tuple[float, float]
     return latitude, longitude
 
 
+# Default thresholds for the three env-bound values introduced alongside the
+# 2026-08-13 direct-beam bypass and the sun-facing-window azimuth arc. Each
+# value is a single source of truth referenced by get_thresholds()'s getenv
+# fallback, is_sun_facing_window()'s signature default, and
+# should_open_awning()'s signature default — see card #97.
+DEFAULT_MIN_DNI_DIRECT_WM2 = 450.0
+DEFAULT_SUN_AZIMUTH_MIN_DEG = 60.0
+DEFAULT_SUN_AZIMUTH_MAX_DEG = 215.0
+
+
 def get_thresholds() -> tuple[float, float, float, float, float, float, float, float, float, int, float, float, float, float, float]:
     """
     Get weather thresholds from environment variables.
@@ -688,7 +698,7 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
     # DNI=498 W/m² was unambiguous direct sun, blocking the sunny gate for ~40 extra minutes.
     # Default 450 W/m² opens the 08:30 reading (498) with margin while keeping the 08:15
     # reading (445) closed — deliberately, since 08:15 is earlier than the observed need.
-    min_dni_direct_str = os.getenv("MIN_DNI_DIRECT_WM2", "450").strip()
+    min_dni_direct_str = os.getenv("MIN_DNI_DIRECT_WM2", str(DEFAULT_MIN_DNI_DIRECT_WM2)).strip()
     try:
         min_dni_direct = float(min_dni_direct_str)
     except ValueError as e:
@@ -711,7 +721,7 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
     # described a SOUTH-facing window and were wrong at both ends: the near edge
     # blocked real morning sun, and the far edge (260° = WSW, late afternoon) would
     # have opened the awning for sun that is never actually on this window.
-    sun_azimuth_min_str = os.getenv("SUN_AZIMUTH_MIN_DEG", "60").strip()
+    sun_azimuth_min_str = os.getenv("SUN_AZIMUTH_MIN_DEG", str(DEFAULT_SUN_AZIMUTH_MIN_DEG)).strip()
     try:
         sun_azimuth_min = float(sun_azimuth_min_str)
     except ValueError as e:
@@ -723,7 +733,7 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
             f"SUN_AZIMUTH_MIN_DEG must be between 0 and 360, got: {sun_azimuth_min}"
         )
 
-    sun_azimuth_max_str = os.getenv("SUN_AZIMUTH_MAX_DEG", "215").strip()
+    sun_azimuth_max_str = os.getenv("SUN_AZIMUTH_MAX_DEG", str(DEFAULT_SUN_AZIMUTH_MAX_DEG)).strip()
     try:
         sun_azimuth_max = float(sun_azimuth_max_str)
     except ValueError as e:
@@ -990,7 +1000,9 @@ def calculate_sun_position(lat: float, lon: float, dt: datetime) -> dict:
 
 
 def is_sun_facing_window(
-    azimuth: float, min_deg: float = 60.0, max_deg: float = 215.0
+    azimuth: float,
+    min_deg: float = DEFAULT_SUN_AZIMUTH_MIN_DEG,
+    max_deg: float = DEFAULT_SUN_AZIMUTH_MAX_DEG,
 ) -> bool:
     """
     Check if sun is facing the window (southeast-facing: sunrise to mid-afternoon).
@@ -1462,9 +1474,9 @@ def should_open_awning(
     lon: Optional[float] = None,
     radar_veto_dni: float = 650.0,
     radar_veto_cloud_pct: float = 15.0,
-    min_dni_direct: float = 450.0,
-    sun_azimuth_min: float = 60.0,
-    sun_azimuth_max: float = 215.0,
+    min_dni_direct: float = DEFAULT_MIN_DNI_DIRECT_WM2,
+    sun_azimuth_min: float = DEFAULT_SUN_AZIMUTH_MIN_DEG,
+    sun_azimuth_max: float = DEFAULT_SUN_AZIMUTH_MAX_DEG,
 ) -> tuple[bool, str, dict]:
     """
     Determine if awning should be open based on ALL conditions.

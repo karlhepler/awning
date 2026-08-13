@@ -6,6 +6,7 @@ mocking of external I/O is required.
 
 Run:  python3 -m unittest test_awning_automation.py -v
 """
+import inspect
 import os
 import unittest
 import unittest.mock
@@ -2677,6 +2678,97 @@ class TestForecastVetoRegression(unittest.TestCase):
         assert "Raining" not in reason, (
             f"Reason must not cite rain as a close reason. reason={reason!r}"
         )
+
+
+class TestDefaultConstantsSingleSource(unittest.TestCase):
+    """
+    Card #97: MIN_DNI_DIRECT_WM2, SUN_AZIMUTH_MIN_DEG, and SUN_AZIMUTH_MAX_DEG
+    each have exactly one authoritative default value (a module-level
+    DEFAULT_ constant), referenced everywhere the default is needed rather
+    than restated as a bare literal at each site.
+
+    These tests read the LIVE default parameter values off the function
+    signatures via inspect.signature() and assert they equal the
+    corresponding DEFAULT_ constant. This is the strongest form of the
+    guard: it would fail if a future edit changed a signature default
+    without updating the constant (drift), not merely if the two numbers
+    happen to differ today.
+    """
+
+    def test_is_sun_facing_window_defaults_track_module_constants_single_source(self):
+        sig = inspect.signature(awning_automation.is_sun_facing_window)
+        self.assertEqual(
+            sig.parameters["min_deg"].default,
+            awning_automation.DEFAULT_SUN_AZIMUTH_MIN_DEG,
+            "is_sun_facing_window's min_deg default must track "
+            "DEFAULT_SUN_AZIMUTH_MIN_DEG, not a hardcoded literal.",
+        )
+        self.assertEqual(
+            sig.parameters["max_deg"].default,
+            awning_automation.DEFAULT_SUN_AZIMUTH_MAX_DEG,
+            "is_sun_facing_window's max_deg default must track "
+            "DEFAULT_SUN_AZIMUTH_MAX_DEG, not a hardcoded literal.",
+        )
+
+    def test_should_open_awning_defaults_track_module_constants_single_source(self):
+        sig = inspect.signature(awning_automation.should_open_awning)
+        self.assertEqual(
+            sig.parameters["min_dni_direct"].default,
+            awning_automation.DEFAULT_MIN_DNI_DIRECT_WM2,
+            "should_open_awning's min_dni_direct default must track "
+            "DEFAULT_MIN_DNI_DIRECT_WM2, not a hardcoded literal.",
+        )
+        self.assertEqual(
+            sig.parameters["sun_azimuth_min"].default,
+            awning_automation.DEFAULT_SUN_AZIMUTH_MIN_DEG,
+            "should_open_awning's sun_azimuth_min default must track "
+            "DEFAULT_SUN_AZIMUTH_MIN_DEG, not a hardcoded literal.",
+        )
+        self.assertEqual(
+            sig.parameters["sun_azimuth_max"].default,
+            awning_automation.DEFAULT_SUN_AZIMUTH_MAX_DEG,
+            "should_open_awning's sun_azimuth_max default must track "
+            "DEFAULT_SUN_AZIMUTH_MAX_DEG, not a hardcoded literal.",
+        )
+
+    def test_get_thresholds_getenv_fallback_tracks_module_constants_single_source(self):
+        """
+        get_thresholds() reads its three getenv fallbacks from the same
+        DEFAULT_ constants (via str(DEFAULT_...)) rather than a restated
+        literal, so clearing the env vars must yield thresholds equal to
+        the module constants.
+        """
+        env_overrides = {
+            "WIND_SPEED_THRESHOLD_MPH": "15",
+            "MIN_SUN_ALTITUDE_DEG": "15",
+        }
+        for var in (
+            "MIN_DNI_DIRECT_WM2",
+            "SUN_AZIMUTH_MIN_DEG",
+            "SUN_AZIMUTH_MAX_DEG",
+        ):
+            env_overrides.pop(var, None)
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            env_overrides,
+            clear=False,
+        ):
+            for var in (
+                "MIN_DNI_DIRECT_WM2",
+                "SUN_AZIMUTH_MIN_DEG",
+                "SUN_AZIMUTH_MAX_DEG",
+            ):
+                os.environ.pop(var, None)
+            thresholds = get_thresholds()
+
+        min_dni_direct = thresholds[12]
+        sun_azimuth_min = thresholds[13]
+        sun_azimuth_max = thresholds[14]
+
+        self.assertEqual(min_dni_direct, awning_automation.DEFAULT_MIN_DNI_DIRECT_WM2)
+        self.assertEqual(sun_azimuth_min, awning_automation.DEFAULT_SUN_AZIMUTH_MIN_DEG)
+        self.assertEqual(sun_azimuth_max, awning_automation.DEFAULT_SUN_AZIMUTH_MAX_DEG)
 
 
 if __name__ == "__main__":
