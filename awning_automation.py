@@ -1514,6 +1514,7 @@ def should_open_awning(
     min_dni_direct: float = DEFAULT_MIN_DNI_DIRECT_WM2,
     sun_azimuth_min: float = DEFAULT_SUN_AZIMUTH_MIN_DEG,
     sun_azimuth_max: float = DEFAULT_SUN_AZIMUTH_MAX_DEG,
+    _attribution: Optional[list] = None,
 ) -> tuple[bool, str, dict]:
     """
     Determine if awning should be open based on ALL conditions.
@@ -1575,6 +1576,11 @@ def should_open_awning(
             southeast-facing window, sun from sunrise; see get_thresholds())
         sun_azimuth_max: Upper bound (degrees) of the sun-facing-window arc (default 215 —
             southeast-facing window, shaded by mid-afternoon)
+        _attribution: Optional list; if provided and the rain gate closed, the
+            attribution string naming the signal(s) that fired is appended.
+            Lets main() name the real signal in the Telegram message. It cannot
+            travel in conditions_dict, which must stay all-bool because
+            should_open is computed as all(conditions.values()).
 
     Returns:
         Tuple of (should_open, reason, conditions_dict)
@@ -1645,6 +1651,11 @@ def should_open_awning(
         radar_veto_cloud_pct=radar_veto_cloud_pct,
         _attribution=rain_attribution,
     )
+    # Forward the rain attribution to the caller so the Telegram message can name
+    # the signal that actually fired. Cannot ride in `conditions`, which must stay
+    # all-bool (should_open = all(conditions.values())).
+    if _attribution is not None and rain_attribution:
+        _attribution.append(rain_attribution[0])
     above_freezing = temperature > min_temperature_f
     is_day = is_daytime(current_time, sunrise, sunset)
     sun_high_enough = altitude >= altitude_threshold
@@ -1765,6 +1776,7 @@ def build_close_reason(
     uv_index: float,
     dni: float,
     cloud_cover: float,
+    rain_attribution: Optional[str] = None,
 ) -> str:
     """
     Build a human-readable close reason string for Telegram notifications.
@@ -1773,9 +1785,18 @@ def build_close_reason(
     from Layer 2) when the sunny condition is the blocking reason, so the message
     clearly indicates which layer failed without needing to consult the full log.
 
+    The rain branch names the signal that actually fired, via rain_attribution.
+    The rain gate has five signals and only one of them is `precipitation`, so
+    reporting the precipitation value unconditionally was actively misleading:
+    a radar-triggered or probability-triggered close truthfully reports
+    "0.0 mm/h" because no rain was measured, which reads as a contradiction.
+    Falls back to the precipitation value when no attribution is supplied.
+
     Priority order: rain > wind > cold > not sunny > nighttime > sun position.
     """
     if not conditions["no_rain"]:
+        if rain_attribution:
+            return f"🌧️ Awning closed: Rain signal — {rain_attribution}"
         precip = round(precipitation, 1)
         return f"🌧️ Awning closed: Rain starting ({precip} mm/h)"
 
@@ -1814,6 +1835,7 @@ def _format_friendly_telegram_message(
     uv_index: float,
     dni: float = 0.0,
     cloud_cover: float = 100.0,
+    rain_attribution: Optional[str] = None,
 ) -> str:
     """
     Format a human-friendly Telegram notification message.
@@ -1828,6 +1850,8 @@ def _format_friendly_telegram_message(
         uv_index: UV Index (dimensionless)
         dni: Direct normal irradiance in W/m² (Layer 2 observational gate)
         cloud_cover: Total cloud cover percentage (Layer 2 observational gate)
+        rain_attribution: Which rain signal(s) fired, e.g. "radar(NEXRAD)". Named
+            in the message so a close is attributable without reading the log.
 
     Returns:
         Friendly message string with appropriate emoji
@@ -1841,6 +1865,7 @@ def _format_friendly_telegram_message(
     return build_close_reason(
         conditions, wind_speed, precipitation, temperature,
         ghi, uv_index, dni, cloud_cover,
+        rain_attribution=rain_attribution,
     )
 
 
@@ -1928,6 +1953,7 @@ def main() -> None:
         )
 
         # Evaluate all conditions
+        rain_attribution_out: list = []
         should_open, reason, conditions = should_open_awning(
             weather,
             sun_position,
@@ -1949,7 +1975,9 @@ def main() -> None:
             min_dni_direct=min_dni_direct,
             sun_azimuth_min=sun_azimuth_min,
             sun_azimuth_max=sun_azimuth_max,
+            _attribution=rain_attribution_out,
         )
+        rain_attribution = rain_attribution_out[0] if rain_attribution_out else None
 
         # Log conditions with checkmarks/crosses
         condition_symbols = {
@@ -2004,6 +2032,7 @@ def main() -> None:
                 weather["uv_index"],
                 weather.get("dni", 0.0),
                 weather.get("cloud_cover", 100.0),
+                rain_attribution=rain_attribution,
             )
             send_telegram_notification(telegram_token, telegram_chat_id, msg)
 

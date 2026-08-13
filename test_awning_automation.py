@@ -2864,5 +2864,190 @@ class TestDefaultConstantsSingleSource(unittest.TestCase):
         self.assertEqual(sun_azimuth_max, awning_automation.DEFAULT_SUN_AZIMUTH_MAX_DEG)
 
 
+class TestCloseNotificationAttribution(unittest.TestCase):
+    """
+    The Telegram close message must name the rain signal that actually fired.
+
+    The rain gate has five signals and only one of them is `precipitation`. Reporting
+    the precipitation value unconditionally meant a radar-triggered close announced
+    "Rain starting (0.0 mm/h)" — truthful about precipitation, but a self-contradiction
+    to the reader, and giving no clue which signal to investigate. Reported repeatedly
+    by the operator; the 2026-08-13 13:15 radar-clutter close was the final instance.
+    """
+
+    _CONDITIONS_RAIN = {
+        "sunny": True,
+        "calm": True,
+        "no_rain": False,
+        "above_freezing": True,
+        "daytime": True,
+        "sun_high": True,
+        "sun_facing_window": True,
+    }
+
+    def test_close_message_names_radar_signal(self):
+        """Radar-triggered close names radar, and does NOT report a bare 0.0 mm/h."""
+        from awning_automation import build_close_reason
+
+        msg = build_close_reason(
+            self._CONDITIONS_RAIN,
+            wind_speed=9.7, precipitation=0.0, temperature=92.3,
+            ghi=910.0, uv_index=7.5, dni=789.0, cloud_cover=24.0,
+            rain_attribution="radar(NEXRAD)",
+        )
+
+        self.assertIn("radar(NEXRAD)", msg)
+        self.assertNotIn(
+            "0.0 mm/h", msg,
+            "A radar-triggered close must not report the precipitation value — "
+            "that is what made the notification read as a contradiction.",
+        )
+
+    def test_close_message_names_probability_signal(self):
+        """Forecast-probability close names the probability, not the precipitation value."""
+        from awning_automation import build_close_reason
+
+        msg = build_close_reason(
+            self._CONDITIONS_RAIN,
+            wind_speed=5.0, precipitation=0.0, temperature=70.0,
+            ghi=500.0, uv_index=5.0, dni=300.0, cloud_cover=60.0,
+            rain_attribution="prob=45%>=20%",
+        )
+
+        self.assertIn("prob=45%>=20%", msg)
+        self.assertNotIn("0.0 mm/h", msg)
+
+    def test_close_message_falls_back_without_attribution(self):
+        """No attribution supplied → original precipitation-based message is preserved."""
+        from awning_automation import build_close_reason
+
+        msg = build_close_reason(
+            self._CONDITIONS_RAIN,
+            wind_speed=5.0, precipitation=2.4, temperature=60.0,
+            ghi=200.0, uv_index=2.0, dni=50.0, cloud_cover=90.0,
+        )
+
+        self.assertIn("2.4 mm/h", msg)
+
+    def test_attribution_does_not_affect_non_rain_closes(self):
+        """A windy close is unaffected by a stale attribution value."""
+        from awning_automation import build_close_reason
+
+        conditions = dict(self._CONDITIONS_RAIN, no_rain=True, calm=False)
+        msg = build_close_reason(
+            conditions,
+            wind_speed=22.0, precipitation=0.0, temperature=70.0,
+            ghi=800.0, uv_index=6.0, dni=700.0, cloud_cover=10.0,
+            rain_attribution="radar(NEXRAD)",
+        )
+
+        self.assertIn("22 mph", msg)
+        self.assertNotIn("radar", msg)
+
+    def test_main_composition_root_sends_attributed_message(self):
+        """
+        Composition-root test: main()'s real wiring must carry the attribution
+        into the Telegram message.
+
+        The unit tests above inject rain_attribution directly, so they would stay
+        green even if main() never plumbed it through. main() is also the one path
+        a --dry-run cannot exercise: dry-run returns before the notification block.
+        This drives main() end to end on the 2026-08-13 13:15 conditions with the
+        radar forced to fire, and asserts the sent message names radar.
+        """
+        import sys
+        from unittest.mock import patch, MagicMock
+        import awning_automation
+
+        mock_controller = MagicMock()
+        mock_controller.get_state.side_effect = [1, 0]  # open before, closed after
+
+        mock_log_path = MagicMock()
+        mock_log_path.parent = MagicMock()
+
+        weather = _weather(
+            shortwave_radiation=910.0,
+            uv_index=7.5,
+            dni=789.0,
+            precipitation=0.0,
+            hourly_precip_prob=0,
+            minutely_15_precip=[],
+            weather_code=1,
+            cloud_cover=24.0,
+            cloud_cover_low=0.0,
+            cloud_cover_mid=20.0,   # over the 15% ceiling → clear-sky radar veto abstains
+            cloud_cover_high=18.0,
+            wind_speed=9.7,
+            temperature=92.3,
+            sunrise="2026-08-13T06:32:00",
+            sunset="2026-08-13T20:07:00",
+        )
+        # main() reads weather["time"]; _weather() does not supply it.
+        weather["time"] = "2026-08-13T13:15:00"
+
+        with patch.object(sys, "argv", ["awning_automation.py"]), \
+             patch.object(awning_automation, "setup_logging", return_value=mock_log_path), \
+             patch.object(awning_automation, "load_location_config", return_value=(35.778, -78.838)), \
+             patch.object(awning_automation, "get_thresholds",
+                          return_value=(15, 15, 400, 4, 50, 80, 45, 95, 30, 20, 650.0, 15.0, 450.0, 60.0, 215.0)), \
+             patch.object(awning_automation, "load_telegram_config", return_value=("fake_token", "fake_chat")), \
+             patch.object(awning_automation, "collect_weather_measurements", return_value=weather), \
+             patch.object(awning_automation, "calculate_sun_position",
+                          return_value={"azimuth": 176.6, "altitude": 68.7}), \
+             patch.object(awning_automation, "is_raining_on_radar", return_value=True), \
+             patch.object(awning_automation, "create_controller_from_env", return_value=mock_controller), \
+             patch.object(awning_automation, "send_telegram_notification") as mock_telegram:
+            awning_automation.main()
+
+        mock_controller.close.assert_called_once()
+        mock_telegram.assert_called_once()
+        sent_msg = mock_telegram.call_args[0][2]
+        self.assertIn(
+            "radar(NEXRAD)", sent_msg,
+            f"main() must plumb the rain attribution into the Telegram message; got: {sent_msg!r}",
+        )
+        self.assertNotIn("0.0 mm/h", sent_msg)
+
+    def test_should_open_awning_forwards_attribution(self):
+        """should_open_awning fills the _attribution out-param when the rain gate closes."""
+        from unittest.mock import patch
+        from awning_automation import should_open_awning
+
+        out: list = []
+        with patch("awning_automation.is_raining_on_radar", return_value=False):
+            should_open, reason, conditions = should_open_awning(
+                weather=_weather(
+                    shortwave_radiation=700.0,
+                    uv_index=7.0,
+                    precipitation=0.0,
+                    hourly_precip_prob=80,      # forecast probability fires
+                    minutely_15_precip=[],
+                    weather_code=0,
+                    dni=300.0,
+                    cloud_cover=70.0,
+                    cloud_cover_low=60.0,       # keeps the forecast veto disengaged
+                    cloud_cover_mid=40.0,
+                    wind_speed=5.0,
+                    temperature=75.0,
+                ),
+                sun_position={"azimuth": 150.0, "altitude": 50.0},
+                current_time=datetime(2026, 8, 13, 13, 15),
+                wind_threshold=15.0,
+                altitude_threshold=15.0,
+                min_ghi=400.0,
+                min_uv_index=4.0,
+                rain_probability_threshold=20,
+                _attribution=out,
+            )
+
+        self.assertFalse(should_open, "Rain gate should have closed on 80% probability")
+        self.assertTrue(out, "_attribution must be populated when the rain gate closes")
+        self.assertIn("prob=", out[0])
+        self.assertTrue(
+            all(isinstance(v, bool) for v in conditions.values()),
+            "conditions must remain all-bool — should_open is all(conditions.values())",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
