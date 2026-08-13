@@ -4,16 +4,25 @@ Awning Weather Automation
 
 Automatically opens/closes awning based on weather conditions.
 - Opens awning if ALL 7 conditions are met: sunny, calm, no rain, above 45°F,
-  daytime, sun high enough, and sun facing window (90°-260°)
+  daytime, sun high enough, and sun facing window (SUN_AZIMUTH_MIN_DEG-SUN_AZIMUTH_MAX_DEG,
+  default 60°-215° for a southeast-facing window: sun from sunrise to mid-afternoon)
 - Closes awning if ANY condition fails
 
 Sunshine detection uses a two-layer gate plus a hard cloud-cover ceiling:
 
   Layer 1 — model forecast ('do we want shade?'):
     sunny_model = (shortwave_radiation >= MIN_GHI_WM2) OR (uv_index >= MIN_UV_INDEX)
+                  OR (dni >= MIN_DNI_DIRECT_WM2)
     GHI (shortwave_radiation) comes from ECMWF. UV Index comes from GFS — a completely
     separate NWP model. Either signal alone is sufficient: the awning has two jobs —
     block UV (relevant even on cloudy-high-UV days) AND block heat/brightness.
+    The DNI (direct normal irradiance) branch bypasses GHI/UV entirely when a strong
+    direct solar beam is already confirmed: GHI is global HORIZONTAL irradiance, so
+    it is suppressed by the sin(altitude) projection factor at low sun elevations —
+    on a cloudless morning GHI can be well under 400 W/m² purely because the sun is
+    low, even though DNI (measured normal to the beam) already proves direct sun.
+    Added after the 2026-08-13 incident: at 08:30 with altitude=22.5°, GHI=277 W/m²
+    and UV=1.7 both failed while DNI=498 W/m² was unambiguous direct sun.
 
   Layer 2 — multi-variable consistency check (independent model variable cross-check):
     sunny_observed = (direct_normal_irradiance >= MIN_DNI_WM2) OR (cloud_cover < MAX_CLOUD_COVER_PCT)
@@ -387,7 +396,7 @@ def load_location_config(env_file: Optional[Path] = None) -> tuple[float, float]
     return latitude, longitude
 
 
-def get_thresholds() -> tuple[float, float, float, float, float, float, float, float, float, int, float, float]:
+def get_thresholds() -> tuple[float, float, float, float, float, float, float, float, float, int, float, float, float, float, float]:
     """
     Get weather thresholds from environment variables.
 
@@ -395,8 +404,9 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
         Tuple of (wind_speed_threshold_mph, min_sun_altitude, min_ghi, min_uv_index,
                   min_dni, max_cloud_cover, min_temperature_f, overcast_threshold,
                   min_dni_cirrus, rain_probability_threshold,
-                  radar_veto_dni, radar_veto_cloud_pct)
-        Types: (float, float, float, float, float, float, float, float, float, int, float, float)
+                  radar_veto_dni, radar_veto_cloud_pct,
+                  min_dni_direct, sun_azimuth_min, sun_azimuth_max)
+        Types: (float, float, float, float, float, float, float, float, float, int, float, float, float, float, float)
             wind_speed_threshold_mph: float — mph, upper wind limit to open awning
             min_sun_altitude: float — degrees above horizon, lower sun altitude limit
             min_ghi: float — W/m², minimum global horizontal irradiance (shortwave_radiation)
@@ -432,6 +442,19 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
                 radar_veto_dni AND max(cloud_cover_low, cloud_cover_mid) < this value.
                 High cirrus is excluded — it does not produce rain and can push total
                 cloud cover above this threshold on provably sunny days. Default 15%.
+            min_dni_direct: float — W/m², DNI floor for the Layer 1 model-gate direct-beam
+                bypass; when DNI >= this value, sunny_model is True regardless of GHI/UV.
+                GHI is suppressed at low sun elevation by the sin(altitude) projection
+                factor, but DNI (measured normal to the beam) is not. Default 450 W/m²,
+                calibrated from the 2026-08-13 incident: 08:30 DNI=498 (opens with margin),
+                08:15 DNI=445 (stays closed — intentional, 08:15 is earlier than observed).
+            sun_azimuth_min: float — degrees, lower bound of the sun-facing-window arc.
+                Default 60°. The window faces SOUTHEAST: the user has confirmed by
+                direct observation that sun is on the window from sunrise until
+                roughly mid-afternoon. 60° (ENE) admits early sunrise-adjacent sun.
+            sun_azimuth_max: float — degrees, upper bound of the sun-facing-window arc.
+                Default 215°. 215° (SSW) is where the window goes into shade in the
+                mid-afternoon (~3pm local).
 
     Raises:
         ConfigurationError: If threshold variables are missing or invalid
@@ -656,7 +679,68 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
             f"A value of 0 would disable the veto entirely; 100 would veto even under full cloud cover."
         )
 
-    return wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold, radar_veto_dni, radar_veto_cloud_pct
+    # Get minimum DNI threshold for the Layer 1 direct-beam bypass (optional, default 450 W/m²)
+    # Layer 1 model gate: when DNI >= this value, sunny_model is True regardless of
+    # GHI/UV. GHI (shortwave_radiation) is global HORIZONTAL irradiance — suppressed by
+    # the sin(altitude) projection factor at low sun elevations — but DNI is measured
+    # normal to the beam and is not suppressed by low sun angle. The 2026-08-13 incident:
+    # at 08:30, altitude=22.5°, GHI=277 W/m² and UV=1.7 both failed their thresholds while
+    # DNI=498 W/m² was unambiguous direct sun, blocking the sunny gate for ~40 extra minutes.
+    # Default 450 W/m² opens the 08:30 reading (498) with margin while keeping the 08:15
+    # reading (445) closed — deliberately, since 08:15 is earlier than the observed need.
+    min_dni_direct_str = os.getenv("MIN_DNI_DIRECT_WM2", "450").strip()
+    try:
+        min_dni_direct = float(min_dni_direct_str)
+    except ValueError as e:
+        raise ConfigurationError(
+            f"Invalid MIN_DNI_DIRECT_WM2 format: {e}. Must be a number."
+        ) from e
+    if min_dni_direct <= 0:
+        raise ConfigurationError(
+            f"MIN_DNI_DIRECT_WM2 must be > 0; a value of 0 would always trigger the "
+            f"direct-beam bypass of the sunny gate (DNI is always >= 0), effectively "
+            f"disabling it as a discriminator. Received: {min_dni_direct}"
+        )
+
+    # Get sun-facing-window azimuth arc bounds (optional, default 60°-215°)
+    # Replaces the previously hardcoded 90°-260° arc (and the short-lived 85°-260°
+    # interim). The window faces SOUTHEAST: the user has directly confirmed sun is on
+    # the window from sunrise until roughly 3pm local, and it is shaded after that.
+    # 60° (ENE) covers early sunrise-adjacent sun; 215° (SSW) is where the window
+    # goes into shade in the mid-afternoon. The old 90-260 arc (and 85-260) both
+    # described a SOUTH-facing window and were wrong at both ends: the near edge
+    # blocked real morning sun, and the far edge (260° = WSW, late afternoon) would
+    # have opened the awning for sun that is never actually on this window.
+    sun_azimuth_min_str = os.getenv("SUN_AZIMUTH_MIN_DEG", "60").strip()
+    try:
+        sun_azimuth_min = float(sun_azimuth_min_str)
+    except ValueError as e:
+        raise ConfigurationError(
+            f"Invalid SUN_AZIMUTH_MIN_DEG format: {e}. Must be a number."
+        ) from e
+    if not (0 <= sun_azimuth_min <= 360):
+        raise ConfigurationError(
+            f"SUN_AZIMUTH_MIN_DEG must be between 0 and 360, got: {sun_azimuth_min}"
+        )
+
+    sun_azimuth_max_str = os.getenv("SUN_AZIMUTH_MAX_DEG", "215").strip()
+    try:
+        sun_azimuth_max = float(sun_azimuth_max_str)
+    except ValueError as e:
+        raise ConfigurationError(
+            f"Invalid SUN_AZIMUTH_MAX_DEG format: {e}. Must be a number."
+        ) from e
+    if not (0 <= sun_azimuth_max <= 360):
+        raise ConfigurationError(
+            f"SUN_AZIMUTH_MAX_DEG must be between 0 and 360, got: {sun_azimuth_max}"
+        )
+    if sun_azimuth_min >= sun_azimuth_max:
+        raise ConfigurationError(
+            f"SUN_AZIMUTH_MIN_DEG ({sun_azimuth_min}) must be < SUN_AZIMUTH_MAX_DEG "
+            f"({sun_azimuth_max}); the sun-facing-window arc must have positive width."
+        )
+
+    return wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold, radar_veto_dni, radar_veto_cloud_pct, min_dni_direct, sun_azimuth_min, sun_azimuth_max
 
 
 def load_telegram_config() -> tuple[Optional[str], Optional[str]]:
@@ -905,17 +989,24 @@ def calculate_sun_position(lat: float, lon: float, dt: datetime) -> dict:
     }
 
 
-def is_sun_facing_window(azimuth: float) -> bool:
+def is_sun_facing_window(
+    azimuth: float, min_deg: float = 60.0, max_deg: float = 215.0
+) -> bool:
     """
-    Check if sun is facing the window (between East and Southwest).
+    Check if sun is facing the window (southeast-facing: sunrise to mid-afternoon).
 
     Args:
         azimuth: Sun azimuth in degrees (0=North, 90=East, 180=South, 270=West)
+        min_deg: Lower bound of the acceptance arc, in degrees (default 60 —
+            from SUN_AZIMUTH_MIN_DEG env var; see get_thresholds() for the
+            southeast-facing-window rationale)
+        max_deg: Upper bound of the acceptance arc, in degrees (default 215 —
+            from SUN_AZIMUTH_MAX_DEG env var)
 
     Returns:
-        True if azimuth is between 90° (East) and 260° (West)
+        True if azimuth is between min_deg and max_deg (inclusive)
     """
-    return 90 <= azimuth <= 260
+    return min_deg <= azimuth <= max_deg
 
 
 def is_daytime(current_time: datetime, sunrise_str: str, sunset_str: str) -> bool:
@@ -1371,6 +1462,9 @@ def should_open_awning(
     lon: Optional[float] = None,
     radar_veto_dni: float = 650.0,
     radar_veto_cloud_pct: float = 15.0,
+    min_dni_direct: float = 450.0,
+    sun_azimuth_min: float = 60.0,
+    sun_azimuth_max: float = 215.0,
 ) -> tuple[bool, str, dict]:
     """
     Determine if awning should be open based on ALL conditions.
@@ -1379,7 +1473,13 @@ def should_open_awning(
 
       Layer 1 — model forecast ('do we want shade?'):
         sunny_model = (shortwave_radiation >= min_ghi) OR (uv_index >= min_uv_index)
-        GHI comes from ECMWF; UV Index from GFS — cross-model OR gate.
+                      OR (dni >= min_dni_direct)
+        GHI comes from ECMWF; UV Index from GFS — cross-model OR gate. The DNI
+        direct-beam branch bypasses GHI/UV when a strong direct solar beam is
+        already confirmed — GHI is suppressed at low sun elevation by the
+        sin(altitude) projection factor, but DNI (measured normal to the beam)
+        is not. Added after the 2026-08-13 incident (08:30, altitude=22.5°,
+        GHI=277 W/m² and UV=1.7 both failed while DNI=498 W/m² was direct sun).
 
       Layer 2 — multi-variable consistency check (independent model variable cross-check):
         sunny_observed = (dni >= min_dni) OR (cloud_cover < max_cloud_cover)
@@ -1420,6 +1520,12 @@ def should_open_awning(
         overcast_threshold: Cloud cover ceiling (%) for not_overcast (Layer 3)
         min_dni_cirrus: DNI guard threshold (W/m²) for Layer 3; when DNI >= this value,
             the overcast ceiling is bypassed because direct sun is demonstrably arriving
+        min_dni_direct: DNI direct-beam bypass threshold (W/m²) for Layer 1; when
+            DNI >= this value, sunny_model is True regardless of GHI/UV (default 450)
+        sun_azimuth_min: Lower bound (degrees) of the sun-facing-window arc (default 60 —
+            southeast-facing window, sun from sunrise; see get_thresholds())
+        sun_azimuth_max: Upper bound (degrees) of the sun-facing-window arc (default 215 —
+            southeast-facing window, shaded by mid-afternoon)
 
     Returns:
         Tuple of (should_open, reason, conditions_dict)
@@ -1441,10 +1547,15 @@ def should_open_awning(
     azimuth = sun_position["azimuth"]
     altitude = sun_position["altitude"]
 
-    # Layer 1: model forecast — 'do we want shade?' (GHI or UV above threshold)
+    # Layer 1: model forecast — 'do we want shade?' (GHI or UV or direct-beam DNI)
+    # The DNI branch bypasses GHI/UV when a strong direct solar beam is already
+    # confirmed. GHI (shortwave_radiation) is global HORIZONTAL irradiance —
+    # suppressed by the sin(altitude) projection factor at low sun elevations —
+    # but DNI is measured normal to the beam and is not suppressed by low sun angle.
     ghi_sunny = ghi >= min_ghi
     uv_sunny = uv_index >= min_uv_index
-    sunny_model = ghi_sunny or uv_sunny
+    dni_direct_sunny = dni >= min_dni_direct
+    sunny_model = ghi_sunny or uv_sunny or dni_direct_sunny
 
     # Layer 2: multi-variable consistency check — independent model variable cross-check
     # DNI and cloud_cover come from different NWP model schemes:
@@ -1488,7 +1599,7 @@ def should_open_awning(
     above_freezing = temperature > min_temperature_f
     is_day = is_daytime(current_time, sunrise, sunset)
     sun_high_enough = altitude >= altitude_threshold
-    sun_facing_se = is_sun_facing_window(azimuth)
+    sun_facing_se = is_sun_facing_window(azimuth, sun_azimuth_min, sun_azimuth_max)
 
     conditions = {
         "sunny": is_sunny,
@@ -1503,16 +1614,24 @@ def should_open_awning(
     should_open = all(conditions.values())
 
     # Build sunny signal trace for logging (three-layer gate)
-    # Layer 1: model forecast signal
+    # Layer 1: model forecast signal (GHI, UV, or DNI direct-beam bypass)
     if sunny_model:
         if ghi_sunny and uv_sunny:
             model_trace = f"GHI {ghi:.0f} W/m² >= {min_ghi:.0f} AND UV {uv_index:.1f} >= {min_uv_index:.1f}"
         elif ghi_sunny:
             model_trace = f"GHI only: GHI {ghi:.0f} W/m² >= {min_ghi:.0f}, UV {uv_index:.1f} < {min_uv_index:.1f}"
-        else:
+        elif uv_sunny:
             model_trace = f"UV only: UV {uv_index:.1f} >= {min_uv_index:.1f}, GHI {ghi:.0f} W/m² < {min_ghi:.0f}"
+        else:
+            model_trace = (
+                f"DNI direct-beam bypass: DNI {dni:.0f} W/m² >= {min_dni_direct:.0f} "
+                f"(GHI {ghi:.0f} W/m² < {min_ghi:.0f}, UV {uv_index:.1f} < {min_uv_index:.1f})"
+            )
     else:
-        model_trace = f"GHI {ghi:.0f} W/m² < {min_ghi:.0f} AND UV {uv_index:.1f} < {min_uv_index:.1f}"
+        model_trace = (
+            f"GHI {ghi:.0f} W/m² < {min_ghi:.0f} AND UV {uv_index:.1f} < {min_uv_index:.1f} "
+            f"AND DNI {dni:.0f} W/m² < {min_dni_direct:.0f}"
+        )
 
     # Layer 2: multi-variable consistency check signal
     if sunny_observed:
@@ -1571,7 +1690,10 @@ def should_open_awning(
     if not sun_high_enough:
         reasons.append(f"Sun too low ({altitude:.1f}° < {altitude_threshold}°)")
     if not sun_facing_se:
-        reasons.append(f"Sun not facing window (azimuth {azimuth:.1f}°, need 90°-260°)")
+        reasons.append(
+            f"Sun not facing window (azimuth {azimuth:.1f}°, "
+            f"need {sun_azimuth_min:.0f}°-{sun_azimuth_max:.0f}°)"
+        )
 
     if should_open:
         reason = (
@@ -1706,14 +1828,16 @@ def main() -> None:
         logger.info(f"Location: {latitude:.4f}, {longitude:.4f}")
 
         # Get thresholds
-        wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold, radar_veto_dni, radar_veto_cloud_pct = get_thresholds()
+        wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold, radar_veto_dni, radar_veto_cloud_pct, min_dni_direct, sun_azimuth_min, sun_azimuth_max = get_thresholds()
         logger.info(
-            f"Thresholds: model=(GHI >= {min_ghi:.0f} W/m² OR UV >= {min_uv_index:.1f}), "
+            f"Thresholds: model=(GHI >= {min_ghi:.0f} W/m² OR UV >= {min_uv_index:.1f} "
+            f"OR DNI >= {min_dni_direct:.0f} W/m² direct-beam bypass), "
             f"consistency=(DNI >= {min_dni:.0f} W/m² OR cloud < {max_cloud_cover:.0f}%), "
             f"overcast ceiling=cloud < {overcast_threshold:.0f}% (DNI guard >= {min_dni_cirrus:.0f} W/m²), "
             f"Wind < {wind_threshold} mph, Rain precip=0 AND prob < {rain_probability_threshold}%, "
             f"Temp > {min_temperature_f:.0f}°F, "
-            f"Sun altitude >= {altitude_threshold}°, Sun facing window (90°-260°), "
+            f"Sun altitude >= {altitude_threshold}°, "
+            f"Sun facing window ({sun_azimuth_min:.0f}°-{sun_azimuth_max:.0f}°), "
             f"radar_veto=(DNI >= {radar_veto_dni:.0f} W/m² AND cloud < {radar_veto_cloud_pct:.0f}%)"
         )
 
@@ -1773,6 +1897,9 @@ def main() -> None:
             lon=longitude,
             radar_veto_dni=radar_veto_dni,
             radar_veto_cloud_pct=radar_veto_cloud_pct,
+            min_dni_direct=min_dni_direct,
+            sun_azimuth_min=sun_azimuth_min,
+            sun_azimuth_max=sun_azimuth_max,
         )
 
         # Log conditions with checkmarks/crosses

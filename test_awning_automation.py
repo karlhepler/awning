@@ -121,12 +121,16 @@ class TestShouldOpenAwningOrGate(unittest.TestCase):
 
     # ------------------------------------------------------------------
     # Test 2 — Genuinely overcast: GHI=100, UV=1 → sunny_enough=False, stays closed
-    # Both signals below threshold — heavy overcast, no shade needed.
+    # All three signals below threshold — heavy overcast, no shade needed.
+    # dni=20.0 is set explicitly (below the _weather() default of 450, which would
+    # otherwise trigger the Layer 1 DNI direct-beam bypass added in card #95 and
+    # falsely flip this "genuinely overcast" scenario to sunny) — 20 W/m² is
+    # squarely in the overcast/rain DNI range, consistent with "no direct beam".
     # ------------------------------------------------------------------
     def test_genuinely_overcast_stays_closed(self):
-        """Overcast: GHI=100 and UV=1 both below thresholds → stays closed."""
+        """Overcast: GHI=100, UV=1, DNI=20 all below thresholds → stays closed."""
         should_open, reason, conditions = should_open_awning(
-            weather=_weather(shortwave_radiation=100.0, uv_index=1.0),
+            weather=_weather(shortwave_radiation=100.0, uv_index=1.0, dni=20.0),
             sun_position=_sun(),
             current_time=_DAYTIME,
             **_THRESHOLDS,
@@ -322,13 +326,17 @@ class TestShouldOpenAwningOrGate(unittest.TestCase):
     # Regression guard: losing any one of these gates would still produce
     # should_open=False (due to AND logic), but this test pins the specific
     # gate flags so a refactor that drops a gate is caught.
+    # dni=0.0 is set explicitly (below the _weather() default of 450, which would
+    # otherwise trigger the Layer 1 DNI direct-beam bypass added in card #95 and
+    # falsely flip sunny=True at night) — 0 W/m² is the physically correct DNI
+    # reading at night (no direct beam at all).
     # ------------------------------------------------------------------
     def test_night_sun_below_horizon(self):
-        """Night: altitude=-10, GHI=0, UV=0 → closed; sunny, sun_high, daytime all False."""
+        """Night: altitude=-10, GHI=0, UV=0, DNI=0 → closed; sunny, sun_high, daytime all False."""
         # Use a time well outside the default sunrise/sunset window
         nighttime = datetime(2026, 4, 17, 2, 0, 0, tzinfo=timezone.utc)
         should_open, reason, conditions = should_open_awning(
-            weather=_weather(shortwave_radiation=0.0, uv_index=0.0),
+            weather=_weather(shortwave_radiation=0.0, uv_index=0.0, dni=0.0),
             sun_position=_sun(altitude=-10.0, azimuth=0.0),  # below horizon, north
             current_time=nighttime,
             **_THRESHOLDS,
@@ -746,6 +754,249 @@ class TestOvercastCeilingGate(unittest.TestCase):
         )
 
 
+class TestDirectBeamBypass(unittest.TestCase):
+    """
+    Tests for card #95: the Layer 1 DNI direct-beam bypass (MIN_DNI_DIRECT_WM2)
+    and the env-configurable sun-facing-window azimuth arc (SUN_AZIMUTH_MIN_DEG /
+    SUN_AZIMUTH_MAX_DEG).
+
+    Background — 2026-08-13 incident: at 08:30 local, GHI=277 W/m² and UV=1.7 both
+    failed their thresholds (GHI is horizontal-plane irradiance, suppressed by the
+    sin(altitude) projection factor at low sun elevation) while DNI=498 W/m² was
+    unambiguous direct sun; separately, azimuth=87.9° was below the old hardcoded
+    90° floor despite the user directly observing sun on the window. Both gates
+    had to move for the awning to open at 08:30.
+    """
+
+    # ------------------------------------------------------------------
+    # Test — today's real 08:30 values: GHI=277, UV=1.7, DNI=498, cloud 0/0/1/1,
+    # azimuth=87.9, altitude=22.5, 78.2°F, wind=2.7mph, no rain => OPEN.
+    # The DNI direct-beam bypass (DNI 498 >= 450) fires the model layer despite
+    # GHI/UV both failing, and azimuth 87.9 clears the 60° floor (southeast window).
+    # ------------------------------------------------------------------
+    def test_direct_beam_real_0830_values_opens(self):
+        """08:30 real values (GHI 277, UV 1.7, DNI 498, azimuth 87.9) => OPEN."""
+        should_open, reason, conditions = should_open_awning(
+            weather=_weather(
+                shortwave_radiation=277.0,
+                uv_index=1.7,
+                dni=498.0,
+                cloud_cover=0.0,
+                cloud_cover_low=0.0,
+                cloud_cover_mid=1.0,
+                cloud_cover_high=1.0,
+                temperature=78.2,
+                wind_speed=2.7,
+            ),
+            sun_position=_sun(azimuth=87.9, altitude=22.5),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        self.assertTrue(
+            conditions["sunny"],
+            f"Expected sunny=True via DNI direct-beam bypass but got False. reason={reason!r}",
+        )
+        self.assertTrue(
+            should_open,
+            f"Expected awning to open for 08:30 real values but got False. reason={reason!r}",
+        )
+        self.assertIn(
+            "DNI direct-beam bypass", reason,
+            f"Expected the DNI direct-beam bypass to be named in the reason trace. reason={reason!r}",
+        )
+
+    # ------------------------------------------------------------------
+    # Test — today's real 08:15 values: GHI=226, UV=1.4, DNI=445, azimuth=85.7,
+    # altitude=19.5 => still CLOSED. DNI=445 is just below MIN_DNI_DIRECT_WM2=450,
+    # proving 450 is a real boundary and not a rubber stamp that opens for any
+    # DNI reading in the ballpark. altitude_threshold is lowered to 15.0 for this
+    # test specifically so sun_high passes and the close is attributable ONLY to
+    # the sunny gate (model layer) — isolating the DNI boundary from the
+    # unrelated altitude gate that the raw 08:15 altitude (19.5) would otherwise
+    # also fail against the default 20° threshold. azimuth=85.7 is comfortably
+    # within the 60°-215° arc, so it does not confound the DNI-boundary isolation.
+    # ------------------------------------------------------------------
+    def test_direct_beam_real_0815_values_stays_closed(self):
+        """08:15 real values (GHI 226, UV 1.4, DNI 445) => still CLOSED (450 is a real boundary)."""
+        thresholds = {**_THRESHOLDS, "altitude_threshold": 15.0}
+        should_open, reason, conditions = should_open_awning(
+            weather=_weather(
+                shortwave_radiation=226.0,
+                uv_index=1.4,
+                dni=445.0,
+                cloud_cover=0.0,
+                cloud_cover_low=0.0,
+                cloud_cover_mid=1.0,
+                cloud_cover_high=1.0,
+                temperature=76.0,
+                wind_speed=2.5,
+            ),
+            sun_position=_sun(azimuth=85.7, altitude=19.5),
+            current_time=_DAYTIME,
+            **thresholds,
+        )
+        self.assertFalse(
+            conditions["sunny"],
+            f"Expected sunny=False for DNI=445 < 450 boundary but got True. reason={reason!r}",
+        )
+        # Isolation: every other gate must pass, so the close is attributable
+        # ONLY to the sunny gate — proving the DNI boundary itself is decisive.
+        self.assertTrue(conditions["calm"], f"Expected calm=True. reason={reason!r}")
+        self.assertTrue(conditions["no_rain"], f"Expected no_rain=True. reason={reason!r}")
+        self.assertTrue(conditions["above_freezing"], f"Expected above_freezing=True. reason={reason!r}")
+        self.assertTrue(conditions["daytime"], f"Expected daytime=True. reason={reason!r}")
+        self.assertTrue(conditions["sun_high"], f"Expected sun_high=True (altitude_threshold lowered). reason={reason!r}")
+        self.assertTrue(conditions["sun_facing_window"], f"Expected sun_facing_window=True (azimuth 85.7 within 60°-215° arc). reason={reason!r}")
+        self.assertFalse(
+            should_open,
+            f"Expected awning closed for 08:15 real values (DNI=445 < 450) but got True. reason={reason!r}",
+        )
+        self.assertIn("Not sunny", reason)
+        self.assertIn("445", reason)
+        self.assertIn("450", reason)
+
+    # ------------------------------------------------------------------
+    # Test — bright-overcast morning: GHI=260, UV=1.5, DNI=20, cloud total 95%
+    # => still CLOSED. Proves diffuse light (bright overcast) cannot defeat the
+    # new DNI bypass — DNI=20 is squarely in the overcast/rain range, nowhere
+    # near the 450 W/m² threshold.
+    # ------------------------------------------------------------------
+    def test_direct_beam_bright_overcast_diffuse_light_stays_closed(self):
+        """Bright overcast (GHI 260, UV 1.5, DNI 20, cloud 95%) => still CLOSED."""
+        should_open, reason, conditions = should_open_awning(
+            weather=_weather(
+                shortwave_radiation=260.0,
+                uv_index=1.5,
+                dni=20.0,
+                cloud_cover=95.0,
+                cloud_cover_low=50.0,
+                cloud_cover_mid=90.0,
+                cloud_cover_high=95.0,
+                temperature=70.0,
+                wind_speed=5.0,
+            ),
+            sun_position=_sun(),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        self.assertFalse(
+            conditions["sunny"],
+            f"Expected sunny=False for bright-overcast diffuse light but got True. reason={reason!r}",
+        )
+        self.assertFalse(
+            should_open,
+            f"Expected awning closed for bright-overcast diffuse light but got True. reason={reason!r}",
+        )
+
+    # ------------------------------------------------------------------
+    # Test — azimuth AT the new SUN_AZIMUTH_MIN_DEG floor (60.0°, inclusive)
+    # opens, with DNI=498 (direct-beam bypass) confirming sunny so the only
+    # variable under test is the azimuth arc itself. 60° reflects the
+    # southeast-facing window's confirmed sunrise-adjacent acceptance edge.
+    # ------------------------------------------------------------------
+    def test_direct_beam_azimuth_at_floor_opens(self):
+        """Azimuth exactly at the 60° floor (inclusive) => sun_facing_window=True, opens."""
+        should_open, reason, conditions = should_open_awning(
+            weather=_weather(
+                shortwave_radiation=277.0,
+                uv_index=1.7,
+                dni=498.0,
+                cloud_cover=0.0,
+                cloud_cover_low=0.0,
+                cloud_cover_mid=1.0,
+                cloud_cover_high=1.0,
+                temperature=78.2,
+                wind_speed=2.7,
+            ),
+            sun_position=_sun(azimuth=60.0, altitude=22.5),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        self.assertTrue(
+            conditions["sun_facing_window"],
+            f"Expected sun_facing_window=True at azimuth=60.0 (floor, inclusive) but got False. reason={reason!r}",
+        )
+        self.assertTrue(
+            should_open,
+            f"Expected awning to open at azimuth=60.0 floor but got False. reason={reason!r}",
+        )
+
+    # ------------------------------------------------------------------
+    # Test — azimuth just BELOW the new SUN_AZIMUTH_MIN_DEG floor (59.9°)
+    # stays closed, proving the floor is a real boundary.
+    # ------------------------------------------------------------------
+    def test_direct_beam_azimuth_below_floor_stays_closed(self):
+        """Azimuth just below the 60° floor (59.9°) => sun_facing_window=False, stays closed."""
+        should_open, reason, conditions = should_open_awning(
+            weather=_weather(
+                shortwave_radiation=277.0,
+                uv_index=1.7,
+                dni=498.0,
+                cloud_cover=0.0,
+                cloud_cover_low=0.0,
+                cloud_cover_mid=1.0,
+                cloud_cover_high=1.0,
+                temperature=78.2,
+                wind_speed=2.7,
+            ),
+            sun_position=_sun(azimuth=59.9, altitude=22.5),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        self.assertFalse(
+            conditions["sun_facing_window"],
+            f"Expected sun_facing_window=False at azimuth=59.9 (below floor) but got True. reason={reason!r}",
+        )
+        self.assertFalse(
+            should_open,
+            f"Expected awning closed at azimuth=59.9 (below floor) but got True. reason={reason!r}",
+        )
+        self.assertIn("Sun not facing window", reason)
+        # Discriminator: the reason string must report the CONFIGURED arc bounds
+        # (60°-215°), not the old hardcoded "90°-260°" literal that pre-change
+        # code always printed regardless of any threshold value.
+        self.assertIn(
+            "need 60°-215°", reason,
+            f"Expected reason to report the configured 60° floor, not a hardcoded value. reason={reason!r}",
+        )
+
+    # ------------------------------------------------------------------
+    # Test — get_thresholds() resolves SUN_AZIMUTH_MIN_DEG/SUN_AZIMUTH_MAX_DEG to
+    # 60.0/215.0 when both env vars are UNSET (i.e. exercising the os.getenv(...)
+    # default fallback path directly, not a caller-supplied override). Pins the
+    # corrected southeast-facing-window defaults named in the card's AC 8.
+    # ------------------------------------------------------------------
+    def test_azimuth_default_resolves_to_60_215_when_unset(self):
+        """SUN_AZIMUTH_MIN_DEG/MAX_DEG unset => defaults resolve to 60.0 floor, 215.0 ceiling."""
+        env_patch = {"WIND_SPEED_THRESHOLD_MPH": "15", "MIN_SUN_ALTITUDE_DEG": "20"}
+        keys_to_clear = ["SUN_AZIMUTH_MIN_DEG", "SUN_AZIMUTH_MAX_DEG"]
+        original_values = {}
+        for k, v in env_patch.items():
+            original_values[k] = os.environ.get(k)
+            os.environ[k] = v
+        for k in keys_to_clear:
+            original_values[k] = os.environ.get(k)
+            os.environ.pop(k, None)
+        try:
+            result = get_thresholds()
+            # sun_azimuth_min is the 14th element (index 13), sun_azimuth_max the
+            # 15th (index 14) of the get_thresholds() return tuple.
+            self.assertEqual(
+                result[13], 60.0,
+                f"Expected SUN_AZIMUTH_MIN_DEG default to resolve to 60.0, got {result[13]}",
+            )
+            self.assertEqual(
+                result[14], 215.0,
+                f"Expected SUN_AZIMUTH_MAX_DEG default to resolve to 215.0, got {result[14]}",
+            )
+        finally:
+            for k, orig in original_values.items():
+                if orig is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = orig
+
+
 class TestTemperatureThreshold(unittest.TestCase):
     """Tests for the MIN_TEMPERATURE_F threshold (default 45°F)."""
 
@@ -828,14 +1079,14 @@ class TestGetThresholdsMinTemperatureFValidation(unittest.TestCase):
         """MIN_TEMPERATURE_F=-50 is at the lower bound → no error."""
         env = {**self._REQUIRED_ENV, "MIN_TEMPERATURE_F": "-50"}
         with unittest.mock.patch.dict(os.environ, env):
-            _, _, _, _, _, _, min_temperature_f, _, _, _, _, _ = get_thresholds()
+            _, _, _, _, _, _, min_temperature_f, _, _, _, _, _, _, _, _ = get_thresholds()
             self.assertEqual(min_temperature_f, -50.0)
 
     def test_min_temperature_f_at_upper_bound_is_valid(self):
         """MIN_TEMPERATURE_F=120 is at the upper bound → no error."""
         env = {**self._REQUIRED_ENV, "MIN_TEMPERATURE_F": "120"}
         with unittest.mock.patch.dict(os.environ, env):
-            _, _, _, _, _, _, min_temperature_f, _, _, _, _, _ = get_thresholds()
+            _, _, _, _, _, _, min_temperature_f, _, _, _, _, _, _, _, _ = get_thresholds()
             self.assertEqual(min_temperature_f, 120.0)
 
 
@@ -986,7 +1237,7 @@ class TestWeatherRetryBehavior(unittest.TestCase):
         with patch.object(sys, "argv", ["awning_automation.py"]):
             with patch.object(awning_automation, "setup_logging", return_value=mock_log_path):
                 with patch.object(awning_automation, "load_location_config", return_value=(37.7, -122.4)):
-                    with patch.object(awning_automation, "get_thresholds", return_value=(15, 20, 400, 4, 50, 80, 60, 95, 30, 20, 400.0, 15.0)):
+                    with patch.object(awning_automation, "get_thresholds", return_value=(15, 20, 400, 4, 50, 80, 60, 95, 30, 20, 400.0, 15.0, 450.0, 60.0, 215.0)):
                         with patch.object(awning_automation, "load_telegram_config", return_value=("fake_token", "fake_chat")):
                             with patch.object(
                                 awning_automation,
