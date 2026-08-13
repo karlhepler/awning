@@ -76,7 +76,7 @@ Bond Bridge awning controller - sends HTTP commands to control a motorized awnin
 
 **Decision Logic (ALL 7 conditions must be met to open):**
 1. **Sunny**: multi-layer model — ALL three layers must be true:
-   - **Model layer**: GHI >= `MIN_GHI_WM2` (default 400 W/m²) OR UV >= `MIN_UV_INDEX` (default 4.0)
+   - **Model layer**: GHI >= `MIN_GHI_WM2` (default 400 W/m²) OR UV >= `MIN_UV_INDEX` (default 4.0) OR DNI >= `MIN_DNI_DIRECT_WM2` (default 450 W/m²). The **direct-beam bypass** exists because GHI and UV are both measured on a *horizontal* plane and are therefore suppressed by the sin(altitude) projection at low sun elevation — at a 22.5° sun altitude a horizontal surface collects only ~38% of the beam, so on a cloudless summer morning GHI physically cannot reach 400 W/m² until roughly 09:10 no matter how strong the sun is. The window is vertical and takes a low morning sun nearly head-on, so GHI measures the wrong plane for this application. DNI is measured normal to the sun and is not projection-suppressed, so it recognizes morning sun that horizontal irradiance cannot see. Mirrors the existing `MIN_DNI_CIRRUS_WM2` guard on the overcast ceiling, which already lets direct irradiance override a cloud-derived verdict. Added after the 2026-08-13 incident where the awning stayed shut at 08:30 on a clear 78°F morning with DNI=498 W/m² and 0% cloud, and had to be opened by hand; the 450 default sits above that morning's 08:15 reading of DNI=445 (so it does not open earlier than intended) and far above the DNI 0–50 range of a bright-overcast morning, which is what keeps diffuse light from defeating it.
    - **Consistency layer**: DNI >= `MIN_DNI_WM2` (default 50 W/m²) OR total cloud cover < `MAX_CLOUD_COVER_PCT` (default 80%)
    - **Overcast ceiling**: max(cloud_cover_mid, cloud_cover_high) < threshold (default 95%) OR DNI >= `MIN_DNI_CIRRUS_WM2` (default 30 W/m²). The DNI guard bypasses the ceiling when direct irradiance proves the sun is reaching the ground — added after the 2026-05-12 incident where Open-Meteo's `cloud_cover_high` field hallucinated 100% on a clear day with DNI=905 W/m².
 2. **Calm**: Wind speed < `WIND_SPEED_THRESHOLD_MPH` (default 15.0 mph)
@@ -97,7 +97,7 @@ Bond Bridge awning controller - sends HTTP commands to control a motorized awnin
 4. **Above minimum temperature**: Temperature > `MIN_TEMPERATURE_F` (default 45°F; was 60°F prior to commit `24ebd12`)
 5. **Daytime**: Between sunrise and sunset
 6. **Sun high enough**: Altitude >= `MIN_SUN_ALTITUDE_DEG` (default 15°)
-7. **Sun facing window**: Azimuth between 90° and 260° (hardcoded; SE-through-SW arc)
+7. **Sun facing window**: Azimuth between `SUN_AZIMUTH_MIN_DEG` (default 60°) and `SUN_AZIMUTH_MAX_DEG` (default 215°). The arc describes a **southeast-facing** window that receives sun from sunrise until roughly mid-afternoon (~3pm), confirmed by the operator's direct observation of when that window is actually in sun. Previously hardcoded 90°–260°, which describes a *south*-facing window and was wrong at **both** ends: the 90° floor blocked real morning sun (the operator observed sun on the glass at azimuth 87.9°, and the floor would also have blocked summer-solstice 08:30 at azimuth 79.9° — verified by computing the code path's own output across both solstices), while the 260° ceiling admitted late-afternoon sun at azimuth 230° that never reaches this window at all. The ceiling error failed in the harmless direction (a pointless open on a shaded afternoon) which is why it survived undetected; only the floor error produced a user-visible symptom. Both bounds are env-tunable, so the arc can be recalibrated on the device **without redeploying code**. Added 2026-08-13 alongside the direct-beam bypass.
 
 If ANY condition fails, the awning closes. Fail-safe: closes awning if weather API is unavailable.
 
@@ -157,6 +157,9 @@ See `.env.example` for full documentation. Key variables:
 - `RAIN_PROBABILITY_THRESHOLD` - Min Open-Meteo precipitation-probability % (current hour) that closes the rain gate (default: 20)
 - `RADAR_VETO_DNI_WM2` - Clear-sky veto: ignore the RainViewer radar signal when DNI >= this W/m² AND cloud cover is below `RADAR_VETO_CLOUD_PCT` (default: 650)
 - `RADAR_VETO_CLOUD_PCT` - Rain-bearing (max of low/mid layer) cloud cover % ceiling shared by both the radar veto and the forecast veto; high cirrus is excluded. Radar veto: suppresses a false radar rain signal when ALSO DNI >= `RADAR_VETO_DNI_WM2`. Forecast veto: suppresses forecast-only signals (probability, weather_code) when precipitation==0 (no DNI condition required) (default: 15)
+- `MIN_DNI_DIRECT_WM2` - Layer 1 direct-beam bypass: DNI at or above this W/m² satisfies the model layer on its own, regardless of GHI and UV. Distinct from `MIN_DNI_WM2` (Layer 2 consistency) and `MIN_DNI_CIRRUS_WM2` (Layer 3 ceiling guard) — three separate DNI thresholds serving three different layers (default: 450)
+- `SUN_AZIMUTH_MIN_DEG` - Near edge of the sun-facing-window arc, in degrees. Below this the sun has not yet come round onto the window. Lower it if the awning is late to open on summer mornings (default: 60)
+- `SUN_AZIMUTH_MAX_DEG` - Far edge of the sun-facing-window arc, in degrees. Above this the sun has passed off the window. Raise it if the awning closes while sun is still on the glass (default: 215)
 
 **Optional:**
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` - For notifications
