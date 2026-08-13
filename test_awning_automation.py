@@ -2073,8 +2073,11 @@ class TestRadarGate(unittest.TestCase):
         from unittest.mock import patch
         from awning_automation import evaluate_rain_gate
 
-        # Non-transparent brownish-gray clutter pixel (matches 2026-06-24 incident pixel)
-        png_bytes = self._make_png_bytes(r=158, g=147, b=117, a=110)
+        # Full-opacity precipitation pixel. The 2026-06-24 incident pixel was
+        # RGBA (158,147,117,110), but alpha 110 now decodes as clutter and never
+        # reaches the veto — this test must keep exercising the veto, so it uses a
+        # pixel that genuinely clears the alpha floor.
+        png_bytes = self._make_png_bytes(r=0, g=100, b=200, a=255)
 
         # All Open-Meteo signals are clear; radar fires but DNI/cloud veto applies
         w = _weather(
@@ -2294,9 +2297,11 @@ class TestRadarGate(unittest.TestCase):
         from unittest.mock import patch
         from awning_automation import evaluate_rain_gate
 
-        # Clutter pixel with alpha > 0 (same as the brownish-gray biological echo from
-        # the 2026-06-24 incident — RGBA 158,147,117,110)
-        png_bytes = self._make_png_bytes(r=158, g=147, b=117, a=110)
+        # Full-opacity precipitation pixel, so the radar arm actually fires and the
+        # rain-bearing-layer veto is the thing under test. (The original 2026-06-24
+        # echo, RGBA 158,147,117,110, is now rejected by the alpha floor before the
+        # veto is consulted, which would make this test vacuous.)
+        png_bytes = self._make_png_bytes(r=0, g=100, b=200, a=255)
 
         # Reproduce today's failure exactly: DNI=888, thin cirrus (high=51%) but
         # rain-bearing layers near-zero (low=2%, mid=0%)
@@ -2439,8 +2444,10 @@ class TestRadarGate(unittest.TestCase):
 
         # Build a 256×256 PNG that is fully transparent EXCEPT for exactly one
         # pixel at the target location — a lone clutter echo.
+        # A single FULL-OPACITY pixel, so the alpha floor cannot be what rejects it —
+        # this test isolates the neighborhood-count guard on its own.
         img = PILImage.new("RGBA", (256, 256), (0, 0, 0, 0))
-        img.putpixel((px, py), (158, 147, 117, 110))  # faint brownish clutter pixel
+        img.putpixel((px, py), (0, 100, 200, 255))  # lone precip-colored pixel
         buf = _io.BytesIO()
         img.save(buf, format="PNG")
         png_bytes = buf.getvalue()
@@ -2554,6 +2561,92 @@ class TestRadarGate(unittest.TestCase):
             gate_result,
             "evaluate_rain_gate must return False (rain) when radar neighborhood "
             "shows >=2 wet pixels (precipitation cell).",
+        )
+
+    # ------------------------------------------------------------------
+    # test_radar_faded_clutter_ramp_does_not_close
+    # 2026-08-13 13:15 incident regression.
+    #
+    # The awning closed on a cloudless 92°F afternoon (DNI 789 W/m², cloud_low 0%,
+    # precipitation 0.00 mm, precipitation_probability 0%) because the 3×3 radar
+    # neighborhood held three pixels at alpha 20/25/20, RGB ~(99,97,89). Those sit
+    # on RainViewer's faded sub-threshold ramp (a fixed 25-entry palette running
+    # alpha 20..190 in desaturated grey-khaki), NOT on its precipitation palette
+    # (alpha exactly 255, saturated blue→yellow→red). The old `alpha > 0` decode
+    # could not tell them apart, so three ghosts outvoted _RADAR_MIN_WET_PIXELS.
+    #
+    # The clear-sky radar veto did not save it: DNI 789 cleared the 650 floor, but
+    # cloud_mid was 20%, over the 15% rain-bearing ceiling — so the veto abstained.
+    # The alpha floor must reject this before the veto is ever needed.
+    # ------------------------------------------------------------------
+    def test_radar_faded_clutter_ramp_does_not_close(self):
+        """2026-08-13: three faded-ramp pixels (alpha 20/25/20) → not rain → gate stays open."""
+        import math
+        from unittest.mock import patch
+        from awning_automation import is_raining_on_radar, evaluate_rain_gate, _RAINVIEWER_TILE_ZOOM
+        from PIL import Image as PILImage
+        import io as _io
+
+        lat, lon = 35.778, -78.838
+        z = _RAINVIEWER_TILE_ZOOM
+        lat_rad = math.radians(lat)
+        n = 2 ** z
+        x_float = (lon + 180.0) / 360.0 * n
+        y_float = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n
+        tile_x = int(x_float)
+        tile_y = int(y_float)
+        px = int((x_float - tile_x) * 256)
+        py = int((y_float - tile_y) * 256)
+
+        # Exactly the observed neighborhood: three horizontally adjacent faded pixels.
+        img = PILImage.new("RGBA", (256, 256), (0, 0, 0, 0))
+        img.putpixel((px, py), (102, 99, 90, 25))
+        if px > 0:
+            img.putpixel((px - 1, py), (99, 97, 89, 20))
+        if px < 255:
+            img.putpixel((px + 1, py), (99, 97, 89, 20))
+        buf = _io.BytesIO()
+        img.save(buf, format="PNG")
+        png_bytes = buf.getvalue()
+
+        with patch("awning_automation.requests.get", self._mock_requests(self._META_JSON, png_bytes)):
+            result = is_raining_on_radar(lat, lon)
+
+        self.assertFalse(
+            result,
+            "is_raining_on_radar must return False for three faded-ramp pixels "
+            "(alpha 20/25/20 < _RADAR_MIN_ALPHA=200) — RainViewer renders real "
+            "precipitation at alpha 255, so these are clear-air clutter.",
+        )
+
+        # Integration: reproduce the incident's exact sky and confirm the gate stays
+        # open. cloud_mid=20% keeps the clear-sky radar veto disengaged, so the alpha
+        # floor is the only thing standing between the clutter and a false close.
+        w = _weather(
+            precipitation=0.0,
+            hourly_precip_prob=0,
+            minutely_15_precip=[],
+            weather_code=1,
+            dni=789.0,
+            cloud_cover=24.0,
+            cloud_cover_low=0.0,
+            cloud_cover_mid=20.0,
+            cloud_cover_high=18.0,
+        )
+        with patch("awning_automation.requests.get", self._mock_requests(self._META_JSON, png_bytes)):
+            gate_result = evaluate_rain_gate(
+                w,
+                rain_probability_threshold=20,
+                lat=lat,
+                lon=lon,
+                radar_veto_dni=650.0,
+                radar_veto_cloud_pct=15.0,
+            )
+
+        self.assertTrue(
+            gate_result,
+            "evaluate_rain_gate must return True (no rain) for the 2026-08-13 13:15 "
+            "conditions — the awning should have stayed open.",
         )
 
 

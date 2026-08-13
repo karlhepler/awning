@@ -1056,19 +1056,44 @@ def is_daytime(current_time: datetime, sunrise_str: str, sunset_str: str) -> boo
 
 
 # Zoom level for RainViewer tile requests.
-# Zoom 6 yields ~156 km/pixel tiles covering roughly 2.5° lat/lon per tile.
-# That is adequate resolution for a point precipitation check: a 256×256 pixel
-# tile at zoom 6 gives ~610 m/pixel at the equator.
+# Zoom 6 yields tiles covering roughly 5.6° of longitude each. A 256×256 pixel
+# tile at zoom 6 gives ~2446 m/pixel at the equator, which is ~1984 m/pixel at
+# the ~35.8° latitude this runs at — so the 3×3 sampling window spans ~6 km.
+# That is adequate resolution for a point precipitation check.
 _RAINVIEWER_TILE_ZOOM = 6
 _RAINVIEWER_MAPS_URL = "https://api.rainviewer.com/public/weather-maps.json"
 
-# Minimum number of non-transparent pixels required within a 3×3 neighborhood
-# around the target pixel before reporting radar rain. A lone non-zero-alpha pixel
-# is almost always NEXRAD clear-air-mode clutter (biological scatter, ground
-# clutter, anomalous propagation); real precipitation cells light up many adjacent
-# pixels and trivially exceed this threshold. Kept as an inline constant because
-# this is an internal algorithm parameter that does not need to vary by deployment.
+# Minimum number of wet pixels required within a 3×3 neighborhood around the
+# target pixel before reporting radar rain. A lone wet pixel is almost always
+# NEXRAD clear-air-mode clutter (biological scatter, ground clutter, anomalous
+# propagation); real precipitation cells light up many adjacent pixels and
+# trivially exceed this threshold. Kept as an inline constant because this is an
+# internal algorithm parameter that does not need to vary by deployment.
 _RADAR_MIN_WET_PIXELS = 2
+
+# Minimum alpha channel value for a pixel to count as precipitation.
+#
+# RainViewer's color scheme 2 (Meteored) renders returns in two visually distinct
+# classes, and the split is absolute:
+#   - Real precipitation: alpha EXACTLY 255, drawn from a saturated reflectivity
+#     ramp (light blue 136,221,238 → deep blue 0,71,104 → yellow 255,238,0 →
+#     orange → red 193,0,0). Channel spread (max-min) is 85-255.
+#   - Sub-threshold / clear-air returns: a fixed 25-entry faded ramp with alpha
+#     20,25,30,...,180,190 in desaturated grey-khaki (99,97,89 → 222,208,151).
+#     Channel spread is only 10-71.
+# Sampling six tiles over this location found 10030 pixels at alpha 255 and 13786
+# on the faded ramp, with NOTHING between alpha 190 and 255 — RainViewer
+# deliberately fades returns below its precipitation threshold.
+#
+# Testing `alpha > 0` therefore counts those ghosts as rain. That is what closed
+# the awning at 13:15 on 2026-08-13: three pixels at alpha 20/25/20, RGB ~(99,97,89),
+# on a cloudless 92°F afternoon with DNI 789 W/m² and 0% precipitation probability.
+# It is also the same failure class as the 2026-06-24 clutter incident, whose pixel
+# was RGBA (158,147,117,110) — likewise on the faded ramp.
+#
+# 200 sits in the empty gap between the faded ramp's 190 ceiling and precipitation's
+# 255, so it rejects every faded pixel while keeping every precipitation pixel.
+_RADAR_MIN_ALPHA = 200
 
 
 def is_raining_on_radar(lat: float, lon: float, timeout: int = 5) -> bool:
@@ -1084,8 +1109,10 @@ def is_raining_on_radar(lat: float, lon: float, timeout: int = 5) -> bool:
       2. Compute the Web Mercator (XYZ) tile covering the location.
       3. Fetch the 256×256 PNG tile.
       4. Sample a 3x3 neighborhood around the target pixel within the tile.
-      5. Return True if at least _RADAR_MIN_WET_PIXELS non-transparent pixels
-         are found in the neighborhood.
+      5. Return True if at least _RADAR_MIN_WET_PIXELS pixels with alpha
+         >= _RADAR_MIN_ALPHA are found in the neighborhood. The alpha floor
+         rejects RainViewer's faded sub-threshold/clear-air ramp, which is
+         rendered well below full opacity.
 
     Fail-open semantics: any exception or timeout returns False.
     A RainViewer outage cannot keep the awning permanently closed — the
@@ -1143,14 +1170,17 @@ def is_raining_on_radar(lat: float, lon: float, timeout: int = 5) -> bool:
         tile_resp = requests.get(tile_url, timeout=timeout)
         tile_resp.raise_for_status()
 
-        # Step 4: count non-transparent pixels in a 3×3 neighborhood around the
-        # target pixel, sampled within the already-fetched tile bounds. A lone
-        # non-zero-alpha pixel is almost always NEXRAD clear-air-mode clutter
-        # (biological scatter, ground clutter, anomalous propagation); real
-        # precipitation cells light up multiple adjacent radar pixels and trivially
-        # exceed the _RADAR_MIN_WET_PIXELS threshold. When the target pixel is near
-        # a tile edge, only the portion of the 3×3 window that falls inside the tile
-        # is sampled — no adjacent-tile fetching.
+        # Step 4: count wet pixels in a 3×3 neighborhood around the target pixel,
+        # sampled within the already-fetched tile bounds. A pixel counts as wet only
+        # when its alpha reaches _RADAR_MIN_ALPHA — RainViewer draws real precipitation
+        # at full opacity and fades sub-threshold clear-air returns (biological
+        # scatter, ground clutter, anomalous propagation) to alpha <= 190, so the
+        # alpha floor discards clutter regardless of how much of it is present.
+        # The neighborhood count is the second, independent guard: a lone wet pixel
+        # is still treated as noise, while real cells light up multiple adjacent
+        # pixels and trivially exceed _RADAR_MIN_WET_PIXELS. When the target pixel is
+        # near a tile edge, only the portion of the 3×3 window that falls inside the
+        # tile is sampled — no adjacent-tile fetching.
         # PIL is an optional dependency; if missing, fail open (radar disabled).
         try:
             from PIL import Image
@@ -1160,26 +1190,33 @@ def is_raining_on_radar(lat: float, lon: float, timeout: int = 5) -> bool:
         img = Image.open(io.BytesIO(tile_resp.content)).convert("RGBA")
         img_width, img_height = img.size  # always 256×256 for this tile format
         wet_pixel_count = 0
+        max_alpha = 0
         for dy in range(-1, 2):
             for dx in range(-1, 2):
                 nx = px + dx
                 ny = py + dy
                 if 0 <= nx < img_width and 0 <= ny < img_height:
                     _, _, _, a = img.getpixel((nx, ny))
-                    if a > 0:
+                    max_alpha = max(max_alpha, a)
+                    if a >= _RADAR_MIN_ALPHA:
                         wet_pixel_count += 1
         is_raining = wet_pixel_count >= _RADAR_MIN_WET_PIXELS
 
         if is_raining:
             logger.info(
                 f"RainViewer: radar return at ({lat:.3f}, {lon:.3f}) — "
-                f"{wet_pixel_count} wet pixels in 3×3 neighborhood → rain detected"
+                f"{wet_pixel_count} wet pixels in 3×3 neighborhood "
+                f"(max alpha {max_alpha}) → rain detected"
             )
         else:
-            logger.debug(
+            # Logged at INFO, not DEBUG: max_alpha is the diagnostic that
+            # distinguishes "sky is empty" from "faded clutter present but
+            # correctly rejected", and cron runs do not enable DEBUG.
+            logger.info(
                 f"RainViewer: no radar return at ({lat:.3f}, {lon:.3f}) — "
                 f"{wet_pixel_count} wet pixel(s) in 3×3 neighborhood "
-                f"(need >= {_RADAR_MIN_WET_PIXELS})"
+                f"(need >= {_RADAR_MIN_WET_PIXELS} at alpha >= {_RADAR_MIN_ALPHA}; "
+                f"max alpha seen {max_alpha})"
             )
 
         return is_raining
