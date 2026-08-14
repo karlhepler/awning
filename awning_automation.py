@@ -405,8 +405,20 @@ DEFAULT_MIN_DNI_DIRECT_WM2 = 450.0
 DEFAULT_SUN_AZIMUTH_MIN_DEG = 60.0
 DEFAULT_SUN_AZIMUTH_MAX_DEG = 215.0
 
+# Cross-model sun confirmation — see the 2026-08-14 incident notes on
+# fetch_crosscheck_irradiance(). The models are named here once and the suffixed
+# response keys are derived from this tuple, so the `models=` request parameter
+# and the key lookups cannot drift apart.
+DEFAULT_SUNNY_CROSSCHECK_ENABLED = True
+_CROSSCHECK_MODELS = ("ecmwf_ifs025", "icon_seamless")  # order = log order
+_CROSSCHECK_TIMEOUT_S = 8
+# Reject a slot older than this. Open-Meteo returns a full forecast day, so a
+# response whose recent entries are missing would otherwise let a stale
+# early-morning slot rescue a late-afternoon run.
+_CROSSCHECK_MAX_SLOT_AGE_MIN = 60
 
-def get_thresholds() -> tuple[float, float, float, float, float, float, float, float, float, int, float, float, float, float, float]:
+
+def get_thresholds() -> tuple[float, float, float, float, float, float, float, float, float, int, float, float, float, float, float, bool]:
     """
     Get weather thresholds from environment variables.
 
@@ -415,8 +427,9 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
                   min_dni, max_cloud_cover, min_temperature_f, overcast_threshold,
                   min_dni_cirrus, rain_probability_threshold,
                   radar_veto_dni, radar_veto_cloud_pct,
-                  min_dni_direct, sun_azimuth_min, sun_azimuth_max)
-        Types: (float, float, float, float, float, float, float, float, float, int, float, float, float, float, float)
+                  min_dni_direct, sun_azimuth_min, sun_azimuth_max,
+                  sunny_crosscheck_enabled)
+        Types: (float, float, float, float, float, float, float, float, float, int, float, float, float, float, float, bool)
             wind_speed_threshold_mph: float — mph, upper wind limit to open awning
             min_sun_altitude: float — degrees above horizon, lower sun altitude limit
             min_ghi: float — W/m², minimum global horizontal irradiance (shortwave_radiation)
@@ -465,6 +478,11 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
             sun_azimuth_max: float — degrees, upper bound of the sun-facing-window arc.
                 Default 215°. 215° (SSW) is where the window goes into shade in the
                 mid-afternoon (~3pm local).
+            sunny_crosscheck_enabled: bool — kill switch for the cross-model sun
+                confirmation (see fetch_crosscheck_irradiance). When True (default),
+                a "not sunny" verdict from the primary Open-Meteo feed can be
+                overturned by ECMWF and ICON both reporting DNI >= min_dni_direct.
+                Set False to fall back to primary-feed-only behavior.
 
     Raises:
         ConfigurationError: If threshold variables are missing or invalid
@@ -750,7 +768,24 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
             f"({sun_azimuth_max}); the sun-facing-window arc must have positive width."
         )
 
-    return wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold, radar_veto_dni, radar_veto_cloud_pct, min_dni_direct, sun_azimuth_min, sun_azimuth_max
+    # Cross-model sun confirmation kill switch (optional, default on).
+    # Appended to the end of the tuple deliberately: every existing positional
+    # index stays valid, which is how min_dni_direct and the azimuth arc were
+    # added too.
+    crosscheck_str = os.getenv(
+        "SUNNY_CROSSCHECK_ENABLED", str(DEFAULT_SUNNY_CROSSCHECK_ENABLED)
+    ).strip().lower()
+    if crosscheck_str in ("true", "1", "yes", "on"):
+        sunny_crosscheck_enabled = True
+    elif crosscheck_str in ("false", "0", "no", "off"):
+        sunny_crosscheck_enabled = False
+    else:
+        raise ConfigurationError(
+            f"Invalid SUNNY_CROSSCHECK_ENABLED value: {crosscheck_str!r}. "
+            f"Must be one of true/1/yes/on or false/0/no/off."
+        )
+
+    return wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold, radar_veto_dni, radar_veto_cloud_pct, min_dni_direct, sun_azimuth_min, sun_azimuth_max, sunny_crosscheck_enabled
 
 
 def load_telegram_config() -> tuple[Optional[str], Optional[str]]:
@@ -969,6 +1004,169 @@ def _fetch_weather_request(url: str, params: dict, timeout: int) -> dict:
     response = _weather_session.get(url, params=params, timeout=timeout)
     response.raise_for_status()
     return response.json()
+
+
+def fetch_crosscheck_irradiance(
+    lat: float,
+    lon: float,
+    timeout: int = _CROSSCHECK_TIMEOUT_S,
+    _now_utc: Optional[datetime] = None,
+) -> Optional[dict]:
+    """
+    Fetch an INDEPENDENT second opinion on direct irradiance from ECMWF and ICON.
+
+    Why this exists — the 2026-08-14 incident
+    ------------------------------------------
+    Open-Meteo's default `best_match` blend resolves to GFS/HRRR at this
+    location. On 2026-08-14 GFS reported DNI 0 W/m² and cloud_cover_high 100%
+    from 08:30 onward on a cloudless 82°F morning, and the awning stayed shut
+    all morning. Same timestamp, same coordinates, 10:00:
+
+        GFS (what fetch_weather reads):  DNI   0 W/m², cloud 100%
+        ECMWF (ecmwf_ifs025):            DNI 574 W/m², cloud  56%
+        ICON  (icon_seamless):           DNI 754 W/m², cloud  17%
+
+    All three layers of the sunny gate read GHI, UV, DNI and cloud cover from
+    that ONE feed. Critically, the MIN_DNI_CIRRUS_WM2 guard added after the
+    2026-05-12 hallucinated-cirrus incident — which exists precisely to override
+    a bogus cloud ceiling when direct sun is demonstrably arriving — needs
+    DNI >= 30 to fire. This time DNI *itself* was the corrupted field, so the
+    guard was disarmed by the very failure it was written to catch.
+
+    Hence the design rule for this function: its inputs are entirely independent
+    of the primary feed. It shares no field, and (see the slot selection below)
+    not even the primary feed's notion of "now". A guard that reads a primary
+    field can be disarmed by that field going bad.
+
+    Why a second request rather than adding `models=` to fetch_weather
+    -----------------------------------------------------------------
+    Both verified against the live API on 2026-08-14:
+      - The `current=` block SILENTLY IGNORES multi-model requests. Passing
+        `models=a,b` returns a single unsuffixed set, not both models.
+      - Requesting an explicit non-GFS model returns `uv_index: null`, because
+        UV is a CAMS product that ECMWF/ICON do not carry. That would break the
+        Layer 1 UV arm outright.
+    `minutely_15=` DOES support multi-model, returning suffixed keys such as
+    `direct_normal_irradiance_ecmwf_ifs025`. So fetch_weather's params must stay
+    exactly as they are, and the second opinion gets its own request.
+
+    Fails open: returns None on ANY error, so a cross-check outage can never
+    wedge the awning closed — it simply reverts to primary-feed-only behavior.
+    This mirrors is_raining_on_radar()'s contract.
+
+    Args:
+        lat: Latitude
+        lon: Longitude
+        timeout: Request timeout in seconds
+        _now_utc: Test injection point for the current UTC time
+
+    Returns:
+        Dict with per-model 'dni' and 'ghi' (keyed by model name) plus
+        'slot_time', or None if the second opinion is unavailable for any reason.
+        GHI is returned for logging only — the rescue rule uses DNI alone.
+    """
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "minutely_15": "direct_normal_irradiance,shortwave_radiation",
+        "models": ",".join(_CROSSCHECK_MODELS),
+        "timezone": "auto",
+        "forecast_days": 1,
+    }
+
+    try:
+        data = _fetch_weather_request(url, params, timeout)
+
+        m15 = data.get("minutely_15")
+        if not m15:
+            logger.warning(
+                "Sun crosscheck: response missing 'minutely_15' block — no rescue"
+            )
+            return None
+
+        times = m15.get("time") or []
+        if not times:
+            logger.warning("Sun crosscheck: empty time array — no rescue")
+            return None
+
+        # Slot selection deliberately does NOT use the primary feed's
+        # current['time'] (the way fetch_weather's minutely_15 precip lookback
+        # does). The whole point of this function is independence: a corrupted
+        # primary payload must not be able to steer which slot we read. We
+        # rebuild "now" from this response's own UTC offset instead.
+        offset_s = data.get("utc_offset_seconds")
+        if offset_s is None:
+            logger.warning(
+                "Sun crosscheck: response missing 'utc_offset_seconds' — no rescue"
+            )
+            return None
+        now_utc = _now_utc or datetime.now(timezone.utc)
+        now_local = (now_utc + timedelta(seconds=offset_s)).replace(tzinfo=None)
+        now_key = now_local.strftime("%Y-%m-%dT%H:%M")
+
+        slot_idx = None
+        for idx, ts in enumerate(times):
+            if ts <= now_key:
+                slot_idx = idx
+            else:
+                break
+        if slot_idx is None:
+            logger.warning(
+                f"Sun crosscheck: no slot at or before {now_key} — no rescue"
+            )
+            return None
+
+        # Reject a stale slot. Open-Meteo returns the whole forecast day, so a
+        # response whose recent entries were dropped would otherwise let this
+        # morning's clear-sky numbers rescue an overcast evening run.
+        slot_time = times[slot_idx]
+        try:
+            slot_dt = datetime.strptime(slot_time, "%Y-%m-%dT%H:%M")
+        except ValueError as e:
+            logger.warning(f"Sun crosscheck: unparseable slot time {slot_time!r}: {e}")
+            return None
+        age_min = (now_local - slot_dt).total_seconds() / 60.0
+        if age_min > _CROSSCHECK_MAX_SLOT_AGE_MIN:
+            logger.warning(
+                f"Sun crosscheck: slot {slot_time} is {age_min:.0f} min old "
+                f"(max {_CROSSCHECK_MAX_SLOT_AGE_MIN}) — no rescue"
+            )
+            return None
+
+        dni: dict = {}
+        ghi: dict = {}
+        for model in _CROSSCHECK_MODELS:
+            dni_series = m15.get(f"direct_normal_irradiance_{model}")
+            if dni_series is None or slot_idx >= len(dni_series):
+                logger.warning(
+                    f"Sun crosscheck: missing DNI series for {model} — no rescue"
+                )
+                return None
+            value = dni_series[slot_idx]
+            if value is None:
+                logger.warning(
+                    f"Sun crosscheck: null DNI for {model} at {slot_time} — no rescue"
+                )
+                return None
+            dni[model] = float(value)
+
+            # GHI is log-only, so a gap here is not fatal.
+            ghi_series = m15.get(f"shortwave_radiation_{model}")
+            if ghi_series is not None and slot_idx < len(ghi_series):
+                ghi_value = ghi_series[slot_idx]
+                ghi[model] = None if ghi_value is None else float(ghi_value)
+            else:
+                ghi[model] = None
+
+        return {"dni": dni, "ghi": ghi, "slot_time": slot_time}
+
+    except requests.RequestException as e:
+        logger.warning(f"Sun crosscheck: API error: {e} — no rescue")
+        return None
+    except Exception as e:
+        logger.warning(f"Sun crosscheck: parse error: {e} — no rescue")
+        return None
 
 
 def calculate_sun_position(lat: float, lon: float, dt: datetime) -> dict:
@@ -1514,6 +1712,7 @@ def should_open_awning(
     min_dni_direct: float = DEFAULT_MIN_DNI_DIRECT_WM2,
     sun_azimuth_min: float = DEFAULT_SUN_AZIMUTH_MIN_DEG,
     sun_azimuth_max: float = DEFAULT_SUN_AZIMUTH_MAX_DEG,
+    sunny_crosscheck_enabled: bool = DEFAULT_SUNNY_CROSSCHECK_ENABLED,
     _attribution: Optional[list] = None,
 ) -> tuple[bool, str, dict]:
     """
@@ -1576,11 +1775,20 @@ def should_open_awning(
             southeast-facing window, sun from sunrise; see get_thresholds())
         sun_azimuth_max: Upper bound (degrees) of the sun-facing-window arc (default 215 —
             southeast-facing window, shaded by mid-afternoon)
+        sunny_crosscheck_enabled: When True (default), a "not sunny" verdict from
+            the primary feed can be overturned by ECMWF and ICON both reporting
+            DNI >= min_dni_direct. See fetch_crosscheck_irradiance() for the
+            2026-08-14 incident that motivated it. Rescue-only: it can never
+            cause a close that would not already happen.
         _attribution: Optional list; if provided and the rain gate closed, the
             attribution string naming the signal(s) that fired is appended.
             Lets main() name the real signal in the Telegram message. It cannot
             travel in conditions_dict, which must stay all-bool because
             should_open is computed as all(conditions.values()).
+            NOTE: this out-param is consumed positionally — main() reads
+            element [0] and hands it to build_close_reason(), whose first branch
+            is the RAIN branch. The cross-model sun rescue therefore must NOT
+            append here; its detail rides in the returned reason string.
 
     Returns:
         Tuple of (should_open, reason, conditions_dict)
@@ -1638,7 +1846,11 @@ def should_open_awning(
     dni_confirms_sun = dni >= min_dni_cirrus
     not_overcast = cloud_ceiling_clear or dni_confirms_sun
 
-    is_sunny = sunny_model and sunny_observed and not_overcast
+    # The three-layer verdict from the PRIMARY feed. Deliberately named and never
+    # reassigned: the cross-model rescue below can only widen this to True, and
+    # keeping the primary verdict as a distinct value is what makes that
+    # additive property provable by reading one line.
+    sunny_primary = sunny_model and sunny_observed and not_overcast
 
     is_calm = wind_speed < wind_threshold
     rain_attribution: list = []
@@ -1660,6 +1872,65 @@ def should_open_awning(
     is_day = is_daytime(current_time, sunrise, sunset)
     sun_high_enough = altitude >= altitude_threshold
     sun_facing_se = is_sun_facing_window(azimuth, sun_azimuth_min, sun_azimuth_max)
+
+    # Cross-model sun confirmation — rescue-only, never a close.
+    #
+    # When the primary feed says "not sunny", ask two INDEPENDENT models whether
+    # a strong direct beam is arriving. Requiring BOTH ECMWF and ICON to clear
+    # min_dni_direct is deliberate: sized over 14 days of history, the rule fires
+    # on only 3-4% of daylight hours, and every firing was a genuinely sunny hour
+    # where GFS undershot. Reusing min_dni_direct rather than introducing a fourth
+    # DNI threshold keeps the knob count honest.
+    #
+    # This can only flip sunny False -> True. Nothing downstream reads
+    # sunny_primary, and no other condition key is touched, so the rescue can
+    # never cause a close that would not already happen.
+    sunny_rescued = False
+    crosscheck = None
+    if not sunny_crosscheck_enabled:
+        crosscheck_status = "disabled"
+    elif sunny_primary:
+        # Fast path: the primary feed already agrees, so spend no request.
+        # Same shape as the radar fast path in evaluate_rain_gate().
+        crosscheck_status = "skipped(primary_sunny)"
+    elif lat is None or lon is None:
+        crosscheck_status = "skipped(no_coords)"
+    elif not (is_day and sun_high_enough and sun_facing_se):
+        # Nothing to rescue: all(conditions.values()) fails on these gates
+        # regardless. Skipping here avoids a pointless request on every
+        # nighttime cron run, which is roughly half of all runs.
+        crosscheck_status = "skipped(sun_gates_closed)"
+    else:
+        # Belt and braces: fetch_crosscheck_irradiance() already catches
+        # everything and returns None, but the additive property of this rescue
+        # must hold unconditionally. If it ever did raise, main()'s fail-safe
+        # would close the awning — the exact outcome this code exists to prevent.
+        try:
+            crosscheck = fetch_crosscheck_irradiance(lat, lon)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(f"Sun crosscheck: unexpected error: {e} — no rescue")
+            crosscheck = None
+        if crosscheck is None:
+            crosscheck_status = "unavailable"
+        else:
+            model_dni = crosscheck["dni"]
+            weakest = min(model_dni.values())
+            sunny_rescued = weakest >= min_dni_direct
+            detail = ", ".join(
+                f"{m}={model_dni[m]:.0f}" for m in _CROSSCHECK_MODELS
+            )
+            comparison = ">=" if sunny_rescued else "<"
+            crosscheck_status = (
+                f"{detail} W/m² @ {crosscheck['slot_time']}, "
+                f"weakest={weakest:.0f} {comparison} {min_dni_direct:.0f} → "
+                f"{'RESCUE ENGAGED' if sunny_rescued else 'no rescue'}"
+            )
+
+    is_sunny = sunny_primary or sunny_rescued
+
+    # Logged on EVERY run (like `Rain signals:`), so a future false reading is
+    # diagnosable from the log alone.
+    logger.info(f"Sun crosscheck: {crosscheck_status}")
 
     conditions = {
         "sunny": is_sunny,
@@ -1723,7 +1994,10 @@ def should_open_awning(
             f"AND DNI {dni:.0f} W/m² < {min_dni_cirrus:.0f} guard"
         )
 
-    if is_sunny:
+    # These three branches describe the PRIMARY feed, so they key off
+    # sunny_primary — a rescued run must still report honestly what the primary
+    # feed said, nested inside the rescue trace below.
+    if sunny_primary:
         sunny_trace = f"model=({model_trace}), consistency=({obs_trace}), overcast=({overcast_trace})"
     elif not sunny_model:
         sunny_trace = f"model failed: {model_trace}"
@@ -1731,6 +2005,15 @@ def should_open_awning(
         sunny_trace = f"observed failed: {obs_trace} (model ok: {model_trace})"
     else:
         sunny_trace = f"overcast ceiling blocked: {overcast_trace} (model ok: {model_trace}, consistency ok: {obs_trace})"
+
+    if sunny_rescued and crosscheck is not None:
+        _rescue_detail = ", ".join(
+            f"{m} DNI {crosscheck['dni'][m]:.0f} W/m²" for m in _CROSSCHECK_MODELS
+        )
+        sunny_trace = (
+            f"CROSS-MODEL RESCUE: {_rescue_detail} — all >= {min_dni_direct:.0f} "
+            f"(primary feed disagreed: {sunny_trace})"
+        )
 
     # Build detailed reason string
     reasons = []
@@ -1902,7 +2185,7 @@ def main() -> None:
         logger.info(f"Location: {latitude:.4f}, {longitude:.4f}")
 
         # Get thresholds
-        wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold, radar_veto_dni, radar_veto_cloud_pct, min_dni_direct, sun_azimuth_min, sun_azimuth_max = get_thresholds()
+        wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold, radar_veto_dni, radar_veto_cloud_pct, min_dni_direct, sun_azimuth_min, sun_azimuth_max, sunny_crosscheck_enabled = get_thresholds()
         logger.info(
             f"Thresholds: model=(GHI >= {min_ghi:.0f} W/m² OR UV >= {min_uv_index:.1f} "
             f"OR DNI >= {min_dni_direct:.0f} W/m² direct-beam bypass), "
@@ -1912,7 +2195,9 @@ def main() -> None:
             f"Temp > {min_temperature_f:.0f}°F, "
             f"Sun altitude >= {altitude_threshold}°, "
             f"Sun facing window ({sun_azimuth_min:.0f}°-{sun_azimuth_max:.0f}°), "
-            f"radar_veto=(DNI >= {radar_veto_dni:.0f} W/m² AND cloud < {radar_veto_cloud_pct:.0f}%)"
+            f"radar_veto=(DNI >= {radar_veto_dni:.0f} W/m² AND cloud < {radar_veto_cloud_pct:.0f}%), "
+            f"sunny_crosscheck=({'on' if sunny_crosscheck_enabled else 'off'}, "
+            f"{'+'.join(_CROSSCHECK_MODELS)} all DNI >= {min_dni_direct:.0f} W/m²)"
         )
 
         # Load Telegram config (optional)
@@ -1975,6 +2260,7 @@ def main() -> None:
             min_dni_direct=min_dni_direct,
             sun_azimuth_min=sun_azimuth_min,
             sun_azimuth_max=sun_azimuth_max,
+            sunny_crosscheck_enabled=sunny_crosscheck_enabled,
             _attribution=rain_attribution_out,
         )
         rain_attribution = rain_attribution_out[0] if rain_attribution_out else None

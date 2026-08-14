@@ -1080,14 +1080,14 @@ class TestGetThresholdsMinTemperatureFValidation(unittest.TestCase):
         """MIN_TEMPERATURE_F=-50 is at the lower bound → no error."""
         env = {**self._REQUIRED_ENV, "MIN_TEMPERATURE_F": "-50"}
         with unittest.mock.patch.dict(os.environ, env):
-            _, _, _, _, _, _, min_temperature_f, _, _, _, _, _, _, _, _ = get_thresholds()
+            _, _, _, _, _, _, min_temperature_f, _, _, _, _, _, _, _, _, _ = get_thresholds()
             self.assertEqual(min_temperature_f, -50.0)
 
     def test_min_temperature_f_at_upper_bound_is_valid(self):
         """MIN_TEMPERATURE_F=120 is at the upper bound → no error."""
         env = {**self._REQUIRED_ENV, "MIN_TEMPERATURE_F": "120"}
         with unittest.mock.patch.dict(os.environ, env):
-            _, _, _, _, _, _, min_temperature_f, _, _, _, _, _, _, _, _ = get_thresholds()
+            _, _, _, _, _, _, min_temperature_f, _, _, _, _, _, _, _, _, _ = get_thresholds()
             self.assertEqual(min_temperature_f, 120.0)
 
 
@@ -1238,7 +1238,7 @@ class TestWeatherRetryBehavior(unittest.TestCase):
         with patch.object(sys, "argv", ["awning_automation.py"]):
             with patch.object(awning_automation, "setup_logging", return_value=mock_log_path):
                 with patch.object(awning_automation, "load_location_config", return_value=(37.7, -122.4)):
-                    with patch.object(awning_automation, "get_thresholds", return_value=(15, 20, 400, 4, 50, 80, 60, 95, 30, 20, 400.0, 15.0, 450.0, 60.0, 215.0)):
+                    with patch.object(awning_automation, "get_thresholds", return_value=(15, 20, 400, 4, 50, 80, 60, 95, 30, 20, 400.0, 15.0, 450.0, 60.0, 215.0, True)):
                         with patch.object(awning_automation, "load_telegram_config", return_value=("fake_token", "fake_chat")):
                             with patch.object(
                                 awning_automation,
@@ -2989,7 +2989,7 @@ class TestCloseNotificationAttribution(unittest.TestCase):
              patch.object(awning_automation, "setup_logging", return_value=mock_log_path), \
              patch.object(awning_automation, "load_location_config", return_value=(35.778, -78.838)), \
              patch.object(awning_automation, "get_thresholds",
-                          return_value=(15, 15, 400, 4, 50, 80, 45, 95, 30, 20, 650.0, 15.0, 450.0, 60.0, 215.0)), \
+                          return_value=(15, 15, 400, 4, 50, 80, 45, 95, 30, 20, 650.0, 15.0, 450.0, 60.0, 215.0, True)), \
              patch.object(awning_automation, "load_telegram_config", return_value=("fake_token", "fake_chat")), \
              patch.object(awning_automation, "collect_weather_measurements", return_value=weather), \
              patch.object(awning_automation, "calculate_sun_position",
@@ -3047,6 +3047,598 @@ class TestCloseNotificationAttribution(unittest.TestCase):
             all(isinstance(v, bool) for v in conditions.values()),
             "conditions must remain all-bool — should_open is all(conditions.values())",
         )
+
+
+class TestCrossModelSunnyRescue(unittest.TestCase):
+    """
+    Cross-model sun confirmation — the 2026-08-14 GFS DNI-collapse incident.
+
+    Open-Meteo's best_match blend resolves to GFS/HRRR at this location. On
+    2026-08-14 GFS reported DNI 0 W/m² and cloud_cover_high 100% on a cloudless
+    82°F morning while ECMWF (574) and ICON (754) both showed strong direct sun.
+    The awning opened at 08:30, closed at 08:45, and stayed shut all morning.
+    """
+
+    # The exact readings the Pi logged at 08:45 on 2026-08-14.
+    INCIDENT_WEATHER = dict(
+        shortwave_radiation=150.0,
+        uv_index=2.0,
+        dni=0.0,
+        cloud_cover=100.0,
+        cloud_cover_low=0.0,
+        cloud_cover_mid=0.0,
+        cloud_cover_high=100.0,
+        temperature=82.1,
+        wind_speed=3.6,
+    )
+
+    # Sun was up, high, and on the window — only the sunny gate failed.
+    SUN = dict(azimuth=90.4, altitude=25.4)
+
+    @staticmethod
+    def _crosscheck(ecmwf, icon, slot_time="2026-08-14T08:45"):
+        return {
+            "dni": {"ecmwf_ifs025": ecmwf, "icon_seamless": icon},
+            "ghi": {"ecmwf_ifs025": None, "icon_seamless": None},
+            "slot_time": slot_time,
+        }
+
+    def _run(self, crosscheck, **overrides):
+        """Evaluate the incident conditions with a given cross-check result."""
+        kwargs = dict(_THRESHOLDS)
+        kwargs.update(lat=35.778, lon=-78.838)
+        kwargs.update(overrides)
+        weather_kwargs = dict(self.INCIDENT_WEATHER)
+        for key in list(weather_kwargs):
+            if key in kwargs:
+                weather_kwargs[key] = kwargs.pop(key)
+        patcher = unittest.mock.patch.object(
+            awning_automation,
+            "fetch_crosscheck_irradiance",
+            return_value=crosscheck,
+        )
+        with patcher as mock_fetch:
+            result = should_open_awning(
+                _weather(**weather_kwargs),
+                _sun(**self.SUN),
+                _DAYTIME,
+                **kwargs,
+            )
+        return result + (mock_fetch,)
+
+    # -- The headline regression -------------------------------------------
+
+    def test_regression_2026_08_14_gfs_dni_collapse_reopens(self):
+        """All three primary layers fail; ECMWF+ICON rescue it."""
+        w = _weather(**self.INCIDENT_WEATHER)
+
+        # Layer 1 (model): GHI 150 < 400, UV 2.0 < 4.0, DNI 0 < 450.
+        self.assertLess(w["shortwave_radiation"], 400.0)
+        self.assertLess(w["uv_index"], 4.0)
+        self.assertLess(w["dni"], 450.0)
+        # Layer 2 (consistency): DNI 0 < 50 AND cloud 100% >= 80%.
+        self.assertLess(w["dni"], 50.0)
+        self.assertGreaterEqual(w["cloud_cover"], 80.0)
+        # Layer 3 (overcast ceiling): cloud_high 100% >= 95%, and — the crux of
+        # this incident — the MIN_DNI_CIRRUS_WM2 guard that exists to override a
+        # bogus ceiling is itself disarmed, because DNI is the corrupted field.
+        self.assertGreaterEqual(
+            max(w["cloud_cover_mid"], w["cloud_cover_high"]), 95.0
+        )
+        self.assertLess(w["dni"], 30.0)
+
+        should_open, reason, conditions, _ = self._run(
+            self._crosscheck(574.0, 754.0)
+        )
+
+        self.assertTrue(
+            should_open,
+            "Awning must open: two independent models both prove direct sun",
+        )
+        self.assertTrue(conditions["sunny"])
+        self.assertIn("RESCUE", reason)
+        self.assertIn("574", reason)
+        self.assertIn("754", reason)
+        # The primary feed's verdict must still be reported honestly.
+        self.assertIn("primary feed disagreed", reason)
+
+    # -- Both models must agree --------------------------------------------
+
+    def test_rescue_requires_both_models(self):
+        for ecmwf, icon, expected in [
+            (574.0, 754.0, True),
+            (574.0, 300.0, False),   # ICON disagrees
+            (300.0, 754.0, False),   # ECMWF disagrees
+            (300.0, 300.0, False),   # neither
+        ]:
+            with self.subTest(ecmwf=ecmwf, icon=icon):
+                should_open, _, conditions, _ = self._run(
+                    self._crosscheck(ecmwf, icon)
+                )
+                self.assertEqual(conditions["sunny"], expected)
+                self.assertEqual(should_open, expected)
+
+    def test_0830_slot_does_not_rescue(self):
+        """
+        Today's 08:30 numbers (ECMWF 394, ICON 479): the weakest model is below
+        450, so no rescue. Pins the empirically-sized 3-4% firing rate — the
+        rule is not a blanket 'trust any model that feels sunny'.
+        """
+        should_open, _, conditions, _ = self._run(self._crosscheck(394.0, 479.0))
+        self.assertFalse(conditions["sunny"])
+        self.assertFalse(should_open)
+
+    def test_rescue_reuses_min_dni_direct(self):
+        """No fourth DNI threshold: the rescue bar IS min_dni_direct."""
+        _, _, conditions, _ = self._run(
+            self._crosscheck(574.0, 754.0), min_dni_direct=600.0
+        )
+        self.assertFalse(conditions["sunny"], "574 < 600 must not rescue")
+
+        # Inclusive comparison at exactly the threshold.
+        _, _, conditions, _ = self._run(
+            self._crosscheck(450.0, 450.0), min_dni_direct=450.0
+        )
+        self.assertTrue(conditions["sunny"], "DNI == threshold must rescue")
+
+    # -- Fail-open ----------------------------------------------------------
+
+    def test_fails_open_when_crosscheck_unavailable(self):
+        """A None result must leave the verdict byte-identical to no-rescue."""
+        should_open, reason, conditions, _ = self._run(None)
+        self.assertFalse(should_open)
+        self.assertFalse(conditions["sunny"])
+        self.assertIn("Not sunny", reason)
+        self.assertNotIn("RESCUE", reason)
+
+    def test_fetch_exception_does_not_propagate(self):
+        """
+        The fetch already catches everything, but an unexpected raise must not
+        escape either — main()'s fail-safe would CLOSE the awning, the exact
+        outcome this whole mechanism exists to prevent.
+        """
+        with unittest.mock.patch.object(
+            awning_automation,
+            "fetch_crosscheck_irradiance",
+            side_effect=Exception("boom"),
+        ):
+            should_open, reason, conditions = should_open_awning(
+                _weather(**self.INCIDENT_WEATHER),
+                _sun(**self.SUN),
+                _DAYTIME,
+                lat=35.778,
+                lon=-78.838,
+                **_THRESHOLDS,
+            )
+        # Degrades to primary-feed-only behavior, does not blow up.
+        self.assertFalse(conditions["sunny"])
+        self.assertIn("Not sunny", reason)
+
+    # -- Scope containment: rescue must not touch any other gate ------------
+
+    def test_rescue_never_overrides_other_gates(self):
+        cases = {
+            "calm": dict(wind_speed=40.0),
+            "above_freezing": dict(temperature=20.0),
+            "no_rain": dict(precipitation=5.0),
+        }
+        for key, override in cases.items():
+            with self.subTest(gate=key):
+                weather_kwargs = dict(self.INCIDENT_WEATHER)
+                weather_kwargs.update(override)
+                with unittest.mock.patch.object(
+                    awning_automation,
+                    "fetch_crosscheck_irradiance",
+                    return_value=self._crosscheck(574.0, 754.0),
+                ):
+                    should_open, _, conditions = should_open_awning(
+                        _weather(**weather_kwargs),
+                        _sun(**self.SUN),
+                        _DAYTIME,
+                        lat=35.778,
+                        lon=-78.838,
+                        **_THRESHOLDS,
+                    )
+                self.assertFalse(conditions[key], f"{key} must stay False")
+                self.assertFalse(should_open)
+
+    def test_rescue_is_strictly_additive(self):
+        """should_open(rescue on) >= should_open(rescue off), always."""
+        matrix = [
+            dict(),                                    # the incident
+            dict(dni=500.0, cloud_cover=10.0,
+                 cloud_cover_high=10.0),               # primary already sunny
+            dict(wind_speed=40.0),                     # blocked by wind
+            dict(temperature=20.0),                    # blocked by cold
+        ]
+        for override in matrix:
+            with self.subTest(override=override):
+                weather_kwargs = dict(self.INCIDENT_WEATHER)
+                weather_kwargs.update(override)
+                results = {}
+                for enabled in (False, True):
+                    with unittest.mock.patch.object(
+                        awning_automation,
+                        "fetch_crosscheck_irradiance",
+                        return_value=self._crosscheck(574.0, 754.0),
+                    ):
+                        results[enabled], _, _ = should_open_awning(
+                            _weather(**weather_kwargs),
+                            _sun(**self.SUN),
+                            _DAYTIME,
+                            lat=35.778,
+                            lon=-78.838,
+                            sunny_crosscheck_enabled=enabled,
+                            **_THRESHOLDS,
+                        )
+                self.assertGreaterEqual(
+                    int(results[True]), int(results[False]),
+                    "the rescue must never turn an open into a close",
+                )
+
+    # -- No wasted requests -------------------------------------------------
+
+    def test_no_fetch_when_primary_already_sunny(self):
+        _, _, _, mock_fetch = self._run(
+            self._crosscheck(574.0, 754.0),
+            dni=500.0, cloud_cover=10.0, cloud_cover_high=10.0,
+        )
+        mock_fetch.assert_not_called()
+
+    def test_no_fetch_when_sun_gates_closed(self):
+        """Night / low sun / sun off the window: nothing to rescue."""
+        for label, sun, when in [
+            ("sun too low", dict(azimuth=90.0, altitude=2.0), _DAYTIME),
+            ("off window", dict(azimuth=300.0, altitude=30.0), _DAYTIME),
+            ("night", dict(azimuth=90.0, altitude=25.0),
+             datetime(2026, 4, 17, 3, 0, 0, tzinfo=timezone.utc)),
+        ]:
+            with self.subTest(case=label):
+                with unittest.mock.patch.object(
+                    awning_automation,
+                    "fetch_crosscheck_irradiance",
+                    return_value=self._crosscheck(574.0, 754.0),
+                ) as mock_fetch:
+                    should_open_awning(
+                        _weather(**self.INCIDENT_WEATHER),
+                        _sun(**sun),
+                        when,
+                        lat=35.778,
+                        lon=-78.838,
+                        **_THRESHOLDS,
+                    )
+                mock_fetch.assert_not_called()
+
+    def test_no_fetch_without_coordinates(self):
+        with unittest.mock.patch.object(
+            awning_automation,
+            "fetch_crosscheck_irradiance",
+            return_value=self._crosscheck(574.0, 754.0),
+        ) as mock_fetch:
+            should_open_awning(
+                _weather(**self.INCIDENT_WEATHER),
+                _sun(**self.SUN),
+                _DAYTIME,
+                **_THRESHOLDS,
+            )
+        mock_fetch.assert_not_called()
+
+    def test_kill_switch_skips_fetch(self):
+        _, _, conditions, mock_fetch = self._run(
+            self._crosscheck(574.0, 754.0), sunny_crosscheck_enabled=False
+        )
+        mock_fetch.assert_not_called()
+        self.assertFalse(conditions["sunny"])
+
+    # -- Invariants that would otherwise break silently ---------------------
+
+    def test_conditions_remain_all_bool_when_rescued(self):
+        _, _, conditions, _ = self._run(self._crosscheck(574.0, 754.0))
+        self.assertTrue(
+            all(isinstance(v, bool) for v in conditions.values()),
+            "conditions must stay all-bool — should_open is all(conditions.values())",
+        )
+
+    def test_rescue_does_not_populate_attribution(self):
+        """
+        _attribution is consumed positionally by build_close_reason(), whose
+        first branch is the RAIN branch. A sunny string appended here would make
+        an unrelated close announce a sun message.
+        """
+        out = []
+        with unittest.mock.patch.object(
+            awning_automation,
+            "fetch_crosscheck_irradiance",
+            return_value=self._crosscheck(574.0, 754.0),
+        ):
+            should_open_awning(
+                _weather(**self.INCIDENT_WEATHER),
+                _sun(**self.SUN),
+                _DAYTIME,
+                lat=35.778,
+                lon=-78.838,
+                _attribution=out,
+                **_THRESHOLDS,
+            )
+        self.assertEqual(out, [], "the sun rescue must not touch _attribution")
+
+    def test_crosscheck_line_logged_every_run(self):
+        for label, crosscheck, enabled, expect in [
+            ("engaged", self._crosscheck(574.0, 754.0), True, "RESCUE ENGAGED"),
+            ("below", self._crosscheck(394.0, 479.0), True, "no rescue"),
+            ("unavailable", None, True, "unavailable"),
+            ("disabled", None, False, "disabled"),
+        ]:
+            with self.subTest(case=label):
+                with unittest.mock.patch.object(
+                    awning_automation,
+                    "fetch_crosscheck_irradiance",
+                    return_value=crosscheck,
+                ):
+                    with self.assertLogs(
+                        awning_automation.logger, level="INFO"
+                    ) as cm:
+                        should_open_awning(
+                            _weather(**self.INCIDENT_WEATHER),
+                            _sun(**self.SUN),
+                            _DAYTIME,
+                            lat=35.778,
+                            lon=-78.838,
+                            sunny_crosscheck_enabled=enabled,
+                            **_THRESHOLDS,
+                        )
+                line = [x for x in cm.output if "Sun crosscheck:" in x]
+                self.assertEqual(len(line), 1, "exactly one crosscheck line per run")
+                self.assertIn(expect, line[0])
+
+
+class TestCrossModelSunnyRescueFetch(unittest.TestCase):
+    """fetch_crosscheck_irradiance() — request shape, slot selection, fail-open."""
+
+    NOW = datetime(2026, 8, 14, 12, 47, 0, tzinfo=timezone.utc)  # 08:47 EDT
+
+    def _response(self, **overrides):
+        body = {
+            "utc_offset_seconds": -14400,
+            "minutely_15": {
+                "time": [
+                    "2026-08-14T08:15",
+                    "2026-08-14T08:30",
+                    "2026-08-14T08:45",
+                    "2026-08-14T09:00",
+                ],
+                "direct_normal_irradiance_ecmwf_ifs025": [351.0, 394.0, 433.0, 473.0],
+                "direct_normal_irradiance_icon_seamless": [396.0, 479.0, 547.0, 608.0],
+                "shortwave_radiation_ecmwf_ifs025": [225.0, 271.0, 318.0, 367.0],
+                "shortwave_radiation_icon_seamless": [214.0, 267.0, 320.0, 374.0],
+            },
+        }
+        body.update(overrides)
+        return body
+
+    def _call(self, response=None, side_effect=None, now=None):
+        mock_resp = unittest.mock.Mock()
+        mock_resp.json.return_value = response
+        mock_resp.raise_for_status.return_value = None
+        with unittest.mock.patch.object(
+            awning_automation._weather_session,
+            "get",
+            side_effect=side_effect,
+            return_value=None if side_effect else mock_resp,
+        ) as mock_get:
+            result = awning_automation.fetch_crosscheck_irradiance(
+                35.778, -78.838, _now_utc=now or self.NOW
+            )
+        return result, mock_get
+
+    def test_request_shape(self):
+        result, mock_get = self._call(self._response())
+        params = mock_get.call_args.kwargs["params"]
+        self.assertEqual(params["models"], "ecmwf_ifs025,icon_seamless")
+        self.assertEqual(
+            params["minutely_15"], "direct_normal_irradiance,shortwave_radiation"
+        )
+        self.assertNotIn("current", params)
+        self.assertIsNotNone(result)
+
+    def test_selects_slot_at_or_before_now(self):
+        """08:47 local must read the 08:45 slot, not 09:00."""
+        result, _ = self._call(self._response())
+        self.assertEqual(result["slot_time"], "2026-08-14T08:45")
+        self.assertEqual(result["dni"]["ecmwf_ifs025"], 433.0)
+        self.assertEqual(result["dni"]["icon_seamless"], 547.0)
+
+    def test_stale_slot_rejected(self):
+        """A response whose newest slot is hours old must not rescue."""
+        result, _ = self._call(
+            self._response(),
+            now=datetime(2026, 8, 14, 22, 0, 0, tzinfo=timezone.utc),  # 18:00 EDT
+        )
+        self.assertIsNone(result)
+
+    def test_fail_open_cases(self):
+        cases = {
+            "missing minutely_15": {"utc_offset_seconds": -14400},
+            "empty time array": {
+                "utc_offset_seconds": -14400,
+                "minutely_15": {"time": []},
+            },
+            "missing utc offset": {
+                "minutely_15": self._response()["minutely_15"],
+            },
+            "no slot at or before now": {
+                "utc_offset_seconds": -14400,
+                "minutely_15": {
+                    "time": ["2026-08-14T23:00"],
+                    "direct_normal_irradiance_ecmwf_ifs025": [500.0],
+                    "direct_normal_irradiance_icon_seamless": [500.0],
+                },
+            },
+        }
+        for label, body in cases.items():
+            with self.subTest(case=label):
+                result, _ = self._call(body)
+                self.assertIsNone(result, f"{label} must fail open")
+
+    def test_null_dni_fails_open(self):
+        body = self._response()
+        body["minutely_15"]["direct_normal_irradiance_icon_seamless"] = [
+            396.0, 479.0, None, 608.0
+        ]
+        result, _ = self._call(body)
+        self.assertIsNone(result)
+
+    def test_missing_model_series_fails_open(self):
+        body = self._response()
+        del body["minutely_15"]["direct_normal_irradiance_icon_seamless"]
+        result, _ = self._call(body)
+        self.assertIsNone(result)
+
+    def test_network_error_fails_open(self):
+        import requests
+        result, _ = self._call(
+            side_effect=requests.exceptions.ConnectionError("no route")
+        )
+        self.assertIsNone(result)
+
+    def test_malformed_json_fails_open(self):
+        result, _ = self._call(side_effect=ValueError("not json"))
+        self.assertIsNone(result)
+
+    def test_primary_request_params_never_carry_models(self):
+        """
+        Guards the two API findings behind this design: `current=` silently
+        ignores multi-model, and an explicit model nulls out uv_index. A future
+        consolidation of the two requests would break the Layer 1 UV arm.
+        """
+        mock_resp = unittest.mock.Mock()
+        mock_resp.json.return_value = {}
+        mock_resp.raise_for_status.return_value = None
+        with unittest.mock.patch.object(
+            awning_automation._weather_session, "get", return_value=mock_resp
+        ) as mock_get:
+            with self.assertRaises(WeatherAPIError):
+                fetch_weather(35.778, -78.838)
+        params = mock_get.call_args.kwargs["params"]
+        self.assertNotIn("models", params)
+        self.assertIn("uv_index", params["current"])
+
+
+class TestCrossModelRescueCompositionRoot(unittest.TestCase):
+    """
+    Drive the real main() on the 2026-08-14 incident numbers.
+
+    The unit tests above pass sunny_crosscheck_enabled directly, so they would
+    stay green even if main() never plumbed the flag through — and main() is the
+    one path a --dry-run cannot exercise. This is the test that catches a missing
+    kwarg in the wiring.
+    """
+
+    def test_main_opens_awning_on_cross_model_rescue(self):
+        import sys
+        from unittest.mock import patch, MagicMock
+
+        mock_controller = MagicMock()
+        mock_controller.get_state.side_effect = [0, 1]  # closed before, open after
+
+        mock_log_path = MagicMock()
+        mock_log_path.parent = MagicMock()
+
+        # Exactly what the Pi logged at 08:45 on 2026-08-14.
+        weather = _weather(
+            shortwave_radiation=150.0,
+            uv_index=2.0,
+            dni=0.0,
+            cloud_cover=100.0,
+            cloud_cover_low=0.0,
+            cloud_cover_mid=0.0,
+            cloud_cover_high=100.0,
+            wind_speed=3.6,
+            temperature=82.1,
+            precipitation=0.0,
+            hourly_precip_prob=0,
+            minutely_15_precip=[],
+            weather_code=0,
+            sunrise="2026-08-14T06:33:00",
+            sunset="2026-08-14T20:06:00",
+        )
+        weather["time"] = "2026-08-14T08:45:00"
+
+        crosscheck = {
+            "dni": {"ecmwf_ifs025": 433.0, "icon_seamless": 547.0},
+            "ghi": {"ecmwf_ifs025": 318.0, "icon_seamless": 320.0},
+            "slot_time": "2026-08-14T08:45",
+        }
+
+        # Deliberately NOT patching get_thresholds: this exercises the real
+        # 16-tuple unpack in main(), which is where a wiring mistake would hide.
+        env = {
+            "WIND_SPEED_THRESHOLD_MPH": "15",
+            "MIN_SUN_ALTITUDE_DEG": "15",
+        }
+
+        def run(crosscheck_result):
+            mock_controller.reset_mock()
+            mock_controller.get_state.side_effect = [0, 1]
+            with patch.dict(os.environ, env, clear=True), \
+                 patch.object(sys, "argv", ["awning_automation.py"]), \
+                 patch.object(awning_automation, "setup_logging", return_value=mock_log_path), \
+                 patch.object(awning_automation, "load_location_config", return_value=(35.778, -78.838)), \
+                 patch.object(awning_automation, "load_telegram_config", return_value=(None, None)), \
+                 patch.object(awning_automation, "collect_weather_measurements", return_value=weather), \
+                 patch.object(awning_automation, "calculate_sun_position",
+                              return_value={"azimuth": 90.4, "altitude": 25.4}), \
+                 patch.object(awning_automation, "is_raining_on_radar", return_value=False), \
+                 patch.object(awning_automation, "fetch_crosscheck_irradiance",
+                              return_value=crosscheck_result), \
+                 patch.object(awning_automation, "create_controller_from_env",
+                              return_value=mock_controller):
+                awning_automation.main()
+            return mock_controller
+
+        # With a rescue that clears the bar (both >= 450 at the default), open.
+        strong = dict(crosscheck)
+        strong["dni"] = {"ecmwf_ifs025": 574.0, "icon_seamless": 754.0}
+        controller = run(strong)
+        controller.open.assert_called_once()
+        controller.close.assert_not_called()
+
+        # The real 08:45 slot: ECMWF 433 is below 450, so no rescue — closed.
+        controller = run(crosscheck)
+        controller.close.assert_called_once()
+        controller.open.assert_not_called()
+
+
+class TestGetThresholdsSunnyCrosscheck(unittest.TestCase):
+    """SUNNY_CROSSCHECK_ENABLED parsing."""
+
+    def _get(self, value):
+        env = {
+            "WIND_SPEED_THRESHOLD_MPH": "15",
+            "MIN_SUN_ALTITUDE_DEG": "20",
+        }
+        if value is not None:
+            env["SUNNY_CROSSCHECK_ENABLED"] = value
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            return get_thresholds()[15]
+
+    def test_defaults_to_enabled(self):
+        self.assertTrue(self._get(None))
+        self.assertIs(
+            self._get(None), awning_automation.DEFAULT_SUNNY_CROSSCHECK_ENABLED
+        )
+
+    def test_truthy_and_falsy_values(self):
+        for value in ("true", "True", "1", "yes", "ON"):
+            with self.subTest(value=value):
+                self.assertTrue(self._get(value))
+        for value in ("false", "False", "0", "no", "OFF"):
+            with self.subTest(value=value):
+                self.assertFalse(self._get(value))
+
+    def test_invalid_value_raises(self):
+        with self.assertRaises(ConfigurationError):
+            self._get("maybe")
 
 
 if __name__ == "__main__":
