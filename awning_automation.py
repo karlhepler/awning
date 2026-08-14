@@ -5,7 +5,7 @@ Awning Weather Automation
 Automatically opens/closes awning based on weather conditions.
 - Opens awning if ALL 7 conditions are met: sunny, calm, no rain, above 45°F,
   daytime, sun high enough, and sun facing window (SUN_AZIMUTH_MIN_DEG-SUN_AZIMUTH_MAX_DEG,
-  default 60°-215° for a southeast-facing window: sun from sunrise to mid-afternoon)
+  default 60°-249° for a southeast-facing window: sun from sunrise to late afternoon)
 - Closes awning if ANY condition fails
 
 Sunshine detection uses a two-layer gate plus a hard cloud-cover ceiling:
@@ -403,7 +403,7 @@ def load_location_config(env_file: Optional[Path] = None) -> tuple[float, float]
 # should_open_awning()'s signature default — see card #97.
 DEFAULT_MIN_DNI_DIRECT_WM2 = 450.0
 DEFAULT_SUN_AZIMUTH_MIN_DEG = 60.0
-DEFAULT_SUN_AZIMUTH_MAX_DEG = 215.0
+DEFAULT_SUN_AZIMUTH_MAX_DEG = 249.0
 
 # Cross-model sun confirmation — see the 2026-08-14 incident notes on
 # fetch_crosscheck_irradiance(). The models are named here once and the suffixed
@@ -474,10 +474,11 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
             sun_azimuth_min: float — degrees, lower bound of the sun-facing-window arc.
                 Default 60°. The window faces SOUTHEAST: the user has confirmed by
                 direct observation that sun is on the window from sunrise until
-                roughly mid-afternoon. 60° (ENE) admits early sunrise-adjacent sun.
+                late afternoon. 60° (ENE) admits early sunrise-adjacent sun.
             sun_azimuth_max: float — degrees, upper bound of the sun-facing-window arc.
-                Default 215°. 215° (SSW) is where the window goes into shade in the
-                mid-afternoon (~3pm local).
+                Default 249°. 249° (WSW) is where the house shadow reaches the porch,
+                calibrated 2026-08-14 from direct observation at 16:01 (azimuth 249.5;
+                the 16:00 cron log recorded 249.3).
             sunny_crosscheck_enabled: bool — kill switch for the cross-model sun
                 confirmation (see fetch_crosscheck_irradiance). When True (default),
                 a "not sunny" verdict from the primary Open-Meteo feed can be
@@ -730,15 +731,34 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
             f"disabling it as a discriminator. Received: {min_dni_direct}"
         )
 
-    # Get sun-facing-window azimuth arc bounds (optional, default 60°-215°)
+    # Get sun-facing-window azimuth arc bounds (optional, default 60°-249°)
     # Replaces the previously hardcoded 90°-260° arc (and the short-lived 85°-260°
     # interim). The window faces SOUTHEAST: the user has directly confirmed sun is on
-    # the window from sunrise until roughly 3pm local, and it is shaded after that.
-    # 60° (ENE) covers early sunrise-adjacent sun; 215° (SSW) is where the window
-    # goes into shade in the mid-afternoon. The old 90-260 arc (and 85-260) both
-    # described a SOUTH-facing window and were wrong at both ends: the near edge
-    # blocked real morning sun, and the far edge (260° = WSW, late afternoon) would
-    # have opened the awning for sun that is never actually on this window.
+    # the window from sunrise until late afternoon, and it is shaded after that.
+    # 60° (ENE) covers early sunrise-adjacent sun; 249° (WSW) is where the house
+    # shadow reaches the porch.
+    #
+    # Both bounds come from direct observation, not geometry, and the ceiling has
+    # been wrong in BOTH directions:
+    #   - The old 90-260 arc (and 85-260) described a SOUTH-facing window. Its 90°
+    #     near edge blocked real morning sun — the operator observed sun on the glass
+    #     at azimuth 87.9°.
+    #   - The 2026-08-13 fix dropped the ceiling to 215° on the untested reasoning
+    #     that 260° "admitted late-afternoon sun that never reaches this window."
+    #     That claim was WRONG. On 2026-08-14 the operator watched the house shadow
+    #     cross the porch and found the retract point at 16:01, azimuth 249.5° (the
+    #     16:00 cron log recorded 249.3°) — sun was still on the porch well past 215°.
+    #     The 215° ceiling had closed the awning at 14:30 that day, giving up ~1.5
+    #     hours of afternoon shade. Raised to 249°, still below the original 260°.
+    #
+    # The 2026-08-13 near-edge fix (90 -> 60) had a user-visible symptom driving it
+    # and was correct; the ceiling half of that same commit was a guess, which is why
+    # only it needed undoing. Keep future changes to these bounds observation-driven.
+    #
+    # The ceiling is a proxy for time-of-day and drifts seasonally: in Nov-Jan the sun
+    # never reaches azimuth 249° while still above MIN_SUN_ALTITUDE_DEG, so the
+    # altitude gate closes the awning instead (~15:15-15:45). That is the correct
+    # fail-direction for low winter sun and needs no separate handling.
     sun_azimuth_min_str = os.getenv("SUN_AZIMUTH_MIN_DEG", str(DEFAULT_SUN_AZIMUTH_MIN_DEG)).strip()
     try:
         sun_azimuth_min = float(sun_azimuth_min_str)
@@ -1203,14 +1223,14 @@ def is_sun_facing_window(
     max_deg: float = DEFAULT_SUN_AZIMUTH_MAX_DEG,
 ) -> bool:
     """
-    Check if sun is facing the window (southeast-facing: sunrise to mid-afternoon).
+    Check if sun is facing the window (southeast-facing: sunrise to late afternoon).
 
     Args:
         azimuth: Sun azimuth in degrees (0=North, 90=East, 180=South, 270=West)
         min_deg: Lower bound of the acceptance arc, in degrees (default 60 —
             from SUN_AZIMUTH_MIN_DEG env var; see get_thresholds() for the
             southeast-facing-window rationale)
-        max_deg: Upper bound of the acceptance arc, in degrees (default 215 —
+        max_deg: Upper bound of the acceptance arc, in degrees (default 249 —
             from SUN_AZIMUTH_MAX_DEG env var)
 
     Returns:
@@ -1773,8 +1793,8 @@ def should_open_awning(
             DNI >= this value, sunny_model is True regardless of GHI/UV (default 450)
         sun_azimuth_min: Lower bound (degrees) of the sun-facing-window arc (default 60 —
             southeast-facing window, sun from sunrise; see get_thresholds())
-        sun_azimuth_max: Upper bound (degrees) of the sun-facing-window arc (default 215 —
-            southeast-facing window, shaded by mid-afternoon)
+        sun_azimuth_max: Upper bound (degrees) of the sun-facing-window arc (default 249 —
+            southeast-facing window, shaded by late afternoon)
         sunny_crosscheck_enabled: When True (default), a "not sunny" verdict from
             the primary feed can be overturned by ECMWF and ICON both reporting
             DNI >= min_dni_direct. See fetch_crosscheck_irradiance() for the

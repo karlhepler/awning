@@ -815,7 +815,7 @@ class TestDirectBeamBypass(unittest.TestCase):
     # the sunny gate (model layer) — isolating the DNI boundary from the
     # unrelated altitude gate that the raw 08:15 altitude (19.5) would otherwise
     # also fail against the default 20° threshold. azimuth=85.7 is comfortably
-    # within the 60°-215° arc, so it does not confound the DNI-boundary isolation.
+    # within the 60°-249° arc, so it does not confound the DNI-boundary isolation.
     # ------------------------------------------------------------------
     def test_direct_beam_real_0815_values_stays_closed(self):
         """08:15 real values (GHI 226, UV 1.4, DNI 445) => still CLOSED (450 is a real boundary)."""
@@ -847,7 +847,7 @@ class TestDirectBeamBypass(unittest.TestCase):
         self.assertTrue(conditions["above_freezing"], f"Expected above_freezing=True. reason={reason!r}")
         self.assertTrue(conditions["daytime"], f"Expected daytime=True. reason={reason!r}")
         self.assertTrue(conditions["sun_high"], f"Expected sun_high=True (altitude_threshold lowered). reason={reason!r}")
-        self.assertTrue(conditions["sun_facing_window"], f"Expected sun_facing_window=True (azimuth 85.7 within 60°-215° arc). reason={reason!r}")
+        self.assertTrue(conditions["sun_facing_window"], f"Expected sun_facing_window=True (azimuth 85.7 within 60°-249° arc). reason={reason!r}")
         self.assertFalse(
             should_open,
             f"Expected awning closed for 08:15 real values (DNI=445 < 450) but got True. reason={reason!r}",
@@ -954,21 +954,21 @@ class TestDirectBeamBypass(unittest.TestCase):
         )
         self.assertIn("Sun not facing window", reason)
         # Discriminator: the reason string must report the CONFIGURED arc bounds
-        # (60°-215°), not the old hardcoded "90°-260°" literal that pre-change
+        # (60°-249°), not the old hardcoded "90°-260°" literal that pre-change
         # code always printed regardless of any threshold value.
         self.assertIn(
-            "need 60°-215°", reason,
+            "need 60°-249°", reason,
             f"Expected reason to report the configured 60° floor, not a hardcoded value. reason={reason!r}",
         )
 
     # ------------------------------------------------------------------
     # Test — get_thresholds() resolves SUN_AZIMUTH_MIN_DEG/SUN_AZIMUTH_MAX_DEG to
-    # 60.0/215.0 when both env vars are UNSET (i.e. exercising the os.getenv(...)
+    # 60.0/249.0 when both env vars are UNSET (i.e. exercising the os.getenv(...)
     # default fallback path directly, not a caller-supplied override). Pins the
     # corrected southeast-facing-window defaults named in the card's AC 8.
     # ------------------------------------------------------------------
-    def test_azimuth_default_resolves_to_60_215_when_unset(self):
-        """SUN_AZIMUTH_MIN_DEG/MAX_DEG unset => defaults resolve to 60.0 floor, 215.0 ceiling."""
+    def test_azimuth_default_resolves_to_60_249_when_unset(self):
+        """SUN_AZIMUTH_MIN_DEG/MAX_DEG unset => defaults resolve to 60.0 floor, 249.0 ceiling."""
         env_patch = {"WIND_SPEED_THRESHOLD_MPH": "15", "MIN_SUN_ALTITUDE_DEG": "20"}
         keys_to_clear = ["SUN_AZIMUTH_MIN_DEG", "SUN_AZIMUTH_MAX_DEG"]
         original_values = {}
@@ -987,8 +987,8 @@ class TestDirectBeamBypass(unittest.TestCase):
                 f"Expected SUN_AZIMUTH_MIN_DEG default to resolve to 60.0, got {result[13]}",
             )
             self.assertEqual(
-                result[14], 215.0,
-                f"Expected SUN_AZIMUTH_MAX_DEG default to resolve to 215.0, got {result[14]}",
+                result[14], 249.0,
+                f"Expected SUN_AZIMUTH_MAX_DEG default to resolve to 249.0, got {result[14]}",
             )
         finally:
             for k, orig in original_values.items():
@@ -996,6 +996,108 @@ class TestDirectBeamBypass(unittest.TestCase):
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = orig
+
+
+class TestAzimuthCeilingObservedCalibration(unittest.TestCase):
+    """
+    Pins the 249° ceiling to the direct observation it came from, so a future
+    edit cannot quietly walk it back the way the 2026-08-13 change did.
+
+    On 2026-08-14 the operator watched the house shadow cross the back porch and
+    identified 16:01 as the moment the awning should retract. pvlib puts the sun
+    at azimuth 249.5° then; the 16:00 cron log recorded 249.3°. The three
+    azimuths below are the real 15-minute cron slots bracketing that moment:
+
+        15:45  az 245.7  -> still on the porch, stay open
+        16:00  az 249.3  -> shadow has arrived, close   <- the observation
+        16:15  az 252.5  -> closed
+
+    These tests deliberately do NOT pass sun_azimuth_max, so they exercise
+    should_open_awning's signature default (DEFAULT_SUN_AZIMUTH_MAX_DEG). A
+    regression that changes the constant fails here, not just in the
+    get_thresholds() default test.
+    """
+
+    def _conditions_at(self, azimuth, altitude):
+        # Weather values are today's real 16:00 readings (clear, hot, dry) so the
+        # only gate that can vary across these three cases is the azimuth arc.
+        return should_open_awning(
+            weather=_weather(
+                shortwave_radiation=700.0,
+                uv_index=6.0,
+                dni=780.0,
+                cloud_cover=10.0,
+                cloud_cover_low=0.0,
+                cloud_cover_mid=0.0,
+                cloud_cover_high=0.0,
+                temperature=96.0,
+                wind_speed=6.0,
+            ),
+            sun_position=_sun(azimuth=azimuth, altitude=altitude),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+
+    def test_1545_slot_azimuth_2457_stays_open(self):
+        """15:45 on 2026-08-14 (az 245.7) => sun still on the porch, awning open."""
+        should_open, reason, conditions = self._conditions_at(245.7, 51.0)
+        self.assertTrue(
+            conditions["sun_facing_window"],
+            f"Expected sun_facing_window=True at azimuth=245.7 (below the 249° ceiling) "
+            f"but got False — the ceiling has regressed below the observed value. reason={reason!r}",
+        )
+        self.assertTrue(
+            should_open,
+            f"Expected awning OPEN at the 15:45 slot but got closed. reason={reason!r}",
+        )
+
+    def test_1600_slot_azimuth_2493_closes(self):
+        """16:00 on 2026-08-14 (az 249.3) => house shadow has arrived, awning closes."""
+        should_open, reason, conditions = self._conditions_at(249.3, 48.2)
+        self.assertFalse(
+            conditions["sun_facing_window"],
+            f"Expected sun_facing_window=False at azimuth=249.3 (past the 249° ceiling) "
+            f"but got True. reason={reason!r}",
+        )
+        self.assertFalse(
+            should_open,
+            f"Expected awning CLOSED at the 16:00 slot — this is the moment the "
+            f"operator identified. reason={reason!r}",
+        )
+        # Isolation: every other gate passes, so the close is attributable ONLY
+        # to the azimuth ceiling.
+        self.assertTrue(conditions["sunny"], f"Expected sunny=True. reason={reason!r}")
+        self.assertTrue(conditions["calm"], f"Expected calm=True. reason={reason!r}")
+        self.assertTrue(conditions["no_rain"], f"Expected no_rain=True. reason={reason!r}")
+        self.assertTrue(conditions["sun_high"], f"Expected sun_high=True. reason={reason!r}")
+        self.assertIn("Sun not facing window", reason)
+
+    def test_1615_slot_azimuth_2525_stays_closed(self):
+        """16:15 on 2026-08-14 (az 252.5) => well past the ceiling, still closed."""
+        should_open, reason, conditions = self._conditions_at(252.5, 45.4)
+        self.assertFalse(
+            conditions["sun_facing_window"],
+            f"Expected sun_facing_window=False at azimuth=252.5. reason={reason!r}",
+        )
+        self.assertFalse(should_open, f"Expected awning CLOSED. reason={reason!r}")
+
+    def test_old_215_ceiling_would_have_closed_1430_slot(self):
+        """
+        Discriminator against the pre-2026-08-14 ceiling: azimuth 220.5 is the
+        14:30 slot that the old 215° ceiling actually closed on. Under 249° it
+        must stay OPEN — this is the ~1.5 hours of afternoon shade the change
+        recovers, and it fails loudly if 215 is ever restored.
+        """
+        should_open, reason, conditions = self._conditions_at(220.5, 63.3)
+        self.assertTrue(
+            conditions["sun_facing_window"],
+            f"Expected sun_facing_window=True at azimuth=220.5 — the old 215° ceiling "
+            f"closed here on 2026-08-14 and that was too early. reason={reason!r}",
+        )
+        self.assertTrue(
+            should_open,
+            f"Expected awning OPEN at the 14:30 slot. reason={reason!r}",
+        )
 
 
 class TestTemperatureThreshold(unittest.TestCase):
@@ -1238,7 +1340,7 @@ class TestWeatherRetryBehavior(unittest.TestCase):
         with patch.object(sys, "argv", ["awning_automation.py"]):
             with patch.object(awning_automation, "setup_logging", return_value=mock_log_path):
                 with patch.object(awning_automation, "load_location_config", return_value=(37.7, -122.4)):
-                    with patch.object(awning_automation, "get_thresholds", return_value=(15, 20, 400, 4, 50, 80, 60, 95, 30, 20, 400.0, 15.0, 450.0, 60.0, 215.0, True)):
+                    with patch.object(awning_automation, "get_thresholds", return_value=(15, 20, 400, 4, 50, 80, 60, 95, 30, 20, 400.0, 15.0, 450.0, 60.0, 249.0, True)):
                         with patch.object(awning_automation, "load_telegram_config", return_value=("fake_token", "fake_chat")):
                             with patch.object(
                                 awning_automation,
@@ -2989,7 +3091,7 @@ class TestCloseNotificationAttribution(unittest.TestCase):
              patch.object(awning_automation, "setup_logging", return_value=mock_log_path), \
              patch.object(awning_automation, "load_location_config", return_value=(35.778, -78.838)), \
              patch.object(awning_automation, "get_thresholds",
-                          return_value=(15, 15, 400, 4, 50, 80, 45, 95, 30, 20, 650.0, 15.0, 450.0, 60.0, 215.0, True)), \
+                          return_value=(15, 15, 400, 4, 50, 80, 45, 95, 30, 20, 650.0, 15.0, 450.0, 60.0, 249.0, True)), \
              patch.object(awning_automation, "load_telegram_config", return_value=("fake_token", "fake_chat")), \
              patch.object(awning_automation, "collect_weather_measurements", return_value=weather), \
              patch.object(awning_automation, "calculate_sun_position",
