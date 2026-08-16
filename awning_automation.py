@@ -61,6 +61,7 @@ import io
 import logging
 import math
 import os
+import statistics
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -416,6 +417,23 @@ _CROSSCHECK_TIMEOUT_S = 8
 # response whose recent entries are missing would otherwise let a stale
 # early-morning slot rescue a late-afternoon run.
 _CROSSCHECK_MAX_SLOT_AGE_MIN = 60
+
+# Trailing-window smoothing for the primary feed's irradiance fields.
+#
+# The primary (`best_match`) feed resolves to GFS/HRRR here, and its 15-minute
+# radiation series is not physically continuous. On 2026-08-16 its GHI read
+# 130 → 20 → 760 → 170 W/m² across four consecutive slots while ECMWF held
+# 701/708/710/707 and ICON held 500/521/541/555 over the same slots. GHI cannot
+# change by 38x in fifteen minutes under any real sky, so a single instantaneous
+# sample of this series is noise, not a measurement, and the sunny gate chases it.
+#
+# Four slots = the trailing hour. MEDIAN, not max: max would amplify the bogus
+# 760 W/m² spike exactly as badly as a single sample does, just in the other
+# direction. The median of four samples is robust to one bad slot either way.
+_SMOOTHING_SLOTS = 4
+# minutely_15 fields the primary request pulls for smoothing. Kept separate from
+# the precipitation field so the reason each is requested stays legible.
+_SMOOTHED_FIELDS = ("shortwave_radiation", "direct_normal_irradiance")
 
 
 def get_thresholds() -> tuple[float, float, float, float, float, float, float, float, float, int, float, float, float, float, float, bool]:
@@ -882,7 +900,11 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
             "cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high"
         ),
         "hourly": "precipitation_probability",
-        "minutely_15": "precipitation",
+        # precipitation drives the rain-gate lookback; the two irradiance fields
+        # drive the trailing-median smoothing (_SMOOTHING_SLOTS). Adding them
+        # costs no extra request and — critically — adds no `models=` key, which
+        # fetch_weather() must never carry (see fetch_crosscheck_irradiance).
+        "minutely_15": "precipitation," + ",".join(_SMOOTHED_FIELDS),
         "daily": "sunrise,sunset",
         "wind_speed_unit": "mph",
         "temperature_unit": "fahrenheit",
@@ -985,6 +1007,17 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
                     past_slots.append(m15_precip[idx])
             minutely_15_precip = past_slots[-3:] if past_slots else []
 
+        # Trailing-hour medians for the sunny gate's irradiance inputs. Both fall
+        # back to the instantaneous `current` value when the series is absent,
+        # short, or all-null — missing data must never harden the gate, which is
+        # the same fail-open convention the radar and crosscheck paths follow.
+        ghi_smoothed = _trailing_median(
+            data.get("minutely_15"), "shortwave_radiation", current.get("time", "")
+        )
+        dni_smoothed = _trailing_median(
+            data.get("minutely_15"), "direct_normal_irradiance", current.get("time", "")
+        )
+
         # Extract daily data (sunrise/sunset)
         if "daily" not in data:
             raise WeatherAPIError("Weather API response missing 'daily' field")
@@ -1013,10 +1046,58 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
             "sunset": daily["sunset"][0],
             "hourly_precip_prob": hourly_precip_prob,
             "minutely_15_precip": minutely_15_precip,
+            # Consumed by the SUNNY gate only. The rain gate deliberately keeps
+            # reading the instantaneous "dni" above: its clear-sky radar veto was
+            # calibrated across three separate false-close incidents, and feeding
+            # it a smoothed (lower) DNI would make that veto harder to trigger
+            # and re-open the radar-clutter closes it exists to prevent.
+            "ghi_smoothed": ghi_smoothed if ghi_smoothed is not None else current["shortwave_radiation"],
+            "dni_smoothed": dni_smoothed if dni_smoothed is not None else current.get("direct_normal_irradiance", 0),
         }
 
     except requests.RequestException as e:
         raise WeatherAPIError(f"Failed to fetch weather data: {e}") from e
+
+
+def _trailing_median(
+    m15: Optional[dict],
+    field: str,
+    current_time_str: str,
+    slots: int = _SMOOTHING_SLOTS,
+) -> Optional[float]:
+    """Median of the last `slots` minutely_15 values of `field` at or before now.
+
+    Used to de-noise the primary feed's irradiance, whose 15-minute series is
+    not physically continuous (see _SMOOTHING_SLOTS).
+
+    Returns None — meaning "caller should fall back to the instantaneous value" —
+    whenever the data cannot support a median: no minutely_15 block, no such
+    field, no slot at or before `current_time_str`, or every candidate slot null.
+    Never raises.
+    """
+    if not m15:
+        return None
+
+    times = m15.get("time") or []
+    values = m15.get(field)
+    if not times or not values:
+        return None
+
+    # Slots are in ascending time order. Take the most recent `slots` entries at
+    # or before now, then drop nulls among them — order matters: filtering first
+    # would silently reach further back in time to make up the count.
+    past: list = []
+    for idx, ts in enumerate(times):
+        if ts > current_time_str:
+            break
+        if idx < len(values):
+            past.append(values[idx])
+
+    window = [v for v in past[-slots:] if v is not None]
+    if not window:
+        return None
+
+    return float(statistics.median(window))
 
 
 def _fetch_weather_request(url: str, params: dict, timeout: int) -> dict:
@@ -1817,9 +1898,15 @@ def should_open_awning(
     wind_speed = weather["wind_speed_10m"]
     precipitation = weather["precipitation"]
     temperature = weather["temperature"]
-    ghi = weather["shortwave_radiation"]
+    # The SUNNY gate reads the trailing-hour medians (see _SMOOTHING_SLOTS); the
+    # rain gate below is handed the raw `weather` dict and keeps reading the
+    # instantaneous "dni" on purpose. Both keys default to the instantaneous
+    # value, so a weather dict built without them behaves exactly as before.
+    ghi_raw = weather["shortwave_radiation"]
+    dni_raw = weather.get("dni", 0.0)
+    ghi = weather.get("ghi_smoothed", ghi_raw)
+    dni = weather.get("dni_smoothed", dni_raw)
     uv_index = weather["uv_index"]
-    dni = weather.get("dni", 0.0)
     cloud_cover = weather.get("cloud_cover", 100.0)
     cloud_cover_mid = weather.get("cloud_cover_mid", 100.0)
     cloud_cover_high = weather.get("cloud_cover_high", 100.0)
@@ -1906,6 +1993,7 @@ def should_open_awning(
     # sunny_primary, and no other condition key is touched, so the rescue can
     # never cause a close that would not already happen.
     sunny_rescued = False
+    sunny_rescued_observed = False
     crosscheck = None
     if not sunny_crosscheck_enabled:
         crosscheck_status = "disabled"
@@ -1935,22 +2023,78 @@ def should_open_awning(
         else:
             model_dni = crosscheck["dni"]
             weakest = min(model_dni.values())
+
+            # Tier 1 — FULL rescue. Overrides all three layers, for the case
+            # where the primary feed's whole radiation block has collapsed
+            # (2026-08-14: GFS reported DNI 0 and cloud 100% all morning on a
+            # cloudless day). Requires the Layer 1 direct-beam bar.
             sunny_rescued = weakest >= min_dni_direct
+
+            # Tier 2 — CONSISTENCY rescue. Strictly narrower: it satisfies only
+            # Layer 2, and only when Layers 1 and 3 already pass on their own.
+            #
+            # Layer 2 asks one question — "is at least min_dni of direct beam
+            # arriving?" — and answers it from the primary feed's DNI. When that
+            # field is corrupt, the question goes unanswered, and Tier 1 is the
+            # wrong instrument to answer it: min_dni_direct (400) is the Layer 1
+            # bar for "strongly sunny on direct beam alone", not the Layer 2 bar
+            # for "is DNI=0 believable?". Using it here discarded evidence that
+            # flatly contradicted the primary feed.
+            #
+            # 2026-08-16, five consecutive closes on a broken-cloud afternoon:
+            # primary DNI 0 W/m² and cloud 100%, while ECMWF read 335 and ICON
+            # 192 — both ~4-7x the min_dni bar of 50, both far below 400. UV held
+            # 6.2-7.3 throughout (a CAMS product, independent of GFS), confirming
+            # strong sun. So the models are asked the LAYER'S OWN question at the
+            # LAYER'S OWN bar. No fourth DNI threshold is introduced.
+            #
+            # Safety, measured over 92 days: only 28 daytime hours have Layer 1
+            # passing while Layer 2 fails. Rescuing at min_dni opens 15 dry hours
+            # and 4 hours within +/-1h of rain — and all 4 had UV 4.2-7.8, i.e.
+            # genuine sun beside a scattered shower. Genuinely dark rainy hours
+            # are rejected outright (2026-06-19 10:00: ECMWF 6, ICON 2). The rain
+            # gate is independent of this verdict and still closes on observed
+            # wetness regardless.
+            sunny_rescued_observed = (
+                not sunny_rescued
+                and sunny_model
+                and not_overcast
+                and not sunny_observed
+                and weakest >= min_dni
+            )
+
             detail = ", ".join(
                 f"{m}={model_dni[m]:.0f}" for m in _CROSSCHECK_MODELS
             )
-            comparison = ">=" if sunny_rescued else "<"
+            if sunny_rescued:
+                bar, verdict = min_dni_direct, "FULL RESCUE ENGAGED"
+            elif sunny_rescued_observed:
+                bar, verdict = min_dni, "CONSISTENCY RESCUE ENGAGED"
+            else:
+                # Report against the bar that was actually reachable: if only
+                # Layer 2 blocked, the consistency bar is the one that was missed.
+                only_layer2_blocked = sunny_model and not_overcast and not sunny_observed
+                bar = min_dni if only_layer2_blocked else min_dni_direct
+                verdict = "no rescue"
+            comparison = ">=" if (sunny_rescued or sunny_rescued_observed) else "<"
             crosscheck_status = (
                 f"{detail} W/m² @ {crosscheck['slot_time']}, "
-                f"weakest={weakest:.0f} {comparison} {min_dni_direct:.0f} → "
-                f"{'RESCUE ENGAGED' if sunny_rescued else 'no rescue'}"
+                f"weakest={weakest:.0f} {comparison} {bar:.0f} → {verdict}"
             )
 
-    is_sunny = sunny_primary or sunny_rescued
+    is_sunny = sunny_primary or sunny_rescued or sunny_rescued_observed
 
     # Logged on EVERY run (like `Rain signals:`), so a future false reading is
     # diagnosable from the log alone.
     logger.info(f"Sun crosscheck: {crosscheck_status}")
+
+    # Same rationale: show what the gate actually read versus what the feed
+    # reported this instant, so a suspect decision can be traced to the smoothing
+    # rather than guessed at.
+    logger.info(
+        f"Irradiance smoothing ({_SMOOTHING_SLOTS}-slot median): "
+        f"GHI {ghi_raw:.0f}→{ghi:.0f} W/m², DNI {dni_raw:.0f}→{dni:.0f} W/m²"
+    )
 
     conditions = {
         "sunny": is_sunny,
@@ -2026,14 +2170,21 @@ def should_open_awning(
     else:
         sunny_trace = f"overcast ceiling blocked: {overcast_trace} (model ok: {model_trace}, consistency ok: {obs_trace})"
 
-    if sunny_rescued and crosscheck is not None:
+    if (sunny_rescued or sunny_rescued_observed) and crosscheck is not None:
         _rescue_detail = ", ".join(
             f"{m} DNI {crosscheck['dni'][m]:.0f} W/m²" for m in _CROSSCHECK_MODELS
         )
-        sunny_trace = (
-            f"CROSS-MODEL RESCUE: {_rescue_detail} — all >= {min_dni_direct:.0f} "
-            f"(primary feed disagreed: {sunny_trace})"
-        )
+        if sunny_rescued:
+            sunny_trace = (
+                f"CROSS-MODEL RESCUE: {_rescue_detail} — all >= {min_dni_direct:.0f} "
+                f"(primary feed disagreed: {sunny_trace})"
+            )
+        else:
+            sunny_trace = (
+                f"CONSISTENCY RESCUE: {_rescue_detail} — all >= {min_dni:.0f} "
+                f"(model ok: {model_trace}, overcast ok: {overcast_trace}; "
+                f"primary consistency disagreed: {obs_trace})"
+            )
 
     # Build detailed reason string
     reasons = []
@@ -2217,7 +2368,9 @@ def main() -> None:
             f"Sun facing window ({sun_azimuth_min:.0f}°-{sun_azimuth_max:.0f}°), "
             f"radar_veto=(DNI >= {radar_veto_dni:.0f} W/m² AND cloud < {radar_veto_cloud_pct:.0f}%), "
             f"sunny_crosscheck=({'on' if sunny_crosscheck_enabled else 'off'}, "
-            f"{'+'.join(_CROSSCHECK_MODELS)} all DNI >= {min_dni_direct:.0f} W/m²)"
+            f"{'+'.join(_CROSSCHECK_MODELS)} all DNI >= {min_dni_direct:.0f} W/m² full "
+            f"| >= {min_dni:.0f} W/m² consistency), "
+            f"irradiance_smoothing={_SMOOTHING_SLOTS}-slot median"
         )
 
         # Load Telegram config (optional)

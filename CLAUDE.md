@@ -74,8 +74,18 @@ Bond Bridge awning controller - sends HTTP commands to control a motorized awnin
 
 ## Weather Automation
 
+**Irradiance smoothing (applies to the sunny gate's GHI and DNI inputs):**
+
+The primary `best_match` feed resolves to GFS/HRRR here, and its 15-minute radiation series is **not physically continuous**. On 2026-08-16 its GHI read `130 → 20 → 760 → 170` W/m² across four consecutive slots while ECMWF held `701/708/710/707` and ICON held `500/521/541/555` over the same slots. GHI cannot change 38× in fifteen minutes under any real sky, so a single instantaneous sample of that series is noise, not a measurement.
+
+The sunny gate therefore reads the **median of the trailing hour** (`_SMOOTHING_SLOTS` = 4) for GHI and DNI, exposed by `fetch_weather()` as `ghi_smoothed` / `dni_smoothed`. Median, not max — max would amplify the bogus 760 W/m² spike exactly as badly, just in the other direction. The fields ride on the request's **existing** `minutely_15=` block, so this costs no extra HTTP call and adds no `models=` key (which would break Layer 1's UV arm — see the cross-model rescue below).
+
+**Fails open**: an absent, short, or all-null series falls back to the instantaneous `current` value, so missing data never hardens the gate. **Scoped to the sunny gate only** — the rain gate, including the `RADAR_VETO_DNI_WM2` clear-sky veto, deliberately keeps reading the instantaneous `dni`; that veto was calibrated across three separate false-close incidents, and a smoothed (lower) DNI would make it harder to trigger and re-open the radar-clutter closes it exists to prevent. Every run logs an `Irradiance smoothing:` line showing raw → smoothed for both fields.
+
+Measured over 14 days (420 daytime 15-min slots), smoothing plus the Tier-2 rescue below take the gate from **349 sunny slots / 33 state flips** to **365 slots / 17 flips** — more open time and half the churn. The two changes are complementary: the rescue recovers stuck-closed time, smoothing removes the flapping.
+
 **Decision Logic (ALL 7 conditions must be met to open):**
-1. **Sunny**: multi-layer model — ALL three layers must be true:
+1. **Sunny**: multi-layer model — ALL three layers must be true (GHI and DNI here are the *smoothed* values above):
    - **Model layer**: GHI >= `MIN_GHI_WM2` (default 400 W/m²) OR UV >= `MIN_UV_INDEX` (default 4.0) OR DNI >= `MIN_DNI_DIRECT_WM2` (default 450 W/m²). The **direct-beam bypass** exists because GHI and UV are both measured on a *horizontal* plane and are therefore suppressed by the sin(altitude) projection at low sun elevation — at a 22.5° sun altitude a horizontal surface collects only ~38% of the beam, so on a cloudless summer morning GHI physically cannot reach 400 W/m² until roughly 09:10 no matter how strong the sun is. The window is vertical and takes a low morning sun nearly head-on, so GHI measures the wrong plane for this application. DNI is measured normal to the sun and is not projection-suppressed, so it recognizes morning sun that horizontal irradiance cannot see. Mirrors the existing `MIN_DNI_CIRRUS_WM2` guard on the overcast ceiling, which already lets direct irradiance override a cloud-derived verdict. Added after the 2026-08-13 incident where the awning stayed shut at 08:30 on a clear 78°F morning with DNI=498 W/m² and 0% cloud, and had to be opened by hand; the 450 default sits above that morning's 08:15 reading of DNI=445 (so it does not open earlier than intended) and far above the DNI 0–50 range of a bright-overcast morning, which is what keeps diffuse light from defeating it.
    - **Consistency layer**: DNI >= `MIN_DNI_WM2` (default 50 W/m²) OR total cloud cover < `MAX_CLOUD_COVER_PCT` (default 80%)
    - **Overcast ceiling**: max(cloud_cover_mid, cloud_cover_high) < threshold (default 95%) OR DNI >= `MIN_DNI_CIRRUS_WM2` (default 30 W/m²). The DNI guard bypasses the ceiling when direct irradiance proves the sun is reaching the ground — added after the 2026-05-12 incident where Open-Meteo's `cloud_cover_high` field hallucinated 100% on a clear day with DNI=905 W/m².
@@ -89,7 +99,23 @@ Bond Bridge awning controller - sends HTTP commands to control a motorized awnin
 
      **Why BOTH models** rather than either: sized empirically over 14 days of history, requiring both fires on only **3–4% of daylight hours**, every one a genuinely sunny hour where GFS undershot. Threshold sensitivity is flat between 350 and 500 W/m², so it reuses `MIN_DNI_DIRECT_WM2` (450) rather than introducing a fourth DNI threshold.
 
-     **Rescue-only and fail-open.** It can only flip `sunny` False → True, never the reverse, so it can never cause a close that would not already happen — a monotonicity test pins this. Any fetch error, timeout, null value, missing slot, or slot older than 60 minutes returns "no rescue" and reverts to primary-feed-only behavior. It skips the request entirely when the primary already says sunny, when coordinates are absent, or when the daytime/altitude/azimuth gates are closed — so most runs, including every nighttime run, make no extra request. Every run logs a `Sun crosscheck:` line, and the `Decision:` string names the rescue when it engages. Note it does **not** write to the `_attribution` out-param: that is consumed positionally by `build_close_reason()`, whose first branch is the rain branch, so a sunny string there would make an unrelated close announce a sun message.
+     **Two tiers.** The rescue has a second, strictly narrower tier added after the 2026-08-16 incident:
+
+     - **Tier 1 — full rescue** (bar `MIN_DNI_DIRECT_WM2`): overrides all three layers. The 2026-08-14 case, where the primary feed's entire radiation block collapsed.
+     - **Tier 2 — consistency rescue** (bar `MIN_DNI_WM2`, 50): satisfies **only Layer 2**, and only when Layers 1 and 3 already pass on their own. Layer 3 is *not* bypassed — a test pins this, and it is the main way this tier could regress into the full rescue.
+
+     **Why Tier 2 exists.** On **2026-08-16** the awning closed five runs in a row (12:15–13:15) on a broken-cloud afternoon the operator wanted shade for. Only Layer 2 failed: primary DNI 0 W/m² and cloud 100%, while ECMWF read 335 and ICON 192 — both 4–7× the `MIN_DNI_WM2` bar of 50, both far below the 400 bar Tier 1 compares against. UV held 6.2–7.3 throughout, independently confirming strong sun. The rescue was *holding* evidence that flatly contradicted `DNI=0` and discarding it, because it asked the wrong question:
+
+     | question | correct bar |
+     |---|---|
+     | "Is there enough direct beam to call it sunny on its own?" | 400 — Layer 1 |
+     | "Is the primary feed's claim of DNI=0 believable?" | 50 — Layer 2's own bar |
+
+     Reusing `MIN_DNI_DIRECT_WM2` for both conflated them. Tier 2 asks the models **the failing layer's own question at the failing layer's own bar**, so it introduces no fourth DNI threshold. `MIN_DNI_WM2` now does double duty (Layer 2 bar *and* Tier 2 rescue bar), the same way `MIN_DNI_DIRECT_WM2` already does.
+
+     **Sizing, measured over 92 days.** Only **28 daytime hours** have Layer 1 passing while Layer 2 fails. Rescuing at bar 50 opens 15 dry hours and 4 hours within ±1h of rain — and all 4 of those had UV 4.2–7.8, i.e. genuine sun beside a scattered shower. Genuinely dark rainy hours are rejected outright (2026-06-19 10:00: ECMWF 6, ICON 2). The rain gate is independent of the sunny verdict and still closes on observed wetness regardless, so Tier 2 cannot open the awning into falling rain.
+
+     **Rescue-only and fail-open.** Neither tier can flip `sunny` True → False, so neither can cause a close that would not already happen — a monotonicity test pins this. Any fetch error, timeout, null value, missing slot, or slot older than 60 minutes returns "no rescue" and reverts to primary-feed-only behavior. It skips the request entirely when the primary already says sunny, when coordinates are absent, or when the daytime/altitude/azimuth gates are closed — so most runs, including every nighttime run, make no extra request. Every run logs a `Sun crosscheck:` line, and the `Decision:` string names the rescue when it engages. Note it does **not** write to the `_attribution` out-param: that is consumed positionally by `build_close_reason()`, whose first branch is the rain branch, so a sunny string there would make an unrelated close announce a sun message.
 2. **Calm**: Wind speed < `WIND_SPEED_THRESHOLD_MPH` (default 15.0 mph)
 3. **No rain (multi-signal gate)**: the awning closes only on **observed wetness** or a forecast signal that is not vetoed by provably-clear sky conditions. Signals are divided into two categories:
 
@@ -129,7 +155,7 @@ If ANY condition fails, the awning closes. Fail-safe: closes awning if weather A
 **Each cron run acts immediately on the current conditions** — all conditions met opens the awning, any condition failing closes it, with no debounce or vote-counting between runs. (An earlier anti-flapping hysteresis that required two consecutive "open" votes was removed on 2026-06-24: Open-Meteo's irradiance/cloud data is hourly so it does not jitter between 15-min runs, rain-driven close is already immediate, and the RainViewer clear-sky veto removed the main flap source — so the debounce only added a ~30-minute open lag.)
 
 **Logging:**
-- Every run emits three diagnostic lines alongside `Conditions:`/`Decision:` — `RainViewer:` (radar pixel decode), `Rain signals:` (every rain signal's value and whether the forecast veto engaged), and `Sun crosscheck:` (per-model DNI, the slot read, and whether the rescue engaged / was skipped / was unavailable). Each is designed so a false reading can be diagnosed from the log alone.
+- Every run emits four diagnostic lines alongside `Conditions:`/`Decision:` — `RainViewer:` (radar pixel decode), `Rain signals:` (every rain signal's value and whether the forecast veto engaged), `Sun crosscheck:` (per-model DNI, the slot read, and whether a rescue engaged — naming which tier — / was skipped / was unavailable), and `Irradiance smoothing:` (raw → smoothed GHI and DNI). Each is designed so a false reading can be diagnosed from the log alone.
 - Daily log rotation in `logs/` directory as `awning-YYYY-MM-DD.log`
 - Symlink at `~/awning.log` always points to today's log
 - Auto-cleanup after 30 days (configurable via `LOG_RETENTION_DAYS`)
@@ -175,7 +201,7 @@ See `.env.example` for full documentation. Key variables:
 **Optional for automation (have defaults):**
 - `MIN_GHI_WM2` - Min global horizontal irradiance W/m² for Layer 1 sunny gate (default: 400)
 - `MIN_UV_INDEX` - Min UV Index for Layer 1 sunny gate (default: 4)
-- `MIN_DNI_WM2` - Min direct normal irradiance W/m² for Layer 2 consistency check (default: 50)
+- `MIN_DNI_WM2` - Min direct normal irradiance W/m² for Layer 2 consistency check (default: 50). **Does double duty**: it is also the Tier-2 cross-model *consistency rescue* bar, so raising it tightens both
 - `MAX_CLOUD_COVER_PCT` - Max total cloud cover % for Layer 2 consistency check (default: 80)
 - `MIN_TEMPERATURE_F` - Min temperature °F to open awning (default: 45)
 - `OVERCAST_THRESHOLD_PCT` - Layer 3 hard ceiling: max(cloud_cover_mid, cloud_cover_high) must be below this % (default: 95)
@@ -186,7 +212,7 @@ See `.env.example` for full documentation. Key variables:
 - `MIN_DNI_DIRECT_WM2` - Layer 1 direct-beam bypass: DNI at or above this W/m² satisfies the model layer on its own, regardless of GHI and UV. Distinct from `MIN_DNI_WM2` (Layer 2 consistency) and `MIN_DNI_CIRRUS_WM2` (Layer 3 ceiling guard) — three separate DNI thresholds serving three different layers (default: 450). **This bar does double duty**: it is also the cross-model rescue bar, so lowering it loosens both the primary bypass and the rescue. **The deployed `.env` pins it to 400**, lowered on 2026-08-14 because at 450 the rescue still left a 15-minute gap at 08:45 (ECMWF read 433). Checked over 14 days of history, 400 clears the bypass on 19 extra 15-min slots, all at the edges of the day — and every one outside 08:15–08:45 is already blocked by the azimuth ceiling (evening sun sits at 271–284°, past the ceiling — which was 215° when this was measured and is 249° as of 2026-08-14; both block it) or by the sun-altitude gate. This supersedes the 2026-08-13 calibration note above, which chose 450 to keep an 08:15 reading of DNI=445 closed.
 - `SUN_AZIMUTH_MIN_DEG` - Near edge of the sun-facing-window arc, in degrees. Below this the sun has not yet come round onto the window. Lower it if the awning is late to open on summer mornings (default: 60)
 - `SUN_AZIMUTH_MAX_DEG` - Far edge of the sun-facing-window arc, in degrees. Above this the sun has passed off the window. Raise it if the awning closes while sun is still on the glass. Calibrated 2026-08-14 from the operator watching the house shadow reach the porch at 16:01 — see condition 7 above for why this bound has been wrong twice (default: 249)
-- `SUNNY_CROSSCHECK_ENABLED` - Cross-model sun confirmation kill switch. When on, a "not sunny" verdict from the primary feed is overturned if ECMWF and ICON both report DNI >= `MIN_DNI_DIRECT_WM2`. Rescue-only and fail-open — see the sunny-gate section above for the 2026-08-14 incident. Accepts true/1/yes/on or false/0/no/off (default: true)
+- `SUNNY_CROSSCHECK_ENABLED` - Cross-model sun confirmation kill switch, governing **both** rescue tiers. When on, a "not sunny" verdict from the primary feed is overturned if ECMWF and ICON both report DNI >= `MIN_DNI_DIRECT_WM2` (Tier 1, overrides all layers), or if they both report DNI >= `MIN_DNI_WM2` while only Layer 2 is blocking (Tier 2, consistency rescue). Rescue-only and fail-open — see the sunny-gate section above for the 2026-08-14 and 2026-08-16 incidents. Accepts true/1/yes/on or false/0/no/off (default: true)
 
 **Optional:**
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` - For notifications

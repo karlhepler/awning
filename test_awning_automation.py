@@ -3743,5 +3743,491 @@ class TestGetThresholdsSunnyCrosscheck(unittest.TestCase):
             self._get("maybe")
 
 
+class TestConsistencyRescue(unittest.TestCase):
+    """
+    Layer-2 consistency rescue — the 2026-08-16 broken-cloud incident.
+
+    Five consecutive runs (12:15-13:15) closed the awning on a broken-cloud
+    afternoon the operator wanted shade for. Only Layer 2 failed: the primary
+    feed read DNI 0 W/m² and cloud 100%, while ECMWF read 335 and ICON 192 —
+    both far above the min_dni bar of 50, both far below the min_dni_direct bar
+    of 400 the full rescue compares against. UV held 6.2-7.3 throughout (a CAMS
+    product, independent of GFS), independently confirming strong sun.
+    """
+
+    # The exact readings the Pi logged at 12:15 on 2026-08-16. Note Layer 1
+    # passes on UV alone and Layer 3 passes outright (mid 0%, high 0%) — this is
+    # what distinguishes the incident from 2026-08-14, where all three failed.
+    INCIDENT_WEATHER = dict(
+        shortwave_radiation=167.0,
+        uv_index=7.2,
+        dni=0.0,
+        cloud_cover=100.0,
+        cloud_cover_low=100.0,
+        cloud_cover_mid=0.0,
+        cloud_cover_high=0.0,
+        temperature=86.7,
+        wind_speed=5.9,
+    )
+
+    SUN = dict(azimuth=136.1, altitude=61.5)
+
+    @staticmethod
+    def _crosscheck(ecmwf, icon, slot_time="2026-08-16T12:15"):
+        return {
+            "dni": {"ecmwf_ifs025": ecmwf, "icon_seamless": icon},
+            "ghi": {"ecmwf_ifs025": None, "icon_seamless": None},
+            "slot_time": slot_time,
+        }
+
+    def _run(self, crosscheck, **overrides):
+        kwargs = dict(_THRESHOLDS)
+        kwargs.update(lat=35.778, lon=-78.838)
+        kwargs.update(overrides)
+        weather_kwargs = dict(self.INCIDENT_WEATHER)
+        for key in list(weather_kwargs):
+            if key in kwargs:
+                weather_kwargs[key] = kwargs.pop(key)
+        with unittest.mock.patch.object(
+            awning_automation, "fetch_crosscheck_irradiance", return_value=crosscheck
+        ) as mock_fetch:
+            result = should_open_awning(
+                _weather(**weather_kwargs), _sun(**self.SUN), _DAYTIME, **kwargs
+            )
+        return result + (mock_fetch,)
+
+    # -- The headline regression -------------------------------------------
+
+    def test_regression_2026_08_16_broken_cloud_reopens(self):
+        """Layers 1 and 3 pass; only Layer 2 fails; ECMWF+ICON satisfy it."""
+        w = _weather(**self.INCIDENT_WEATHER)
+
+        # Layer 1 passes on UV alone (the field GFS did not corrupt).
+        self.assertGreaterEqual(w["uv_index"], 4.0)
+        # Layer 2 fails on BOTH arms — the gate that actually closed the awning.
+        self.assertLess(w["dni"], 50.0)
+        self.assertGreaterEqual(w["cloud_cover"], 80.0)
+        # Layer 3 passes outright: no mid or high cloud at all.
+        self.assertLess(max(w["cloud_cover_mid"], w["cloud_cover_high"]), 95.0)
+
+        should_open, reason, conditions, _ = self._run(self._crosscheck(335.0, 192.0))
+
+        self.assertTrue(
+            should_open,
+            "Awning must open: both independent models contradict DNI=0 by 4-7x",
+        )
+        self.assertTrue(conditions["sunny"])
+        self.assertIn("CONSISTENCY RESCUE", reason)
+        self.assertIn("335", reason)
+        self.assertIn("192", reason)
+        # The primary feed's verdict must still be reported honestly.
+        self.assertIn("primary consistency disagreed", reason)
+
+    def test_below_full_rescue_bar_so_old_logic_would_have_closed(self):
+        """
+        Pins WHY this tier exists: the incident readings are far below
+        min_dni_direct, so the pre-existing full rescue cannot reach them.
+        """
+        for model_dni in (335.0, 192.0):
+            self.assertLess(model_dni, _THRESHOLDS["min_dni"] * 8)
+            self.assertLess(model_dni, 400.0)
+
+        should_open, reason, _, _ = self._run(
+            self._crosscheck(335.0, 192.0), sunny_crosscheck_enabled=False
+        )
+        self.assertFalse(should_open, "With the rescue off, this is the old behaviour")
+        self.assertIn("observed failed", reason)
+
+    # -- Safety: the narrow tier must stay narrow --------------------------
+
+    def test_does_not_bypass_overcast_ceiling(self):
+        """
+        The crux separating this tier from the full rescue. Under a genuine
+        overcast ceiling (Layer 3 blocked), cross-model DNI above min_dni must
+        NOT open the awning — only the full rescue may override Layer 3.
+        """
+        should_open, _, conditions, _ = self._run(
+            self._crosscheck(335.0, 192.0),
+            cloud_cover_mid=99.0,
+            cloud_cover_high=99.0,
+        )
+        self.assertFalse(should_open)
+        self.assertFalse(conditions["sunny"])
+
+        # ...but the FULL rescue still may, which is the 2026-08-14 behaviour.
+        should_open, reason, _, _ = self._run(
+            self._crosscheck(574.0, 754.0),
+            cloud_cover_mid=99.0,
+            cloud_cover_high=99.0,
+        )
+        self.assertTrue(should_open)
+        self.assertIn("CROSS-MODEL RESCUE", reason)
+
+    def test_does_not_fire_when_layer1_fails(self):
+        """
+        A genuinely dark hour: 2026-06-19 10:00 had UV 0.3 with ECMWF 6 and
+        ICON 2. Layer 1 fails, so the consistency tier must not engage.
+        """
+        should_open, _, conditions, _ = self._run(
+            self._crosscheck(6.0, 2.0),
+            shortwave_radiation=194.0,
+            uv_index=0.3,
+        )
+        self.assertFalse(should_open)
+        self.assertFalse(conditions["sunny"])
+
+    def test_requires_both_models_above_min_dni(self):
+        for ecmwf, icon, expected in [
+            (335.0, 192.0, True),
+            (335.0, 12.0, False),   # ICON says no direct beam
+            (12.0, 192.0, False),   # ECMWF says no direct beam
+            (12.0, 2.0, False),     # neither
+        ]:
+            with self.subTest(ecmwf=ecmwf, icon=icon):
+                should_open, _, conditions, _ = self._run(
+                    self._crosscheck(ecmwf, icon)
+                )
+                self.assertEqual(conditions["sunny"], expected)
+                self.assertEqual(should_open, expected)
+
+    def test_uses_min_dni_not_a_fourth_threshold(self):
+        """The bar is Layer 2's own knob — moving min_dni moves the rescue."""
+        just_under = self._crosscheck(60.0, 55.0)
+        self.assertTrue(self._run(just_under, min_dni=50.0)[2]["sunny"])
+        self.assertFalse(self._run(just_under, min_dni=100.0)[2]["sunny"])
+
+    def test_is_strictly_additive(self):
+        """Neither tier may ever flip sunny True -> False."""
+        for ecmwf, icon in [(0.0, 0.0), (335.0, 192.0), (574.0, 754.0), (900.0, 900.0)]:
+            with self.subTest(ecmwf=ecmwf, icon=icon):
+                # A day the primary already calls sunny stays sunny regardless.
+                _, _, conditions, mock_fetch = self._run(
+                    self._crosscheck(ecmwf, icon),
+                    dni=500.0,
+                    cloud_cover=10.0,
+                )
+                self.assertTrue(conditions["sunny"])
+                # ...and no request is spent when the primary already agrees.
+                mock_fetch.assert_not_called()
+
+    def test_rescue_never_overrides_other_gates(self):
+        """Rain, wind, and cold still close the awning through a rescue."""
+        for override in (
+            dict(wind_speed=40.0),
+            dict(temperature=20.0),
+            dict(precipitation=5.0),
+        ):
+            with self.subTest(**override):
+                kwargs = dict(_THRESHOLDS)
+                kwargs.update(lat=35.778, lon=-78.838)
+                weather_kwargs = dict(self.INCIDENT_WEATHER)
+                weather_kwargs.update(override)
+                with unittest.mock.patch.object(
+                    awning_automation,
+                    "fetch_crosscheck_irradiance",
+                    return_value=self._crosscheck(335.0, 192.0),
+                ), unittest.mock.patch.object(
+                    awning_automation, "is_raining_on_radar", return_value=False
+                ):
+                    should_open, _, _, = should_open_awning(
+                        _weather(**weather_kwargs), _sun(**self.SUN), _DAYTIME, **kwargs
+                    )
+                self.assertFalse(should_open)
+
+    def test_does_not_populate_attribution(self):
+        """
+        _attribution is consumed positionally by build_close_reason(), whose
+        first branch is rain. A sunny string there would make an unrelated close
+        announce a sun message.
+        """
+        attribution: list = []
+        kwargs = dict(_THRESHOLDS)
+        kwargs.update(lat=35.778, lon=-78.838, _attribution=attribution)
+        with unittest.mock.patch.object(
+            awning_automation,
+            "fetch_crosscheck_irradiance",
+            return_value=self._crosscheck(335.0, 192.0),
+        ):
+            should_open_awning(
+                _weather(**self.INCIDENT_WEATHER), _sun(**self.SUN), _DAYTIME, **kwargs
+            )
+        self.assertEqual(attribution, [])
+
+
+class TestIrradianceSmoothing(unittest.TestCase):
+    """
+    Trailing-hour median over the primary feed's irradiance.
+
+    On 2026-08-16 best_match GHI read 130 -> 20 -> 760 -> 170 W/m² across four
+    consecutive 15-minute slots while ECMWF held 701/708/710/707. A single
+    instantaneous sample of that series is noise, and the sunny gate chased it.
+    """
+
+    def _m15(self, ghi=None, dni=None, times=None):
+        block = {"time": times or [
+            "2026-08-16T12:30", "2026-08-16T12:45",
+            "2026-08-16T13:00", "2026-08-16T13:15",
+        ]}
+        if ghi is not None:
+            block["shortwave_radiation"] = ghi
+        if dni is not None:
+            block["direct_normal_irradiance"] = dni
+        return block
+
+    def test_median_of_trailing_window(self):
+        got = awning_automation._trailing_median(
+            self._m15(ghi=[120.0, 240.0, 130.0, 20.0]),
+            "shortwave_radiation",
+            "2026-08-16T13:15",
+        )
+        self.assertEqual(got, 125.0)  # median(120, 240, 130, 20)
+
+    def test_ignores_future_slots(self):
+        """A forecast slot ahead of `now` must never enter the window."""
+        got = awning_automation._trailing_median(
+            self._m15(ghi=[120.0, 240.0, 9999.0, 9999.0]),
+            "shortwave_radiation",
+            "2026-08-16T12:45",
+        )
+        self.assertEqual(got, 180.0)  # median(120, 240)
+
+    def test_median_rejects_a_single_spike(self):
+        """The whole point: one bogus 760 W/m² slot must not carry the gate."""
+        spiky = self._m15(ghi=[130.0, 20.0, 760.0, 170.0])
+        got = awning_automation._trailing_median(
+            spiky, "shortwave_radiation", "2026-08-16T13:15"
+        )
+        self.assertEqual(got, 150.0)
+        self.assertLess(got, 400.0, "A lone spike must not clear the GHI bar")
+
+    def test_fails_open_to_instantaneous(self):
+        """Every unusable shape returns None so the caller keeps `current`."""
+        for label, args in [
+            ("no block", (None, "shortwave_radiation", "2026-08-16T13:15")),
+            ("empty block", ({}, "shortwave_radiation", "2026-08-16T13:15")),
+            ("missing field", (self._m15(ghi=[1.0]), "direct_normal_irradiance",
+                               "2026-08-16T13:15")),
+            ("no past slot", (self._m15(ghi=[1.0, 2.0, 3.0, 4.0]),
+                              "shortwave_radiation", "2026-08-16T00:00")),
+            ("all null", (self._m15(ghi=[None, None, None, None]),
+                          "shortwave_radiation", "2026-08-16T13:15")),
+            ("no times", ({"shortwave_radiation": [1.0]},
+                          "shortwave_radiation", "2026-08-16T13:15")),
+        ]:
+            with self.subTest(label):
+                self.assertIsNone(awning_automation._trailing_median(*args))
+
+    def test_tolerates_partial_nulls(self):
+        got = awning_automation._trailing_median(
+            self._m15(ghi=[100.0, None, 300.0, None]),
+            "shortwave_radiation",
+            "2026-08-16T13:15",
+        )
+        self.assertEqual(got, 200.0)  # median of the two non-null values
+
+    def test_series_shorter_than_times(self):
+        """A truncated value array must not raise or index past its end."""
+        block = self._m15(ghi=[100.0, 200.0])
+        got = awning_automation._trailing_median(
+            block, "shortwave_radiation", "2026-08-16T13:15"
+        )
+        self.assertEqual(got, 150.0)
+
+    # -- Wiring ------------------------------------------------------------
+
+    def test_sunny_gate_reads_smoothed_values(self):
+        weather = _weather(shortwave_radiation=20.0, dni=0.0, uv_index=1.0,
+                           cloud_cover=100.0)
+        weather["ghi_smoothed"] = 600.0
+        weather["dni_smoothed"] = 500.0
+        should_open, _, conditions = should_open_awning(
+            weather, _sun(), _DAYTIME, **_THRESHOLDS
+        )
+        self.assertTrue(conditions["sunny"])
+        self.assertTrue(should_open)
+
+    def test_rain_gate_still_reads_instantaneous_dni(self):
+        """
+        The radar clear-sky veto was calibrated across three false-close
+        incidents against the instantaneous DNI. Smoothing must not reach it.
+        """
+        weather = _weather(dni=800.0, cloud_cover_low=2.0, cloud_cover_mid=0.0)
+        weather["dni_smoothed"] = 10.0  # would defeat the veto if it were read
+        with unittest.mock.patch.object(
+            awning_automation, "is_raining_on_radar", return_value=True
+        ):
+            no_rain = awning_automation.evaluate_rain_gate(
+                weather, 20, lat=35.778, lon=-78.838,
+                radar_veto_dni=650.0, radar_veto_cloud_pct=15.0,
+            )
+        self.assertTrue(no_rain, "Veto must engage on the instantaneous DNI 800")
+
+    def test_weather_dict_without_smoothing_keys_is_unchanged(self):
+        """Back-compat: the gate must behave identically without the new keys."""
+        weather = _weather()
+        self.assertNotIn("ghi_smoothed", weather)
+        should_open, _, conditions = should_open_awning(
+            weather, _sun(), _DAYTIME, **_THRESHOLDS
+        )
+        self.assertTrue(should_open)
+        self.assertTrue(conditions["sunny"])
+
+    def test_primary_request_asks_for_irradiance_but_no_models(self):
+        """
+        The smoothing fields ride on the EXISTING minutely_15 request. Adding a
+        `models=` key would break Layer 1's UV arm (ECMWF/ICON return uv_index
+        null), so it must never appear.
+        """
+        captured = {}
+
+        def fake_request(url, params, timeout):
+            captured.update(params)
+            raise awning_automation.WeatherAPIError("stop here")
+
+        with unittest.mock.patch.object(
+            awning_automation, "_fetch_weather_request", side_effect=fake_request
+        ):
+            with self.assertRaises(awning_automation.WeatherAPIError):
+                awning_automation.fetch_weather(35.778, -78.838)
+
+        self.assertNotIn("models", captured)
+        self.assertIn("precipitation", captured["minutely_15"])
+        self.assertIn("shortwave_radiation", captured["minutely_15"])
+        self.assertIn("direct_normal_irradiance", captured["minutely_15"])
+
+    def test_fetch_weather_populates_smoothed_keys(self):
+        """
+        The helper is useless if fetch_weather() never calls it. Drives the real
+        parse over a response shaped like the 2026-08-16 13:15 payload.
+        """
+        response = {
+            "current": {
+                "time": "2026-08-16T13:15",
+                "wind_speed_10m": 5.9, "precipitation": 0.0, "weather_code": 3,
+                "is_day": 1, "temperature_2m": 86.7,
+                "shortwave_radiation": 20.0, "uv_index": 6.2,
+                "direct_normal_irradiance": 0.0,
+                "cloud_cover": 100, "cloud_cover_low": 100,
+                "cloud_cover_mid": 0, "cloud_cover_high": 0,
+            },
+            "hourly": {"time": ["2026-08-16T13:00"], "precipitation_probability": [4]},
+            "minutely_15": {
+                "time": ["2026-08-16T12:30", "2026-08-16T12:45",
+                         "2026-08-16T13:00", "2026-08-16T13:15"],
+                "precipitation": [0.0, 0.0, 0.0, 0.0],
+                "shortwave_radiation": [120.0, 240.0, 130.0, 20.0],
+                "direct_normal_irradiance": [1.1, 0.0, 0.0, 0.0],
+            },
+            "daily": {"sunrise": ["2026-08-16T06:35"], "sunset": ["2026-08-16T20:03"]},
+        }
+        with unittest.mock.patch.object(
+            awning_automation, "_fetch_weather_request", return_value=response
+        ):
+            weather = awning_automation.fetch_weather(35.778, -78.838)
+
+        # The instantaneous sample the old gate read, versus the median.
+        self.assertEqual(weather["shortwave_radiation"], 20.0)
+        self.assertEqual(weather["ghi_smoothed"], 125.0)
+        self.assertEqual(weather["dni_smoothed"], 0.0)
+
+    def test_fetch_weather_falls_back_when_minutely_absent(self):
+        response = {
+            "current": {
+                "time": "2026-08-16T13:15",
+                "wind_speed_10m": 5.9, "precipitation": 0.0, "weather_code": 3,
+                "is_day": 1, "temperature_2m": 86.7,
+                "shortwave_radiation": 20.0, "uv_index": 6.2,
+                "direct_normal_irradiance": 7.0,
+                "cloud_cover": 100, "cloud_cover_low": 100,
+                "cloud_cover_mid": 0, "cloud_cover_high": 0,
+            },
+            "daily": {"sunrise": ["2026-08-16T06:35"], "sunset": ["2026-08-16T20:03"]},
+        }
+        with unittest.mock.patch.object(
+            awning_automation, "_fetch_weather_request", return_value=response
+        ):
+            weather = awning_automation.fetch_weather(35.778, -78.838)
+
+        self.assertEqual(weather["ghi_smoothed"], 20.0)
+        self.assertEqual(weather["dni_smoothed"], 7.0)
+
+
+class TestConsistencyRescueCompositionRoot(unittest.TestCase):
+    """
+    Drive the real main() on the 2026-08-16 incident numbers.
+
+    The unit tests above call should_open_awning() directly, so they would stay
+    green even if main() never plumbed the thresholds through. A --dry-run
+    cannot exercise this path either.
+    """
+
+    def test_main_opens_awning_on_consistency_rescue(self):
+        import sys
+        from unittest.mock import patch, MagicMock
+
+        mock_controller = MagicMock()
+        mock_log_path = MagicMock()
+        mock_log_path.parent = MagicMock()
+
+        # Exactly what the Pi logged at 12:15 on 2026-08-16.
+        weather = _weather(
+            shortwave_radiation=167.0,
+            uv_index=7.2,
+            dni=0.0,
+            cloud_cover=100.0,
+            cloud_cover_low=100.0,
+            cloud_cover_mid=0.0,
+            cloud_cover_high=0.0,
+            wind_speed=5.9,
+            temperature=86.7,
+            precipitation=0.0,
+            hourly_precip_prob=2,
+            minutely_15_precip=[0.0, 0.0, 0.0],
+            weather_code=3,
+            sunrise="2026-08-16T06:35:00",
+            sunset="2026-08-16T20:03:00",
+        )
+        weather["time"] = "2026-08-16T12:15:00"
+
+        env = {"WIND_SPEED_THRESHOLD_MPH": "15", "MIN_SUN_ALTITUDE_DEG": "15"}
+
+        def run(crosscheck_result):
+            mock_controller.reset_mock()
+            mock_controller.get_state.side_effect = [0, 1]
+            with patch.dict(os.environ, env, clear=True), \
+                 patch.object(sys, "argv", ["awning_automation.py"]), \
+                 patch.object(awning_automation, "setup_logging", return_value=mock_log_path), \
+                 patch.object(awning_automation, "load_location_config", return_value=(35.778, -78.838)), \
+                 patch.object(awning_automation, "load_telegram_config", return_value=(None, None)), \
+                 patch.object(awning_automation, "collect_weather_measurements", return_value=weather), \
+                 patch.object(awning_automation, "calculate_sun_position",
+                              return_value={"azimuth": 136.1, "altitude": 61.5}), \
+                 patch.object(awning_automation, "is_raining_on_radar", return_value=False), \
+                 patch.object(awning_automation, "fetch_crosscheck_irradiance",
+                              return_value=crosscheck_result), \
+                 patch.object(awning_automation, "create_controller_from_env",
+                              return_value=mock_controller):
+                awning_automation.main()
+            return mock_controller
+
+        incident = {
+            "dni": {"ecmwf_ifs025": 335.0, "icon_seamless": 192.0},
+            "ghi": {"ecmwf_ifs025": 650.0, "icon_seamless": 467.0},
+            "slot_time": "2026-08-16T12:15",
+        }
+
+        # The real 12:15 slot: both models clear min_dni (50) — open.
+        controller = run(incident)
+        controller.open.assert_called_once()
+        controller.close.assert_not_called()
+
+        # A genuinely dark hour (ECMWF 6, ICON 2) stays closed.
+        dark = dict(incident)
+        dark["dni"] = {"ecmwf_ifs025": 6.0, "icon_seamless": 2.0}
+        controller = run(dark)
+        controller.close.assert_called_once()
+        controller.open.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
