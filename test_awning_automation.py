@@ -171,6 +171,39 @@ class TestShouldOpenAwningOrGate(unittest.TestCase):
         self.assertIn("UV only", reason)
 
     # ------------------------------------------------------------------
+    # Test 3b — 2026-08-21 incident: high UV under HEAVY cloud must NOT carry
+    # Layer 1 alone. GHI=173, UV=7.5, cloud_cover=96 — same UV/GHI shape as
+    # Test 3 above, but under heavy cloud rather than thin cirrus. uv_index is
+    # not reliably cloud-attenuated (checked over 60 days: it sits within 5%
+    # of Open-Meteo's own uv_index_clear_sky field on 31% of heavy-cloud
+    # hours), so the UV arm is gated by cloud_cover < max_cloud_cover — the
+    # same threshold Layer 2 already uses. Contrast with Test 3: uv_sunny
+    # requires BOTH a high UV reading AND a plausible (non-overcast) sky.
+    # ------------------------------------------------------------------
+    def test_high_uv_under_heavy_cloud_does_not_open_via_uv(self):
+        """High UV (7.5) under 96% cloud must not satisfy Layer 1 alone → stays closed."""
+        should_open, reason, conditions = should_open_awning(
+            weather=_weather(
+                shortwave_radiation=173.0,
+                uv_index=7.5,
+                dni=0.0,
+                cloud_cover=96.0,
+            ),
+            sun_position=_sun(),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        self.assertFalse(
+            conditions["sunny"],
+            f"Expected sunny=False (UV gated off by heavy cloud) but got True. reason={reason!r}",
+        )
+        self.assertFalse(
+            should_open,
+            f"Expected awning to stay closed but got True. reason={reason!r}",
+        )
+        self.assertIn("gated off", reason)
+
+    # ------------------------------------------------------------------
     # Test 4 — Sunny but low UV (unusual but physically possible):
     # GHI=500, UV=2 → sunny_enough=True via GHI, opens.
     # Physical scenario: high solar elevation, less atmosphere, UV suppressed
@@ -754,6 +787,49 @@ class TestOvercastCeilingGate(unittest.TestCase):
             f"Expected awning to open (below ceiling) but got False. reason={reason!r}",
         )
 
+    # ------------------------------------------------------------------
+    # Test — 2026-08-21 incident: a solid LOW-level deck (cloud_cover_low=96%)
+    # left the ceiling blind before this fix, because it only ever read
+    # max(cloud_cover_mid, cloud_cover_high) — both 0% under a low deck.
+    # METAR KRDU read OVC015 (overcast at 1500 ft) throughout that morning.
+    # cloud_cover_low is now included in the ceiling's max(), so a solid low
+    # deck fires it exactly like a solid mid or high deck already did.
+    #
+    # Scenario mirrors test_overcast_ceiling_blocks_open, isolating Layer 3:
+    #   Layer 1: GHI=850 >= 400 → sunny_model=True
+    #   Layer 2: cloud=60 < 80 → sunny_observed=True (cloud arm rescues low DNI=14)
+    #   Layer 3: max(cloud_low=96, cloud_mid=0, cloud_high=0)=96 >= 95 ceiling
+    #            AND DNI=14 < 30 (min_dni_cirrus guard) → guard does NOT rescue
+    #            → not_overcast=False → sunny=False
+    # ------------------------------------------------------------------
+    def test_low_cloud_alone_triggers_overcast_ceiling(self):
+        """Solid low deck (low=96%, mid=0%, high=0%) with low DNI → ceiling fires → stays closed."""
+        should_open, reason, conditions = should_open_awning(
+            weather=_weather(
+                shortwave_radiation=850.0,
+                uv_index=2.7,
+                dni=14.0,
+                cloud_cover=60.0,
+                cloud_cover_low=96.0,
+                cloud_cover_mid=0.0,
+                cloud_cover_high=0.0,
+                temperature=77.9,
+            ),
+            sun_position=_sun(),
+            current_time=_DAYTIME,
+            **_THRESHOLDS,
+        )
+        self.assertFalse(
+            conditions["sunny"],
+            f"Expected sunny=False (low-cloud ceiling should block) but got True. reason={reason!r}",
+        )
+        self.assertFalse(
+            should_open,
+            f"Expected awning to stay closed (solid low deck) but got True. reason={reason!r}",
+        )
+        self.assertIn("overcast", reason.lower())
+        self.assertIn("cloud_low=96", reason)
+
 
 class TestDirectBeamBypass(unittest.TestCase):
     """
@@ -1098,6 +1174,107 @@ class TestAzimuthCeilingObservedCalibration(unittest.TestCase):
             should_open,
             f"Expected awning OPEN at the 14:30 slot. reason={reason!r}",
         )
+
+
+class TestSolidOvercastRegression20260821(unittest.TestCase):
+    """
+    Pins the real 2026-08-21 cron log readings bracketing the solid-low-
+    overcast incident, so the Layer 1 UV gate and the Layer 3 low-cloud
+    ceiling cannot be silently walked back the way the azimuth ceiling was
+    in 2026-08-13. METAR KRDU read OVC015-OVC017 (overcast at 1100-1700 ft)
+    continuously through this whole window — the ground truth the awning
+    should have matched throughout.
+
+    12:15 and 12:30 are genuinely broken cloud (GHI still reaches 484 W/m²
+    smoothed) and correctly stay open under the fix, unchanged from what the
+    Pi actually did. 12:45 and 13:00 are the incident: GHI collapses under a
+    96-98% low deck while UV and both cross-check models keep reporting
+    strong sun — before this fix, the awning opened at both slots; after it,
+    both correctly close.
+    """
+
+    def _run(self, *, ghi_raw, ghi_smoothed, uv, dni_raw, dni_smoothed,
+             cloud, cloud_low, ecmwf, icon, azimuth, altitude):
+        weather = _weather(
+            shortwave_radiation=ghi_raw,
+            uv_index=uv,
+            dni=dni_raw,
+            cloud_cover=cloud,
+            cloud_cover_low=cloud_low,
+            cloud_cover_mid=0.0,
+            cloud_cover_high=0.0,
+            temperature=79.0,
+            wind_speed=6.0,
+        )
+        weather["ghi_smoothed"] = ghi_smoothed
+        weather["dni_smoothed"] = dni_smoothed
+        crosscheck = {
+            "dni": {"ecmwf_ifs025": ecmwf, "icon_seamless": icon},
+            "ghi": {"ecmwf_ifs025": None, "icon_seamless": None},
+            "slot_time": "2026-08-21T12:45",
+        }
+        kwargs = dict(_THRESHOLDS)
+        # The deployed .env pins MIN_DNI_DIRECT_WM2 to 400 (not the 450 code
+        # default) — matching it here is what makes these numbers reproduce
+        # exactly what the Pi logged.
+        kwargs.update(lat=35.778, lon=-78.838, min_dni_direct=400.0)
+        with unittest.mock.patch.object(
+            awning_automation, "fetch_crosscheck_irradiance", return_value=crosscheck
+        ):
+            return should_open_awning(
+                weather, _sun(azimuth=azimuth, altitude=altitude), _DAYTIME, **kwargs
+            )
+
+    def test_1215_slot_broken_cloud_stays_open(self):
+        """12:15 — GHI 495->484 smoothed carries Layer 1 on its own; genuinely broken cloud."""
+        should_open, reason, conditions = self._run(
+            ghi_raw=495.0, ghi_smoothed=484.0, uv=7.2, dni_raw=202.0, dni_smoothed=61.0,
+            cloud=85.0, cloud_low=85.0, ecmwf=None, icon=None,
+            azimuth=145.1, altitude=62.2,
+        )
+        self.assertTrue(should_open, f"Expected OPEN at 12:15 (broken cloud). reason={reason!r}")
+        self.assertTrue(conditions["sunny"])
+
+    def test_1230_slot_broken_cloud_stays_open(self):
+        """12:30 — GHI 270->484 smoothed still carries Layer 1; broken cloud continues."""
+        should_open, reason, conditions = self._run(
+            ghi_raw=270.0, ghi_smoothed=484.0, uv=7.4, dni_raw=6.0, dni_smoothed=64.0,
+            cloud=90.0, cloud_low=90.0, ecmwf=None, icon=None,
+            azimuth=152.4, altitude=63.8,
+        )
+        self.assertTrue(should_open, f"Expected OPEN at 12:30 (broken cloud). reason={reason!r}")
+        self.assertTrue(conditions["sunny"])
+
+    def test_1245_slot_solid_overcast_now_closes(self):
+        """
+        12:45 — the incident slot. GHI collapses to 173 smoothed under a 96%
+        low deck; UV (7.5) and both cross-check models (ECMWF 350, ICON 469)
+        keep reporting sun, but neither clears min_dni_direct (400), and the
+        deck fails the ceiling outright. Before this fix, UV alone opened it.
+        """
+        should_open, reason, conditions = self._run(
+            ghi_raw=180.0, ghi_smoothed=173.0, uv=7.5, dni_raw=0.0, dni_smoothed=0.0,
+            cloud=96.0, cloud_low=96.0, ecmwf=350.0, icon=469.0,
+            azimuth=160.4, altitude=65.0,
+        )
+        self.assertFalse(
+            should_open,
+            f"Expected CLOSED at 12:45 (solid overcast, METAR OVC015). reason={reason!r}",
+        )
+        self.assertFalse(conditions["sunny"])
+
+    def test_1300_slot_solid_overcast_now_closes(self):
+        """13:00 — the deck holds. GHI 410->250 smoothed; cloud low 98%; still closes."""
+        should_open, reason, conditions = self._run(
+            ghi_raw=410.0, ghi_smoothed=250.0, uv=7.7, dni_raw=0.0, dni_smoothed=0.0,
+            cloud=98.0, cloud_low=98.0, ecmwf=338.0, icon=485.0,
+            azimuth=169.0, altitude=65.8,
+        )
+        self.assertFalse(
+            should_open,
+            f"Expected CLOSED at 13:00 (solid overcast, METAR OVC015). reason={reason!r}",
+        )
+        self.assertFalse(conditions["sunny"])
 
 
 class TestTemperatureThreshold(unittest.TestCase):
@@ -3745,19 +3922,47 @@ class TestGetThresholdsSunnyCrosscheck(unittest.TestCase):
 
 class TestConsistencyRescue(unittest.TestCase):
     """
-    Layer-2 consistency rescue — the 2026-08-16 broken-cloud incident.
+    Layer-2 consistency rescue — the 2026-08-16 broken-cloud incident, revised
+    2026-08-21 after a solid low-overcast day exposed the same fixture as a
+    false positive.
 
-    Five consecutive runs (12:15-13:15) closed the awning on a broken-cloud
-    afternoon the operator wanted shade for. Only Layer 2 failed: the primary
-    feed read DNI 0 W/m² and cloud 100%, while ECMWF read 335 and ICON 192 —
-    both far above the min_dni bar of 50, both far below the min_dni_direct bar
-    of 400 the full rescue compares against. UV held 6.2-7.3 throughout (a CAMS
-    product, independent of GFS), independently confirming strong sun.
+    Five consecutive runs closed the awning on 2026-08-16 (12:15-13:15) on a
+    broken-cloud afternoon the operator wanted shade for. Only Layer 2 failed:
+    the primary feed read DNI 0 W/m² and cloud 100%, while ECMWF read 335 and
+    ICON 192 — both far above the min_dni bar of 50, both far below the
+    min_dni_direct bar of 400 the full rescue compares against. This tier
+    (Tier 2) was added to rescue exactly that shape.
+
+    On 2026-08-21 the SAME numbers recurred almost exactly (GHI 180, UV 7.5,
+    DNI 0, cloud low 96%/mid 0%/high 0%, ECMWF 350, ICON 469) — but this time
+    ground truth (METAR KRDU: OVC015, overcast at 1500 ft) said the sky was
+    genuinely, solidly overcast, and the awning stayed open for hours under it.
+    No available signal — including a real METAR observation — separates the
+    two days at decision time; the difference is what the sky did *next*
+    (08-16's deck broke 18 minutes later). This is a policy call, and the
+    costs are asymmetric: rescuing wrongly on 08-16 costs a ~30-minute late
+    open; rescuing wrongly on 08-21 costs hours of wrong-open. The operator
+    chose to lean toward closing.
+
+    Two changes implement that lean, both upstream of this rescue tier:
+      - The Layer 1 UV arm is now gated by cloud_cover (uv_index alone is not
+        reliably cloud-attenuated — see evaluate_sunny()'s Layer 1 comment).
+      - The Layer 3 overcast ceiling now includes cloud_cover_low, so a solid
+        low deck (mid=0%, high=0%) no longer passes Layer 3 outright.
+
+    Both changes make the ORIGINAL 2026-08-16 fixture (INCIDENT_WEATHER below)
+    fail Layer 1 and Layer 3, not just Layer 2 — so Tier 2's own precondition
+    ("only Layer 2 is blocking") no longer holds for it, and it now correctly
+    stays closed with no code change to the rescue itself. Tier 2 still exists
+    and still fires for a genuine broken-cloud reading, where GHI (not UV)
+    carries Layer 1 and no cloud layer is ≥95% (BROKEN_CLOUD_WEATHER below).
     """
 
-    # The exact readings the Pi logged at 12:15 on 2026-08-16. Note Layer 1
-    # passes on UV alone and Layer 3 passes outright (mid 0%, high 0%) — this is
-    # what distinguishes the incident from 2026-08-14, where all three failed.
+    # The exact readings the Pi logged at 12:15 on 2026-08-16. Kept verbatim
+    # for the historical record — see test_2026_08_16_solid_deck_now_closes.
+    # As of the 2026-08-21 revision this fixture fails Layer 1 (uv_sunny is
+    # now gated by cloud_cover=100%) AND Layer 3 (cloud_cover_low=100% now
+    # feeds the ceiling), not just Layer 2 as it did when this tier was built.
     INCIDENT_WEATHER = dict(
         shortwave_radiation=167.0,
         uv_index=7.2,
@@ -3770,6 +3975,24 @@ class TestConsistencyRescue(unittest.TestCase):
         wind_speed=5.9,
     )
 
+    # A genuine broken-cloud reading, post 2026-08-21: Layer 1 passes on GHI
+    # alone (not UV), Layer 3's ceiling is clear outright (no layer >= 95%),
+    # and only Layer 2 fails (DNI 10 < 50, cloud 85% >= 80%) — precisely the
+    # shape Tier 2 exists to rescue. Distinct from INCIDENT_WEATHER's solid
+    # deck: here low cloud tops out at 85%, not 100%, and daylight GHI still
+    # gets through at 450 W/m² — consistent with broken (not solid) cover.
+    BROKEN_CLOUD_WEATHER = dict(
+        shortwave_radiation=450.0,
+        uv_index=6.0,
+        dni=10.0,
+        cloud_cover=85.0,
+        cloud_cover_low=85.0,
+        cloud_cover_mid=5.0,
+        cloud_cover_high=5.0,
+        temperature=84.0,
+        wind_speed=6.0,
+    )
+
     SUN = dict(azimuth=136.1, altitude=61.5)
 
     @staticmethod
@@ -3780,11 +4003,11 @@ class TestConsistencyRescue(unittest.TestCase):
             "slot_time": slot_time,
         }
 
-    def _run(self, crosscheck, **overrides):
+    def _run(self, crosscheck, base=None, **overrides):
         kwargs = dict(_THRESHOLDS)
         kwargs.update(lat=35.778, lon=-78.838)
         kwargs.update(overrides)
-        weather_kwargs = dict(self.INCIDENT_WEATHER)
+        weather_kwargs = dict(base if base is not None else self.INCIDENT_WEATHER)
         for key in list(weather_kwargs):
             if key in kwargs:
                 weather_kwargs[key] = kwargs.pop(key)
@@ -3796,21 +4019,47 @@ class TestConsistencyRescue(unittest.TestCase):
             )
         return result + (mock_fetch,)
 
-    # -- The headline regression -------------------------------------------
+    # -- The headline regressions --------------------------------------------
 
-    def test_regression_2026_08_16_broken_cloud_reopens(self):
-        """Layers 1 and 3 pass; only Layer 2 fails; ECMWF+ICON satisfy it."""
+    def test_2026_08_16_solid_deck_now_closes(self):
+        """
+        Post 2026-08-21: the original 08-16 fixture now fails Layer 1 (UV
+        gated by 100% cloud) and Layer 3 (100% low cloud feeds the ceiling),
+        so Tier 2 never gets a chance to engage — it requires Layer 1 and
+        Layer 3 to already pass. This is the accepted trade-off: solid
+        low-overcast afternoons like this one now stay closed, in exchange
+        for correctly closing on 2026-08-21's near-identical numbers.
+        """
         w = _weather(**self.INCIDENT_WEATHER)
-
-        # Layer 1 passes on UV alone (the field GFS did not corrupt).
-        self.assertGreaterEqual(w["uv_index"], 4.0)
-        # Layer 2 fails on BOTH arms — the gate that actually closed the awning.
-        self.assertLess(w["dni"], 50.0)
-        self.assertGreaterEqual(w["cloud_cover"], 80.0)
-        # Layer 3 passes outright: no mid or high cloud at all.
-        self.assertLess(max(w["cloud_cover_mid"], w["cloud_cover_high"]), 95.0)
+        self.assertGreaterEqual(w["uv_index"], 4.0)  # UV itself still reads high...
+        self.assertGreaterEqual(w["cloud_cover"], 80.0)  # ...but cloud says no.
 
         should_open, reason, conditions, _ = self._run(self._crosscheck(335.0, 192.0))
+
+        self.assertFalse(
+            should_open,
+            "Solid low overcast must stay closed even when both rescue models "
+            "report a strong beam — see the 2026-08-21 incident.",
+        )
+        self.assertFalse(conditions["sunny"])
+
+    def test_broken_cloud_afternoon_still_rescued(self):
+        """Layers 1 and 3 pass on their own merits; only Layer 2 fails; ECMWF+ICON satisfy it."""
+        w = _weather(**self.BROKEN_CLOUD_WEATHER)
+
+        # Layer 1 passes on GHI alone — no dependency on the (now-gated) UV arm.
+        self.assertGreaterEqual(w["shortwave_radiation"], 400.0)
+        # Layer 2 fails on both arms — the gate this tier exists to rescue.
+        self.assertLess(w["dni"], 50.0)
+        self.assertGreaterEqual(w["cloud_cover"], 80.0)
+        # Layer 3 passes outright: no layer reaches the 95% ceiling.
+        self.assertLess(
+            max(w["cloud_cover_low"], w["cloud_cover_mid"], w["cloud_cover_high"]), 95.0
+        )
+
+        should_open, reason, conditions, _ = self._run(
+            self._crosscheck(335.0, 192.0), base=self.BROKEN_CLOUD_WEATHER
+        )
 
         self.assertTrue(
             should_open,
@@ -3833,7 +4082,9 @@ class TestConsistencyRescue(unittest.TestCase):
             self.assertLess(model_dni, 400.0)
 
         should_open, reason, _, _ = self._run(
-            self._crosscheck(335.0, 192.0), sunny_crosscheck_enabled=False
+            self._crosscheck(335.0, 192.0),
+            base=self.BROKEN_CLOUD_WEATHER,
+            sunny_crosscheck_enabled=False,
         )
         self.assertFalse(should_open, "With the rescue off, this is the old behaviour")
         self.assertIn("observed failed", reason)
@@ -3848,6 +4099,7 @@ class TestConsistencyRescue(unittest.TestCase):
         """
         should_open, _, conditions, _ = self._run(
             self._crosscheck(335.0, 192.0),
+            base=self.BROKEN_CLOUD_WEATHER,
             cloud_cover_mid=99.0,
             cloud_cover_high=99.0,
         )
@@ -3857,6 +4109,7 @@ class TestConsistencyRescue(unittest.TestCase):
         # ...but the FULL rescue still may, which is the 2026-08-14 behaviour.
         should_open, reason, _, _ = self._run(
             self._crosscheck(574.0, 754.0),
+            base=self.BROKEN_CLOUD_WEATHER,
             cloud_cover_mid=99.0,
             cloud_cover_high=99.0,
         )
@@ -3870,6 +4123,7 @@ class TestConsistencyRescue(unittest.TestCase):
         """
         should_open, _, conditions, _ = self._run(
             self._crosscheck(6.0, 2.0),
+            base=self.BROKEN_CLOUD_WEATHER,
             shortwave_radiation=194.0,
             uv_index=0.3,
         )
@@ -3885,7 +4139,7 @@ class TestConsistencyRescue(unittest.TestCase):
         ]:
             with self.subTest(ecmwf=ecmwf, icon=icon):
                 should_open, _, conditions, _ = self._run(
-                    self._crosscheck(ecmwf, icon)
+                    self._crosscheck(ecmwf, icon), base=self.BROKEN_CLOUD_WEATHER
                 )
                 self.assertEqual(conditions["sunny"], expected)
                 self.assertEqual(should_open, expected)
@@ -3893,8 +4147,12 @@ class TestConsistencyRescue(unittest.TestCase):
     def test_uses_min_dni_not_a_fourth_threshold(self):
         """The bar is Layer 2's own knob — moving min_dni moves the rescue."""
         just_under = self._crosscheck(60.0, 55.0)
-        self.assertTrue(self._run(just_under, min_dni=50.0)[2]["sunny"])
-        self.assertFalse(self._run(just_under, min_dni=100.0)[2]["sunny"])
+        self.assertTrue(
+            self._run(just_under, base=self.BROKEN_CLOUD_WEATHER, min_dni=50.0)[2]["sunny"]
+        )
+        self.assertFalse(
+            self._run(just_under, base=self.BROKEN_CLOUD_WEATHER, min_dni=100.0)[2]["sunny"]
+        )
 
     def test_is_strictly_additive(self):
         """Neither tier may ever flip sunny True -> False."""
@@ -3920,7 +4178,7 @@ class TestConsistencyRescue(unittest.TestCase):
             with self.subTest(**override):
                 kwargs = dict(_THRESHOLDS)
                 kwargs.update(lat=35.778, lon=-78.838)
-                weather_kwargs = dict(self.INCIDENT_WEATHER)
+                weather_kwargs = dict(self.BROKEN_CLOUD_WEATHER)
                 weather_kwargs.update(override)
                 with unittest.mock.patch.object(
                     awning_automation,
@@ -3949,7 +4207,7 @@ class TestConsistencyRescue(unittest.TestCase):
             return_value=self._crosscheck(335.0, 192.0),
         ):
             should_open_awning(
-                _weather(**self.INCIDENT_WEATHER), _sun(**self.SUN), _DAYTIME, **kwargs
+                _weather(**self.BROKEN_CLOUD_WEATHER), _sun(**self.SUN), _DAYTIME, **kwargs
             )
         self.assertEqual(attribution, [])
 
@@ -4154,22 +4412,50 @@ class TestIrradianceSmoothing(unittest.TestCase):
 
 class TestConsistencyRescueCompositionRoot(unittest.TestCase):
     """
-    Drive the real main() on the 2026-08-16 incident numbers.
-
-    The unit tests above call should_open_awning() directly, so they would stay
-    green even if main() never plumbed the thresholds through. A --dry-run
-    cannot exercise this path either.
+    Drive the real main() end to end, so the Layer 1/3 fix and the Tier 2
+    consistency rescue are proven wired through main(), not just through
+    should_open_awning() called directly (which would stay green even if
+    main() never plumbed the thresholds through — a --dry-run cannot
+    exercise this path either).
     """
 
-    def test_main_opens_awning_on_consistency_rescue(self):
+    def _run(self, weather, crosscheck_result, mock_controller, mock_log_path):
         import sys
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
+
+        env = {"WIND_SPEED_THRESHOLD_MPH": "15", "MIN_SUN_ALTITUDE_DEG": "15"}
+        mock_controller.reset_mock()
+        mock_controller.get_state.side_effect = [0, 1]
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(sys, "argv", ["awning_automation.py"]), \
+             patch.object(awning_automation, "setup_logging", return_value=mock_log_path), \
+             patch.object(awning_automation, "load_location_config", return_value=(35.778, -78.838)), \
+             patch.object(awning_automation, "load_telegram_config", return_value=(None, None)), \
+             patch.object(awning_automation, "collect_weather_measurements", return_value=weather), \
+             patch.object(awning_automation, "calculate_sun_position",
+                          return_value={"azimuth": 136.1, "altitude": 61.5}), \
+             patch.object(awning_automation, "is_raining_on_radar", return_value=False), \
+             patch.object(awning_automation, "fetch_crosscheck_irradiance",
+                          return_value=crosscheck_result), \
+             patch.object(awning_automation, "create_controller_from_env",
+                          return_value=mock_controller):
+            awning_automation.main()
+        return mock_controller
+
+    def test_main_closes_awning_on_solid_overcast(self):
+        """
+        The real 2026-08-16 12:15 readings — solid low deck (cloud/low=100%,
+        mid=0%, high=0%) — now correctly close through the real main() even
+        though both cross-check models (ECMWF 335, ICON 192) report a strong
+        beam. This is the accepted 2026-08-21 policy reversal: see
+        TestConsistencyRescue's class docstring.
+        """
+        from unittest.mock import MagicMock
 
         mock_controller = MagicMock()
         mock_log_path = MagicMock()
         mock_log_path.parent = MagicMock()
 
-        # Exactly what the Pi logged at 12:15 on 2026-08-16.
         weather = _weather(
             shortwave_radiation=167.0,
             uv_index=7.2,
@@ -4189,26 +4475,46 @@ class TestConsistencyRescueCompositionRoot(unittest.TestCase):
         )
         weather["time"] = "2026-08-16T12:15:00"
 
-        env = {"WIND_SPEED_THRESHOLD_MPH": "15", "MIN_SUN_ALTITUDE_DEG": "15"}
+        incident = {
+            "dni": {"ecmwf_ifs025": 335.0, "icon_seamless": 192.0},
+            "ghi": {"ecmwf_ifs025": 650.0, "icon_seamless": 467.0},
+            "slot_time": "2026-08-16T12:15",
+        }
 
-        def run(crosscheck_result):
-            mock_controller.reset_mock()
-            mock_controller.get_state.side_effect = [0, 1]
-            with patch.dict(os.environ, env, clear=True), \
-                 patch.object(sys, "argv", ["awning_automation.py"]), \
-                 patch.object(awning_automation, "setup_logging", return_value=mock_log_path), \
-                 patch.object(awning_automation, "load_location_config", return_value=(35.778, -78.838)), \
-                 patch.object(awning_automation, "load_telegram_config", return_value=(None, None)), \
-                 patch.object(awning_automation, "collect_weather_measurements", return_value=weather), \
-                 patch.object(awning_automation, "calculate_sun_position",
-                              return_value={"azimuth": 136.1, "altitude": 61.5}), \
-                 patch.object(awning_automation, "is_raining_on_radar", return_value=False), \
-                 patch.object(awning_automation, "fetch_crosscheck_irradiance",
-                              return_value=crosscheck_result), \
-                 patch.object(awning_automation, "create_controller_from_env",
-                              return_value=mock_controller):
-                awning_automation.main()
-            return mock_controller
+        controller = self._run(weather, incident, mock_controller, mock_log_path)
+        controller.close.assert_called_once()
+        controller.open.assert_not_called()
+
+    def test_main_opens_awning_on_broken_cloud_consistency_rescue(self):
+        """
+        A genuine broken-cloud reading (GHI 450 carries Layer 1, no cloud
+        layer >= 95%, only Layer 2 fails) still opens through the real
+        main() via Tier 2 when both cross-check models clear min_dni (50).
+        """
+        from unittest.mock import MagicMock
+
+        mock_controller = MagicMock()
+        mock_log_path = MagicMock()
+        mock_log_path.parent = MagicMock()
+
+        weather = _weather(
+            shortwave_radiation=450.0,
+            uv_index=6.0,
+            dni=10.0,
+            cloud_cover=85.0,
+            cloud_cover_low=85.0,
+            cloud_cover_mid=5.0,
+            cloud_cover_high=5.0,
+            wind_speed=6.0,
+            temperature=84.0,
+            precipitation=0.0,
+            hourly_precip_prob=2,
+            minutely_15_precip=[0.0, 0.0, 0.0],
+            weather_code=3,
+            sunrise="2026-08-16T06:35:00",
+            sunset="2026-08-16T20:03:00",
+        )
+        weather["time"] = "2026-08-16T12:15:00"
 
         incident = {
             "dni": {"ecmwf_ifs025": 335.0, "icon_seamless": 192.0},
@@ -4216,15 +4522,15 @@ class TestConsistencyRescueCompositionRoot(unittest.TestCase):
             "slot_time": "2026-08-16T12:15",
         }
 
-        # The real 12:15 slot: both models clear min_dni (50) — open.
-        controller = run(incident)
+        # Both models clear min_dni (50) — open.
+        controller = self._run(weather, incident, mock_controller, mock_log_path)
         controller.open.assert_called_once()
         controller.close.assert_not_called()
 
         # A genuinely dark hour (ECMWF 6, ICON 2) stays closed.
         dark = dict(incident)
         dark["dni"] = {"ecmwf_ifs025": 6.0, "icon_seamless": 2.0}
-        controller = run(dark)
+        controller = self._run(weather, dark, mock_controller, mock_log_path)
         controller.close.assert_called_once()
         controller.open.assert_not_called()
 

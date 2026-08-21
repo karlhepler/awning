@@ -11,11 +11,20 @@ Automatically opens/closes awning based on weather conditions.
 Sunshine detection uses a two-layer gate plus a hard cloud-cover ceiling:
 
   Layer 1 — model forecast ('do we want shade?'):
-    sunny_model = (shortwave_radiation >= MIN_GHI_WM2) OR (uv_index >= MIN_UV_INDEX)
+    sunny_model = (shortwave_radiation >= MIN_GHI_WM2)
+                  OR (uv_index >= MIN_UV_INDEX AND cloud_cover < MAX_CLOUD_COVER_PCT)
                   OR (dni >= MIN_DNI_DIRECT_WM2)
     GHI (shortwave_radiation) comes from ECMWF. UV Index comes from GFS — a completely
     separate NWP model. Either signal alone is sufficient: the awning has two jobs —
     block UV (relevant even on cloudy-high-UV days) AND block heat/brightness.
+    The UV arm is gated by cloud_cover (reusing the Layer 2 threshold, no new knob):
+    uv_index and shortwave_radiation are both horizontal-plane measurements from the
+    same feed and should move together on a genuinely sunny day. On 2026-08-21 the
+    awning stayed open under a solid low deck (METAR KRDU: OVC015) because uv_index
+    read 7.5 while GHI from the same feed read 173 — a ~4x disagreement the un-gated
+    OR let UV win. Checked over 60 days against Open-Meteo's own uv_index_clear_sky
+    field: uv_index sits within 5% of the clear-sky value on 31% of heavy-cloud hours
+    (total cloud >= 90%), so it is not reliably cloud-attenuated on its own.
     The DNI (direct normal irradiance) branch bypasses GHI/UV entirely when a strong
     direct solar beam is already confirmed: GHI is global HORIZONTAL irradiance, so
     it is suppressed by the sin(altitude) projection factor at low sun elevations —
@@ -33,14 +42,19 @@ Sunshine detection uses a two-layer gate plus a hard cloud-cover ceiling:
     preventing false-closes when DNI is intermittent on partly-cloudy days.
 
   Layer 3 — hard cloud-cover ceiling with DNI guard (overcast override):
-    not_overcast = (max(cloud_cover_mid, cloud_cover_high) < OVERCAST_THRESHOLD_PCT)
+    not_overcast = (max(cloud_cover_low, cloud_cover_mid, cloud_cover_high) < OVERCAST_THRESHOLD_PCT)
                    OR (dni >= MIN_DNI_CIRRUS_WM2)
-    When max(cloud_cover_mid, cloud_cover_high) is very high (≥95%), the sky has
-    optically thick cloud cover that blocks direct sun. Both mid-level (altostratus/
-    altocumulus) and high-level (cirrostratus) clouds can independently cause full
-    overcast. The 2026-04-28 incident confirmed that cloud_cover_high=99% with
-    cloud_cover_mid=53-70% fully blocked the sun while the awning remained open.
-    Using max() ensures either layer alone is sufficient to fire the ceiling gate.
+    When max(cloud_cover_low, cloud_cover_mid, cloud_cover_high) is very high (≥95%),
+    the sky has optically thick cloud cover that blocks direct sun. Low-level (stratus/
+    cumulus), mid-level (altostratus/altocumulus), and high-level (cirrostratus) clouds
+    can each independently cause full overcast. The 2026-04-28 incident confirmed that
+    cloud_cover_high=99% with cloud_cover_mid=53-70% fully blocked the sun while the
+    awning remained open; cloud_cover_low was added after 2026-08-21, when a 96% low
+    deck (METAR KRDU: OVC015) left the ceiling blind because cloud_cover_mid and
+    cloud_cover_high both read 0%. Using max() ensures any one layer alone is
+    sufficient to fire the ceiling gate. Total cloud cover is still NOT used — it
+    saturates to 100% with any cirrus, making it too aggressive; this is a per-layer
+    ceiling, not the total-cover field.
     The DNI guard (MIN_DNI_CIRRUS_WM2, default 30 W/m²) bypasses the ceiling when
     direct sun is demonstrably arriving — the 2026-05-12 incident showed Open-Meteo
     cloud_cover_high=100% (bad model data) closing the awning at DNI=905 W/m² during
@@ -933,7 +947,8 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
         # above accepts null values, which would later crash at threshold
         # comparisons with TypeError — bypassing the fail-safe close path.
         # Guard all four Layer 1/2 fields (GHI, UV, DNI, cloud_cover) and the
-        # two Layer 3 ceiling fields (cloud_cover_mid, cloud_cover_high). The
+        # three Layer 3 ceiling fields (cloud_cover_low, cloud_cover_mid,
+        # cloud_cover_high — cloud_cover_low also feeds the rain gate). The
         # .get(..., 100) defaults below handle missing keys (network glitch),
         # but a JSON null for these fields is a distinct error condition that
         # must be surfaced explicitly rather than silently classified as 100%.
@@ -959,7 +974,8 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
         if cloud_cover_low_val is None:
             raise WeatherAPIError(
                 f"Weather API returned null for cloud_cover_low. "
-                f"Cannot evaluate rain-bearing cloud cover without this value."
+                f"Cannot evaluate rain-bearing cloud cover or the Layer 3 "
+                f"overcast ceiling without this value."
             )
         if cloud_cover_mid_val is None:
             raise WeatherAPIError(
@@ -1822,10 +1838,15 @@ def should_open_awning(
     Sunshine detection uses a two-layer gate plus a hard cloud-cover ceiling:
 
       Layer 1 — model forecast ('do we want shade?'):
-        sunny_model = (shortwave_radiation >= min_ghi) OR (uv_index >= min_uv_index)
+        sunny_model = (shortwave_radiation >= min_ghi)
+                      OR (uv_index >= min_uv_index AND cloud_cover < max_cloud_cover)
                       OR (dni >= min_dni_direct)
-        GHI comes from ECMWF; UV Index from GFS — cross-model OR gate. The DNI
-        direct-beam branch bypasses GHI/UV when a strong direct solar beam is
+        GHI comes from ECMWF; UV Index from GFS — cross-model OR gate. The UV arm
+        is gated by cloud_cover (reusing the Layer 2 threshold, no new knob) since
+        GHI and UV are both horizontal-plane measurements from the same feed and
+        uv_index tracks uv_index_clear_sky too closely under cloud to trust alone
+        (2026-08-21 incident: UV=7.5 vs GHI=173 under a 96% low deck, METAR OVC015).
+        The DNI direct-beam branch bypasses GHI/UV when a strong direct solar beam is
         already confirmed — GHI is suppressed at low sun elevation by the
         sin(altitude) projection factor, but DNI (measured normal to the beam)
         is not. Added after the 2026-08-13 incident (08:30, altitude=22.5°,
@@ -1840,19 +1861,23 @@ def should_open_awning(
         is intermittent on partly-cloudy days and cloud_cover is wrongly high.
 
       Layer 3 — hard cloud-cover ceiling with DNI guard (overcast override):
-        not_overcast = (max(cloud_cover_mid, cloud_cover_high) < overcast_threshold)
+        not_overcast = (max(cloud_cover_low, cloud_cover_mid, cloud_cover_high) < overcast_threshold)
                        OR (dni >= min_dni_cirrus)
-        When max(cloud_cover_mid, cloud_cover_high) >= overcast_threshold (default 95%),
-        DNI is overridden — UNLESS dni >= min_dni_cirrus (default 30 W/m²), which proves
-        direct sun is arriving despite the cloud model. Both mid-level (altostratus/
-        altocumulus) and high-level (cirrostratus) clouds can independently produce full
-        optical overcast — the 2026-04-28 incident confirmed this: cloud_cover_high=99%
-        with cloud_cover_mid at 53-70% fully blocked the sun. max() ensures either layer
+        When max(cloud_cover_low, cloud_cover_mid, cloud_cover_high) >= overcast_threshold
+        (default 95%), DNI is overridden — UNLESS dni >= min_dni_cirrus (default 30 W/m²),
+        which proves direct sun is arriving despite the cloud model. Low-level (stratus/
+        cumulus), mid-level (altostratus/altocumulus), and high-level (cirrostratus)
+        clouds can each independently produce full optical overcast — the 2026-04-28
+        incident confirmed this for mid/high: cloud_cover_high=99% with cloud_cover_mid
+        at 53-70% fully blocked the sun. cloud_cover_low was added after 2026-08-21,
+        when a 96% low deck (METAR KRDU: OVC015) left the ceiling blind because
+        cloud_cover_mid and cloud_cover_high both read 0%. max() ensures any one layer
         fires the ceiling. The DNI guard handles the 2026-05-12 false positive where
         Open-Meteo returned cloud_cover_high=100% despite a clear sky (DNI=905 W/m²
         and direct visual observation both confirmed direct sun was arriving).
         Total cloud cover is NOT used because it saturates to 100% for any cirrus,
-        making it too aggressive for partly-cloudy conditions.
+        making it too aggressive for partly-cloudy conditions — this is a per-layer
+        ceiling, not the total-cover field.
 
       sunny_enough = sunny_model AND sunny_observed AND not_overcast
 
@@ -1863,7 +1888,8 @@ def should_open_awning(
         wind_threshold: Maximum wind speed (mph) for "calm"
         altitude_threshold: Minimum sun altitude (degrees) above horizon
         min_ghi: Minimum global horizontal irradiance (W/m²) for sunny_model
-        min_uv_index: Minimum UV Index for sunny_model
+        min_uv_index: Minimum UV Index for sunny_model; gated by cloud_cover <
+            max_cloud_cover, since uv_index alone is not reliably cloud-attenuated
         min_dni: Minimum direct normal irradiance (W/m²) for sunny_observed (Layer 2)
         max_cloud_cover: Maximum total cloud cover (%) for sunny_observed (Layer 2)
         min_temperature_f: Minimum temperature (°F) to open awning
@@ -1908,6 +1934,7 @@ def should_open_awning(
     dni = weather.get("dni_smoothed", dni_raw)
     uv_index = weather["uv_index"]
     cloud_cover = weather.get("cloud_cover", 100.0)
+    cloud_cover_low = weather.get("cloud_cover_low", 100.0)
     cloud_cover_mid = weather.get("cloud_cover_mid", 100.0)
     cloud_cover_high = weather.get("cloud_cover_high", 100.0)
     sunrise = weather["sunrise"]
@@ -1922,8 +1949,23 @@ def should_open_awning(
     # confirmed. GHI (shortwave_radiation) is global HORIZONTAL irradiance —
     # suppressed by the sin(altitude) projection factor at low sun elevations —
     # but DNI is measured normal to the beam and is not suppressed by low sun angle.
+    #
+    # UV arm is gated by cloud_cover < max_cloud_cover (reusing the Layer 2
+    # threshold — no new knob). uv_index and shortwave_radiation (GHI) are both
+    # horizontal-plane measurements from the same feed, so on a genuinely sunny
+    # day they move together; under heavy cloud they should NOT — GHI is expected
+    # to collapse. On 2026-08-21 the awning stayed open under a solid low deck
+    # (METAR KRDU: OVC015, overcast at 1500 ft) because uv_index read 7.5 while
+    # the same feed's GHI read 173 — a ~4x disagreement Layer 1's OR let UV win.
+    # Checked against Open-Meteo's own uv_index_clear_sky field over 60 days:
+    # uv_index sits within 5% of the clear-sky value on 31% of heavy-cloud hours
+    # (total cloud >= 90%), i.e. it is not reliably cloud-attenuated. The
+    # 2026-08-14 case this arm was originally kept for (primary feed's whole
+    # radiation block collapsed under bad model data) is covered by the Tier 1
+    # cross-model rescue below, which overrides all three layers unconditionally
+    # and does not depend on this arm.
     ghi_sunny = ghi >= min_ghi
-    uv_sunny = uv_index >= min_uv_index
+    uv_sunny = uv_index >= min_uv_index and cloud_cover < max_cloud_cover
     dni_direct_sunny = dni >= min_dni_direct
     sunny_model = ghi_sunny or uv_sunny or dni_direct_sunny
 
@@ -1938,18 +1980,24 @@ def should_open_awning(
     sunny_observed = dni_sunny or cloud_sunny
 
     # Layer 3: hard cloud-cover ceiling with DNI guard — overcast override
-    # max(cloud_cover_mid, cloud_cover_high) fires the ceiling if EITHER mid-level
-    # (altostratus/altocumulus) OR high-level (cirrostratus) clouds are thick enough.
-    # The 2026-04-28 incident confirmed that cloud_cover_high=99% with cloud_cover_mid
-    # at 53-70% fully blocked direct sun. Total cloud cover is NOT used because it
-    # saturates to 100% with any cirrus, making it too aggressive.
+    # max(cloud_cover_low, cloud_cover_mid, cloud_cover_high) fires the ceiling if
+    # ANY layer — low (stratus/cumulus), mid (altostratus/altocumulus), or high
+    # (cirrostratus) — is thick enough. The 2026-04-28 incident confirmed that
+    # cloud_cover_high=99% with cloud_cover_mid at 53-70% fully blocked direct
+    # sun; cloud_cover_low was added after 2026-08-21, when a 96% low deck
+    # (METAR KRDU: OVC015) left the awning open all morning because the ceiling
+    # only ever looked at mid/high, which both read 0%. Total cloud cover is
+    # still NOT used because it saturates to 100% with any cirrus, making it too
+    # aggressive — this is a per-layer ceiling, not the total-cover field.
     #
     # DNI guard: if DNI >= min_dni_cirrus, direct sun is demonstrably arriving and
     # the cloud model estimate is wrong. The ceiling fires ONLY when BOTH the cloud
     # model says overcast AND DNI is too low to confirm direct beam. This prevents
     # the 2026-05-12 false positive where cloud_cover_high=100% (bad model data)
     # closed the awning during peak midday sun (DNI=905 W/m²).
-    cloud_ceiling_clear = max(cloud_cover_mid, cloud_cover_high) < overcast_threshold
+    cloud_ceiling_clear = (
+        max(cloud_cover_low, cloud_cover_mid, cloud_cover_high) < overcast_threshold
+    )
     dni_confirms_sun = dni >= min_dni_cirrus
     not_overcast = cloud_ceiling_clear or dni_confirms_sun
 
@@ -2110,21 +2158,35 @@ def should_open_awning(
 
     # Build sunny signal trace for logging (three-layer gate)
     # Layer 1: model forecast signal (GHI, UV, or DNI direct-beam bypass)
+    # uv_sunny already folds in the cloud gate (uv_index >= min_uv_index AND
+    # cloud_cover < max_cloud_cover), so a UV reading above the bar can still
+    # read uv_sunny=False — the trace names the gate explicitly rather than
+    # implying the UV number itself was too low.
+    uv_above_bar = uv_index >= min_uv_index
+    if not uv_above_bar:
+        uv_note = f"UV {uv_index:.1f} < {min_uv_index:.1f}"
+    elif uv_sunny:
+        uv_note = f"UV {uv_index:.1f} >= {min_uv_index:.1f}"
+    else:
+        uv_note = (
+            f"UV {uv_index:.1f} >= {min_uv_index:.1f} but "
+            f"cloud {cloud_cover:.0f}% >= {max_cloud_cover:.0f}% (gated off)"
+        )
     if sunny_model:
         if ghi_sunny and uv_sunny:
             model_trace = f"GHI {ghi:.0f} W/m² >= {min_ghi:.0f} AND UV {uv_index:.1f} >= {min_uv_index:.1f}"
         elif ghi_sunny:
-            model_trace = f"GHI only: GHI {ghi:.0f} W/m² >= {min_ghi:.0f}, UV {uv_index:.1f} < {min_uv_index:.1f}"
+            model_trace = f"GHI only: GHI {ghi:.0f} W/m² >= {min_ghi:.0f}, {uv_note}"
         elif uv_sunny:
-            model_trace = f"UV only: UV {uv_index:.1f} >= {min_uv_index:.1f}, GHI {ghi:.0f} W/m² < {min_ghi:.0f}"
+            model_trace = f"UV only: UV {uv_index:.1f} >= {min_uv_index:.1f} (cloud {cloud_cover:.0f}% < {max_cloud_cover:.0f}%), GHI {ghi:.0f} W/m² < {min_ghi:.0f}"
         else:
             model_trace = (
                 f"DNI direct-beam bypass: DNI {dni:.0f} W/m² >= {min_dni_direct:.0f} "
-                f"(GHI {ghi:.0f} W/m² < {min_ghi:.0f}, UV {uv_index:.1f} < {min_uv_index:.1f})"
+                f"(GHI {ghi:.0f} W/m² < {min_ghi:.0f}, {uv_note})"
             )
     else:
         model_trace = (
-            f"GHI {ghi:.0f} W/m² < {min_ghi:.0f} AND UV {uv_index:.1f} < {min_uv_index:.1f} "
+            f"GHI {ghi:.0f} W/m² < {min_ghi:.0f} AND {uv_note} "
             f"AND DNI {dni:.0f} W/m² < {min_dni_direct:.0f}"
         )
 
@@ -2140,21 +2202,23 @@ def should_open_awning(
         obs_trace = f"DNI {dni:.0f} W/m² < {min_dni:.0f} AND cloud {cloud_cover:.0f}% >= {max_cloud_cover:.0f}%"
 
     # Layer 3: hard cloud-cover ceiling with DNI guard
-    _overcast_driver = max(cloud_cover_mid, cloud_cover_high)
+    _overcast_driver = max(cloud_cover_low, cloud_cover_mid, cloud_cover_high)
+    _overcast_layers = (
+        f"cloud_low={cloud_cover_low:.0f}%,cloud_mid={cloud_cover_mid:.0f}%,"
+        f"cloud_high={cloud_cover_high:.0f}%"
+    )
     if cloud_ceiling_clear:
         overcast_trace = (
-            f"max(cloud_mid={cloud_cover_mid:.0f}%,cloud_high={cloud_cover_high:.0f}%)"
-            f"={_overcast_driver:.0f}% < {overcast_threshold:.0f}% ceiling"
+            f"max({_overcast_layers})={_overcast_driver:.0f}% < {overcast_threshold:.0f}% ceiling"
         )
     elif dni_confirms_sun:
         overcast_trace = (
             f"DNI guard: DNI {dni:.0f} W/m² >= {min_dni_cirrus:.0f} overrides "
-            f"cloud ceiling (max={_overcast_driver:.0f}% >= {overcast_threshold:.0f}%)"
+            f"cloud ceiling (max({_overcast_layers})={_overcast_driver:.0f}% >= {overcast_threshold:.0f}%)"
         )
     else:
         overcast_trace = (
-            f"max(cloud_mid={cloud_cover_mid:.0f}%,cloud_high={cloud_cover_high:.0f}%)"
-            f"={_overcast_driver:.0f}% >= {overcast_threshold:.0f}% ceiling "
+            f"max({_overcast_layers})={_overcast_driver:.0f}% >= {overcast_threshold:.0f}% ceiling "
             f"AND DNI {dni:.0f} W/m² < {min_dni_cirrus:.0f} guard"
         )
 
@@ -2358,7 +2422,8 @@ def main() -> None:
         # Get thresholds
         wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold, radar_veto_dni, radar_veto_cloud_pct, min_dni_direct, sun_azimuth_min, sun_azimuth_max, sunny_crosscheck_enabled = get_thresholds()
         logger.info(
-            f"Thresholds: model=(GHI >= {min_ghi:.0f} W/m² OR UV >= {min_uv_index:.1f} "
+            f"Thresholds: model=(GHI >= {min_ghi:.0f} W/m² "
+            f"OR [UV >= {min_uv_index:.1f} AND cloud < {max_cloud_cover:.0f}%] "
             f"OR DNI >= {min_dni_direct:.0f} W/m² direct-beam bypass), "
             f"consistency=(DNI >= {min_dni:.0f} W/m² OR cloud < {max_cloud_cover:.0f}%), "
             f"overcast ceiling=cloud < {overcast_threshold:.0f}% (DNI guard >= {min_dni_cirrus:.0f} W/m²), "
