@@ -889,6 +889,35 @@ def _send_telegram_request(url: str, payload: dict, timeout: int) -> None:
     response.raise_for_status()
 
 
+def ping_heartbeat(url: str, timeout: int = 5) -> None:
+    """
+    Ping an external dead-man's-switch URL (e.g. a healthchecks.io check) to signal
+    that this run completed successfully end to end.
+
+    Added after the 2026-08-29 incident where the Orange Pi running this automation
+    was completely unreachable for 2 days 7.5 hours — cron never ran, so nothing in
+    this process could have logged or alerted, and the operator only discovered it
+    by noticing the awning open at the wrong time of day. No monitoring that lives
+    on this same box can catch that failure mode, because the box itself is down;
+    the check has to be off-box, and it has to notice an *absence* of a signal
+    rather than react to a present one.
+
+    This function is deliberately dumb: it never retries and never raises. Retrying
+    would delay the run for no benefit — a dead-man's-switch service alerts on a
+    missed check-in regardless of *why* it was missed, so a failed ping here simply
+    means this run doesn't count, which is the correct outcome whether the network
+    blipped or the service is down. Call only on a run that actually completed the
+    full decision-and-actuate cycle; a --dry-run or an exception path should not
+    call this, since a heartbeat during a real outage would silence the alarm it
+    exists to raise.
+    """
+    try:
+        requests.get(url, timeout=timeout)
+        logger.info("Heartbeat ping sent")
+    except requests.RequestException as e:
+        logger.warning(f"Heartbeat ping failed: {e}")
+
+
 def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
     """
     Fetch current weather and daily data from Open-Meteo API.
@@ -2443,6 +2472,12 @@ def main() -> None:
         if telegram_token:
             logger.info("Telegram notifications enabled")
 
+        # Load heartbeat config (optional) — see ping_heartbeat() for why this
+        # exists and why it fires only at the very end of a successful run.
+        heartbeat_url = os.getenv("HEARTBEAT_PING_URL", "").strip()
+        if heartbeat_url:
+            logger.info("Heartbeat monitoring enabled")
+
         # Fetch current weather (cron runs every 15 minutes — that's the sampling cadence)
         weather = collect_weather_measurements(latitude, longitude)
 
@@ -2565,6 +2600,11 @@ def main() -> None:
         # Cleanup old log files
         retention_days = int(os.environ.get("LOG_RETENTION_DAYS", "30"))
         cleanup_old_logs(log_path.parent, retention_days)
+
+        # Heartbeat: only reached once the full run — fetch, decide, actuate,
+        # cleanup — has succeeded without exception. See ping_heartbeat().
+        if heartbeat_url:
+            ping_heartbeat(heartbeat_url)
 
     except ConfigurationError as e:
         logger.error(f"Configuration error: {e}")

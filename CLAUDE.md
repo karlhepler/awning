@@ -163,11 +163,15 @@ If ANY condition fails, the awning closes. Fail-safe: closes awning if weather A
 - Auto-cleanup after 30 days (configurable via `LOG_RETENTION_DAYS`)
 - View logs: `tail -f ~/awning.log`
 
+**Heartbeat monitoring (optional, `HEARTBEAT_PING_URL`):** every run that completes the full fetch → decide → actuate → cleanup cycle without an exception pings this URL (`ping_heartbeat()` in `awning_automation.py`), fire-and-forget with no retries — a failed ping just means this run doesn't count, which is correct whether the network blipped or the far end is down. Nothing that lives *on* the Pi can detect the Pi itself being down, so this deliberately pushes the check off-box: point it at a dead-man's-switch service (e.g. healthchecks.io) that alerts when a check-in goes missing, rather than reacting to one that arrives. Added after the 2026-08-29 incident where the Pi was completely unreachable for 2 days 7.5 hours — cron never ran, so nothing in the process could have logged or alerted, and the operator only found out by noticing the awning open at the wrong time of day. It is not called on `--dry-run` (which returns before this point) or on any exception path — a heartbeat during a real outage would silence the alarm it exists to raise. See `.env.example` for setup.
+
 ## Deployment
 
 **🚨 The user runs `./deploy.sh` — Claude must NEVER run it.** Deployment requires interactive sudo/password input on the remote Orange Pi that only the user can provide. Claude's responsibility ends at `git commit` + `git push`; the user handles the actual deploy from their own terminal. Attempting to invoke `deploy.sh` (directly, via `bash -x`, via a sub-agent, via SSH, etc.) WILL fail because Claude cannot supply the password, and the attempt wastes tool budget plus produces misleading error output. When code is pushed and ready, tell the user "ready to deploy" and stop — wait for them to run it.
 
-**Target:** Orange Pi 3 LTS running Debian (`karlhepler@orangepi3-lts`)
+**Target:** Orange Pi 3 LTS running Debian (`karlhepler@orangepi3-lts`, or `karlhepler@$PI_HOST` when `PI_HOST` is set in `.env` — see below)
+
+**`orangepi3-lts` is not mDNS.** The Pi has no `avahi-daemon` installed (confirmed via `systemctl is-enabled avahi-daemon` → `not-found`), so `orangepi3-lts.local` has never resolved. The bare `orangepi3-lts` name has only ever worked via the router's own DHCP/DNS hostname registration, and that registration can go stale after a router reboot or a long Pi outage — on 2026-08-31 the Pi was down for 2 days 7.5 hours, and even after it came back the name stayed unresolvable on the operator's Mac (a stuck macOS resolver cache; `dig @<router-ip>` resolved it fine the whole time, `ssh`/`ping` did not). Set `PI_HOST` in `.env` to the Pi's IP (ideally backed by a router DHCP reservation, same as `BOND_HOST`) to stop depending on that registration; `deploy.sh` reads it with a fallback to `orangepi3-lts` so nothing changes for a setup where the name already resolves.
 
 **Deploy script (`deploy.sh`):**
 1. Discovers Bond Bridge IP via mDNS (using `BOND_ID` from `.env`)
@@ -220,6 +224,8 @@ See `.env.example` for full documentation. Key variables:
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` - For notifications
 - `LOG_RETENTION_DAYS` - Days to keep logs (default: 30)
 - `BOND_ID` - For mDNS discovery in deploy.sh
+- `HEARTBEAT_PING_URL` - Dead-man's-switch URL (e.g. healthchecks.io) pinged after every successful run; alerts off-box when the automation stops running entirely (see Logging above)
+- `PI_HOST` - Overrides the `orangepi3-lts` hostname `deploy.sh` SSHes to; not mDNS (avahi isn't installed on the Pi) — see Deployment above
 
 ## UI/UX Guidelines
 

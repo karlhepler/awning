@@ -4535,5 +4535,179 @@ class TestConsistencyRescueCompositionRoot(unittest.TestCase):
         controller.open.assert_not_called()
 
 
+class TestHeartbeatPing(unittest.TestCase):
+    """
+    ping_heartbeat() reports a successful run to an external dead-man's-switch.
+
+    Added after the 2026-08-29 incident: the Orange Pi running this automation
+    was unreachable for 2 days 7.5 hours and nothing alerted, because nothing
+    that lives on the Pi can report the Pi itself being down. The fix has to be
+    an off-box service noticing an *absence* of a signal — this function is
+    just the signal-sending half, so it must never let a delivery failure
+    become the automation's own failure.
+    """
+
+    def test_ping_heartbeat_sends_get_request(self):
+        """A successful ping issues a GET to the configured URL."""
+        from unittest.mock import patch, MagicMock
+        from awning_automation import ping_heartbeat
+
+        mock_response = MagicMock()
+        with patch("awning_automation.requests.get", return_value=mock_response) as mock_get:
+            ping_heartbeat("https://hc-ping.com/fake-uuid")
+
+        mock_get.assert_called_once()
+        self.assertEqual(mock_get.call_args[0][0], "https://hc-ping.com/fake-uuid")
+
+    def test_ping_heartbeat_never_raises_on_failure(self):
+        """A network failure must not propagate — a missed ping IS the correct
+        signal to the external service, not something to escalate here."""
+        import requests
+        from unittest.mock import patch
+        from awning_automation import ping_heartbeat
+
+        with patch("awning_automation.requests.get", side_effect=requests.ConnectionError("down")):
+            ping_heartbeat("https://hc-ping.com/fake-uuid")  # must not raise
+
+    def test_ping_heartbeat_does_not_retry(self):
+        """Exactly one attempt per run — unlike Telegram, retrying would only
+        delay a run whose outcome a missed ping already correctly reports."""
+        from unittest.mock import patch, MagicMock
+        from awning_automation import ping_heartbeat
+
+        mock_response = MagicMock()
+        with patch("awning_automation.requests.get", return_value=mock_response) as mock_get:
+            ping_heartbeat("https://hc-ping.com/fake-uuid")
+
+        self.assertEqual(mock_get.call_count, 1)
+
+
+class TestHeartbeatCompositionRoot(unittest.TestCase):
+    """
+    main() must ping the heartbeat URL only once a run has fully succeeded,
+    and must never ping when HEARTBEAT_PING_URL is unset, on --dry-run, or on
+    any exception path — a heartbeat during a real outage would silence the
+    exact alarm this feature exists to raise.
+    """
+
+    _THRESHOLDS_TUPLE = (15, 15, 400, 4, 50, 80, 45, 95, 30, 20, 650.0, 15.0, 450.0, 60.0, 249.0, True)
+
+    def _happy_weather(self):
+        weather = _weather(
+            shortwave_radiation=500.0,
+            uv_index=6.0,
+            dni=450.0,
+            precipitation=0.0,
+        )
+        weather["time"] = "2026-04-17T13:00:00"
+        return weather
+
+    def test_main_pings_heartbeat_on_successful_run(self):
+        """A clean run with HEARTBEAT_PING_URL set pings exactly that URL."""
+        import sys
+        from unittest.mock import patch, MagicMock
+        import awning_automation
+
+        mock_controller = MagicMock()
+        mock_controller.get_state.side_effect = [0, 1]
+        mock_log_path = MagicMock()
+        mock_log_path.parent = MagicMock()
+
+        with patch.object(sys, "argv", ["awning_automation.py"]), \
+             patch.dict(os.environ, {"HEARTBEAT_PING_URL": "https://hc-ping.com/fake-uuid"}), \
+             patch.object(awning_automation, "setup_logging", return_value=mock_log_path), \
+             patch.object(awning_automation, "load_location_config", return_value=(35.778, -78.838)), \
+             patch.object(awning_automation, "get_thresholds", return_value=self._THRESHOLDS_TUPLE), \
+             patch.object(awning_automation, "load_telegram_config", return_value=(None, None)), \
+             patch.object(awning_automation, "collect_weather_measurements", return_value=self._happy_weather()), \
+             patch.object(awning_automation, "calculate_sun_position", return_value={"azimuth": 150.0, "altitude": 40.0}), \
+             patch.object(awning_automation, "is_raining_on_radar", return_value=False), \
+             patch.object(awning_automation, "create_controller_from_env", return_value=mock_controller), \
+             patch.object(awning_automation, "ping_heartbeat") as mock_ping:
+            awning_automation.main()
+
+        mock_ping.assert_called_once_with("https://hc-ping.com/fake-uuid")
+
+    def test_main_skips_heartbeat_when_url_not_set(self):
+        """No HEARTBEAT_PING_URL configured → ping_heartbeat is never called."""
+        import sys
+        from unittest.mock import patch, MagicMock
+        import awning_automation
+
+        mock_controller = MagicMock()
+        mock_controller.get_state.side_effect = [0, 1]
+        mock_log_path = MagicMock()
+        mock_log_path.parent = MagicMock()
+
+        with patch.object(sys, "argv", ["awning_automation.py"]), \
+             patch.dict(os.environ, {"HEARTBEAT_PING_URL": ""}), \
+             patch.object(awning_automation, "setup_logging", return_value=mock_log_path), \
+             patch.object(awning_automation, "load_location_config", return_value=(35.778, -78.838)), \
+             patch.object(awning_automation, "get_thresholds", return_value=self._THRESHOLDS_TUPLE), \
+             patch.object(awning_automation, "load_telegram_config", return_value=(None, None)), \
+             patch.object(awning_automation, "collect_weather_measurements", return_value=self._happy_weather()), \
+             patch.object(awning_automation, "calculate_sun_position", return_value={"azimuth": 150.0, "altitude": 40.0}), \
+             patch.object(awning_automation, "is_raining_on_radar", return_value=False), \
+             patch.object(awning_automation, "create_controller_from_env", return_value=mock_controller), \
+             patch.object(awning_automation, "ping_heartbeat") as mock_ping:
+            awning_automation.main()
+
+        mock_ping.assert_not_called()
+
+    def test_main_skips_heartbeat_on_weather_api_failure(self):
+        """An outage on THIS run must not ping, or the dead-man's-switch would
+        never notice the outage it was set up to catch."""
+        import sys
+        from unittest.mock import patch, MagicMock
+        import awning_automation
+        from awning_automation import WeatherAPIError
+
+        mock_controller = MagicMock()
+        mock_controller.get_state.return_value = 0
+        mock_log_path = MagicMock()
+        mock_log_path.parent = MagicMock()
+
+        with patch.object(sys, "argv", ["awning_automation.py"]), \
+             patch.dict(os.environ, {"HEARTBEAT_PING_URL": "https://hc-ping.com/fake-uuid"}), \
+             patch.object(awning_automation, "setup_logging", return_value=mock_log_path), \
+             patch.object(awning_automation, "load_location_config", return_value=(35.778, -78.838)), \
+             patch.object(awning_automation, "get_thresholds", return_value=self._THRESHOLDS_TUPLE), \
+             patch.object(awning_automation, "load_telegram_config", return_value=(None, None)), \
+             patch.object(awning_automation, "collect_weather_measurements",
+                          side_effect=WeatherAPIError("Simulated outage")), \
+             patch.object(awning_automation, "create_controller_from_env", return_value=mock_controller), \
+             patch.object(awning_automation, "ping_heartbeat") as mock_ping:
+            with self.assertRaises(SystemExit):
+                awning_automation.main()
+
+        mock_ping.assert_not_called()
+
+    def test_main_skips_heartbeat_on_dry_run(self):
+        """--dry-run returns before the heartbeat call site — must not ping."""
+        import sys
+        from unittest.mock import patch, MagicMock
+        import awning_automation
+
+        mock_controller = MagicMock()
+        mock_controller.get_state.return_value = 0
+        mock_log_path = MagicMock()
+        mock_log_path.parent = MagicMock()
+
+        with patch.object(sys, "argv", ["awning_automation.py", "--dry-run"]), \
+             patch.dict(os.environ, {"HEARTBEAT_PING_URL": "https://hc-ping.com/fake-uuid"}), \
+             patch.object(awning_automation, "setup_logging", return_value=mock_log_path), \
+             patch.object(awning_automation, "load_location_config", return_value=(35.778, -78.838)), \
+             patch.object(awning_automation, "get_thresholds", return_value=self._THRESHOLDS_TUPLE), \
+             patch.object(awning_automation, "load_telegram_config", return_value=(None, None)), \
+             patch.object(awning_automation, "collect_weather_measurements", return_value=self._happy_weather()), \
+             patch.object(awning_automation, "calculate_sun_position", return_value={"azimuth": 150.0, "altitude": 40.0}), \
+             patch.object(awning_automation, "is_raining_on_radar", return_value=False), \
+             patch.object(awning_automation, "create_controller_from_env", return_value=mock_controller), \
+             patch.object(awning_automation, "ping_heartbeat") as mock_ping:
+            awning_automation.main()
+
+        mock_ping.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

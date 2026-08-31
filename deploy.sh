@@ -2,9 +2,18 @@
 #!nix-shell -i bash -p sshpass
 set -e
 
-SERVER="karlhepler@orangepi3-lts"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REMOTE_DIR=".config/awning"
+
+# PI_HOST override: the Pi has no avahi-daemon installed, so "orangepi3-lts.local"
+# has never resolved via mDNS — the bare hostname only ever worked because the
+# router's own DNS/DHCP registered it, and that registration goes stale after a
+# router reboot or a long Pi outage (see the 2026-08-31 incident: two full days
+# offline left the name unresolvable on the operator's Mac even after the Pi came
+# back, because the resolver had negatively cached it). Set PI_HOST in .env to an
+# IP or a name that does resolve to skip relying on that registration entirely.
+PI_HOST=$(grep '^PI_HOST=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 || echo "")
+SERVER="karlhepler@${PI_HOST:-orangepi3-lts}"
 
 # Get version from git
 VERSION=$(git -C "$SCRIPT_DIR" rev-parse --short HEAD)
