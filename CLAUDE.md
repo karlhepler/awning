@@ -141,7 +141,19 @@ Measured over 14 days (420 daytime 15-min slots), smoothing plus the Tier-2 resc
    **The Telegram close notification carries the same attribution**: `🌧️ Awning closed: Rain signal — radar(NEXRAD)`. Only one of the five signals is `precipitation`, so the old message — which printed the precipitation value on every rain close regardless of which signal fired — announced `Rain starting (0.0 mm/h)` for radar- and probability-triggered closes. That is truthful about precipitation and reads as a self-contradiction, and it named nothing to investigate; the operator reported it repeatedly before the 2026-08-13 radar-clutter close. The attribution string is the same one `evaluate_rain_gate()` already builds for the log, forwarded to `main()` through the `_attribution` out-param on `should_open_awning()`. It cannot travel in the `conditions` dict, which must stay all-bool because `should_open = all(conditions.values())`. `build_close_reason()` falls back to the precipitation value when no attribution is supplied. A dry-run cannot exercise this path (dry-run returns before the notification block), so a composition-root test drives the real `main()` end to end and asserts the sent message names the signal.
 4. **Above minimum temperature**: Temperature > `MIN_TEMPERATURE_F` (default 45°F; was 60°F prior to commit `24ebd12`)
 5. **Daytime**: Between sunrise and sunset
-6. **Sun high enough**: Altitude >= `MIN_SUN_ALTITUDE_DEG` (default 15°)
+6. **Sun high enough**: Altitude >= `MIN_SUN_ALTITUDE_DEG` (default 15°, pinned to 12° in the deployed `.env`). Unlike every other threshold in this section, this one had never been calibrated against real observation — it has exactly one commit in its history, the one that introduced it, justified only as "accounts for trees blocking the sun," no incident, no measurement. That went unnoticed for months because the sun-position math itself (`pvlib`, NREL SPA) is exact and already fully accounts for how the sun's real altitude at a given clock time shifts with the seasons — the threshold only needed calibrating once, in true-altitude terms, to then hold correctly year-round; nobody had done that yet.
+
+   **2026-09-28 incident.** The operator manually opened the awning at 8:15 (sun visibly strong through the window) and again at 8:30 (even stronger) — the automation didn't open on its own until 8:45, once the cross-model rescue engaged. Comparing sun altitude at the same clock times on 2026-08-14 (the day the DNI-rescue thresholds above were tuned) versus today, computed directly with `pvlib`:
+
+   | Time | Aug 14 altitude | Sep 28 altitude |
+   |---|---|---|
+   | 8:00 | 16.3° | 9.7° |
+   | 8:15 | 19.4° | 12.7° (operator: should be open) |
+   | 8:30 | 22.4° | 15.6° (operator: should be open) |
+
+   On 08-14 the sun had already cleared the old 15° floor before 8:00, so the altitude gate was never the binding constraint that day — the tuning session that produced `MIN_DNI_DIRECT_WM2=400` never exercised this edge. By late September, a ~30-minute-later sunrise means the same 15° crossing happens around 8:28 instead — real seasonal drift in sunrise time, not a bug in the angle math. The operator's two data points (12.7° and 15.6°, both confirmed "should be open") are the first direct calibration this threshold has ever had; 12° was chosen to sit just under the earlier confirmed point (12.7°), the same margin convention used for the azimuth ceiling below, rather than extrapolating past what was actually observed (8:00's 9.7° reading is not confirmed either way).
+
+   **This does not guarantee 8:15 opens on every similar morning.** At 8:15 today the sunny gate (condition 1) was *also* failing independently — the cross-model rescue is only queried once the altitude/azimuth/daytime gates are already open, so its 8:15 numbers were never collected (skipped) and it's not known whether it would have cleared 400 W/m² that early. If a future clear morning still closes at 8:15 with the sunny gate as the named blocker, that gate's own thresholds are next in line for this same direct-observation treatment — not a sign the altitude fix was wrong.
 7. **Sun facing window**: Azimuth between `SUN_AZIMUTH_MIN_DEG` (default 60°) and `SUN_AZIMUTH_MAX_DEG` (default 249°). The arc describes a **southeast-facing** window that receives sun from sunrise until late afternoon (~4pm in mid-August). **Both bounds come from the operator's direct observation of when that window is actually in sun — never from geometry**, and both have needed correcting.
 
    - **Floor (90° → 60°, 2026-08-13).** The original hardcoded arc was 90°–260°, which describes a *south*-facing window. The 90° floor blocked real morning sun: the operator observed sun on the glass at azimuth 87.9°, and the floor would also have blocked summer-solstice 08:30 at azimuth 79.9° (verified by computing the code path's own output across both solstices). This half was correct and stands.
@@ -204,7 +216,7 @@ See `.env.example` for full documentation. Key variables:
 **Required for automation:**
 - `LATITUDE`, `LONGITUDE` - Location for weather/sun calculations
 - `WIND_SPEED_THRESHOLD_MPH` - Max wind speed (mph) to open awning; no default, must be set
-- `MIN_SUN_ALTITUDE_DEG` - Min sun altitude (degrees above horizon); no default, must be set
+- `MIN_SUN_ALTITUDE_DEG` - Min sun altitude (degrees above horizon); no default, must be set. **The deployed `.env` pins it to 12**, lowered from 15 on 2026-09-28 — see Decision Logic condition 6 above for the first-ever direct-observation calibration of this threshold
 
 **Optional for automation (have defaults):**
 - `MIN_GHI_WM2` - Min global horizontal irradiance W/m² for Layer 1 sunny gate (default: 400)
