@@ -4743,8 +4743,8 @@ class TestHeartbeatCompositionRoot(unittest.TestCase):
         mock_ping.assert_not_called()
 
 
-class TestFetchMetarCeiling(unittest.TestCase):
-    """fetch_metar_ceiling() — request shape, newest-report selection, fail-open."""
+class TestFetchMetar(unittest.TestCase):
+    """fetch_metar() — request shape, newest-report selection, fail-open."""
 
     NOW = datetime(2026, 10, 3, 15, 15, 0, tzinfo=timezone.utc)  # 11:15 EDT
 
@@ -4775,7 +4775,7 @@ class TestFetchMetarCeiling(unittest.TestCase):
             side_effect=side_effect,
             return_value=None if side_effect else mock_resp,
         ) as mock_get:
-            result = awning_automation.fetch_metar_ceiling(
+            result = awning_automation.fetch_metar(
                 "KRDU", _now_utc=now or self.NOW
             )
         return result, mock_get
@@ -4835,6 +4835,32 @@ class TestFetchMetarCeiling(unittest.TestCase):
         report = {"obsTime": self.SPECI_1104["obsTime"], "rawOb": "METAR KRDU CLR"}
         result, _ = self._call([report])
         self.assertIsNone(result["ceiling_ft"])
+
+    def test_wind_and_gust_are_converted_from_knots(self):
+        report = dict(self.SPECI_1104, wspd=22, wgst=38, wxString="-DZ")
+        result, _ = self._call([report])
+        self.assertAlmostEqual(result["wind_mph"], 22 * 1.15078, places=3)
+        self.assertAlmostEqual(result["gust_mph"], 38 * 1.15078, places=3)
+        self.assertEqual(result["wx"], "-DZ")
+
+    def test_report_without_gust_or_weather_gives_none(self):
+        """The real KRDU report carries wspd but no wgst/wxString keys at all."""
+        report = dict(self.SPECI_1104, wspd=8)
+        result, _ = self._call([report])
+        self.assertAlmostEqual(result["wind_mph"], 8 * 1.15078, places=3)
+        self.assertIsNone(result["gust_mph"])
+        self.assertIsNone(result["wx"])
+
+    def test_variable_or_garbage_wind_becomes_none_not_zero(self):
+        """A 0 would read as 'calm' and a raise would drop the ceiling too."""
+        for label, value in {"VRB string": "VRB", "null": None, "bool": True, "text": "n/a"}.items():
+            with self.subTest(case=label):
+                report = dict(self.SPECI_1104, wspd=value, wgst=value)
+                result, _ = self._call([report])
+                self.assertIsNotNone(result, "ceiling must survive unparseable wind")
+                self.assertEqual(result["ceiling_ft"], 1600.0)
+                self.assertIsNone(result["wind_mph"])
+                self.assertIsNone(result["gust_mph"])
 
     def test_stale_report_fails_open(self):
         """A 2-hour-old overcast report must not veto a run now."""
@@ -4951,7 +4977,7 @@ class TestObservedCeilingVeto(unittest.TestCase):
         }
 
     def _run(self, obs, *, station="KRDU", weather=None, sun=None, **overrides):
-        """Evaluate the incident with fetch_metar_ceiling returning `obs`."""
+        """Evaluate the incident with fetch_metar returning `obs`."""
         w = _weather(**(weather or self.INCIDENT_WEATHER))
         if weather is None:
             # Only the real incident carries its logged smoothed values; a
@@ -4961,7 +4987,7 @@ class TestObservedCeilingVeto(unittest.TestCase):
         kwargs = dict(_THRESHOLDS, altitude_threshold=12.0)
         kwargs.update(overrides)
         with unittest.mock.patch.object(
-            awning_automation, "fetch_metar_ceiling", return_value=obs
+            awning_automation, "fetch_metar", return_value=obs
         ) as mock_fetch, unittest.mock.patch.object(
             awning_automation, "is_raining_on_radar", return_value=False
         ):
@@ -5027,7 +5053,7 @@ class TestObservedCeilingVeto(unittest.TestCase):
     def test_raising_fetch_fails_open(self):
         w = _weather(**self.INCIDENT_WEATHER)
         with unittest.mock.patch.object(
-            awning_automation, "fetch_metar_ceiling", side_effect=RuntimeError("boom")
+            awning_automation, "fetch_metar", side_effect=RuntimeError("boom")
         ), unittest.mock.patch.object(
             awning_automation, "is_raining_on_radar", return_value=False
         ):
@@ -5063,7 +5089,7 @@ class TestObservedCeilingVeto(unittest.TestCase):
                     dni=0.0, cloud_cover=100.0)
         w = _weather(**dark)
         with unittest.mock.patch.object(
-            awning_automation, "fetch_metar_ceiling", return_value=self._obs(None)
+            awning_automation, "fetch_metar", return_value=self._obs(None)
         ), unittest.mock.patch.object(
             awning_automation, "is_raining_on_radar", return_value=False
         ):
@@ -5096,7 +5122,7 @@ class TestObservedCeilingVeto(unittest.TestCase):
             with unittest.mock.patch.object(
                 awning_automation, "fetch_crosscheck_irradiance", return_value=crosscheck
             ), unittest.mock.patch.object(
-                awning_automation, "fetch_metar_ceiling", return_value=obs
+                awning_automation, "fetch_metar", return_value=obs
             ), unittest.mock.patch.object(
                 awning_automation, "is_raining_on_radar", return_value=False
             ):
@@ -5161,7 +5187,7 @@ class TestObservedCeilingVetoCompositionRoot(unittest.TestCase):
              patch.object(awning_automation, "calculate_sun_position",
                           return_value={"azimuth": 141.6, "altitude": 42.6}), \
              patch.object(awning_automation, "is_raining_on_radar", return_value=False), \
-             patch.object(awning_automation, "fetch_metar_ceiling",
+             patch.object(awning_automation, "fetch_metar",
                           return_value=metar_result) as mock_fetch, \
              patch.object(awning_automation, "create_controller_from_env",
                           return_value=mock_controller):
@@ -5244,7 +5270,7 @@ class TestObservedCeilingVetoNotification(unittest.TestCase):
         weather = _weather(**TestObservedCeilingVeto.INCIDENT_WEATHER)
         rain_out, sky_out = [], []
         with unittest.mock.patch.object(
-            awning_automation, "fetch_metar_ceiling",
+            awning_automation, "fetch_metar",
             return_value={"ceiling_ft": 1600.0, "cover": "BKN", "age_min": 11.0, "raw": ""},
         ), unittest.mock.patch.object(
             awning_automation, "is_raining_on_radar", return_value=False
@@ -5263,7 +5289,7 @@ class TestObservedCeilingVetoNotification(unittest.TestCase):
         weather = _weather(**TestObservedCeilingVeto.INCIDENT_WEATHER)
         sky_out = []
         with unittest.mock.patch.object(
-            awning_automation, "fetch_metar_ceiling",
+            awning_automation, "fetch_metar",
             return_value={"ceiling_ft": None, "cover": None, "age_min": 11.0, "raw": ""},
         ), unittest.mock.patch.object(
             awning_automation, "is_raining_on_radar", return_value=False
@@ -5316,7 +5342,7 @@ class TestObservedCeilingVetoNotification(unittest.TestCase):
              patch.object(awning_automation, "calculate_sun_position",
                           return_value={"azimuth": 141.6, "altitude": 42.6}), \
              patch.object(awning_automation, "is_raining_on_radar", return_value=False), \
-             patch.object(awning_automation, "fetch_metar_ceiling",
+             patch.object(awning_automation, "fetch_metar",
                           return_value={"ceiling_ft": 1600.0, "cover": "BKN",
                                         "age_min": 11.0, "raw": ""}), \
              patch.object(awning_automation, "create_controller_from_env",
@@ -5329,6 +5355,294 @@ class TestObservedCeilingVetoNotification(unittest.TestCase):
         sent = mock_telegram.call_args[0][2]
         self.assertIn("KRDU reports BKN016", sent)
         self.assertNotIn("Not enough sun", sent)
+
+
+class TestEvaluateWind(unittest.TestCase):
+    """evaluate_wind() — the worse of model and airport, gusts included."""
+
+    def _eval(self, model_mean=5.0, model_gust=8.0, metar=None, station="KRDU",
+              mean_limit=15.0, gust_limit=25.0):
+        return awning_automation.evaluate_wind(
+            model_mean, model_gust, mean_limit, gust_limit, metar=metar, station=station
+        )
+
+    @staticmethod
+    def _metar(wind=None, gust=None, age=10.0):
+        return {"wind_mph": wind, "gust_mph": gust, "age_min": age}
+
+    def test_calm_model_only(self):
+        calm, line, alert = self._eval()
+        self.assertTrue(calm)
+        self.assertIsNone(alert)
+
+    def test_model_mean_at_or_over_the_limit_is_not_calm(self):
+        """Same boundary as the original `wind < threshold` rule."""
+        self.assertTrue(self._eval(model_mean=14.9)[0])
+        calm, _, alert = self._eval(model_mean=15.0)
+        self.assertFalse(calm)
+        self.assertEqual(alert, "wind 15 mph (model)")
+
+    def test_model_gust_closes(self):
+        calm, _, alert = self._eval(model_gust=26.0)
+        self.assertFalse(calm)
+        self.assertEqual(alert, "gusts 26 mph (model)")
+
+    def test_gust_boundary(self):
+        self.assertTrue(self._eval(model_gust=24.9)[0])
+        self.assertFalse(self._eval(model_gust=25.0)[0])
+
+    def test_2026_09_05_airport_gust_closes_despite_calm_model(self):
+        """KRDU 25 mph sustained / 44 mph gust vs model 9 / 10 mph."""
+        calm, line, alert = self._eval(
+            model_mean=9.0, model_gust=10.0, metar=self._metar(wind=25.0, gust=44.0, age=6.0)
+        )
+        self.assertFalse(calm)
+        self.assertEqual(alert, "gusts 44 mph (KRDU)")
+        self.assertIn("KRDU 25/44", line)
+
+    def test_airport_sustained_wind_without_gust_closes(self):
+        calm, _, alert = self._eval(metar=self._metar(wind=17.0))
+        self.assertFalse(calm)
+        self.assertEqual(alert, "wind 17 mph (KRDU)")
+
+    def test_observation_can_only_tighten(self):
+        """A calm airport must never cancel a windy model."""
+        calm, _, alert = self._eval(
+            model_mean=20.0, model_gust=30.0, metar=self._metar(wind=2.0, gust=3.0)
+        )
+        self.assertFalse(calm)
+        self.assertEqual(alert, "gusts 30 mph (model)")
+
+    def test_stale_metar_is_ignored_for_wind(self):
+        calm, line, _ = self._eval(metar=self._metar(wind=30.0, gust=50.0, age=61.0))
+        self.assertTrue(calm)
+        self.assertIn("too old for wind", line)
+        calm, _, _ = self._eval(metar=self._metar(wind=30.0, gust=50.0, age=60.0))
+        self.assertFalse(calm, "60 min is still inside the window")
+
+    def test_missing_pieces_degrade_to_what_is_known(self):
+        self.assertTrue(self._eval(model_gust=None)[0], "null model gust is not 'windy'")
+        self.assertTrue(self._eval(metar=self._metar())[0], "VRB/empty METAR wind is ignored")
+        self.assertTrue(self._eval(metar=None)[0])
+        self.assertTrue(self._eval(metar=self._metar(wind=30.0), station=None)[0],
+                        "no station configured means no observation is used")
+
+    def test_line_names_every_source(self):
+        _, line, _ = self._eval(metar=self._metar(wind=8.0, gust=None))
+        self.assertIn("model 5/8", line)
+        self.assertIn("KRDU 8/n/a", line)
+        self.assertIn("mph (mean/gust)", line)
+
+
+class TestGustGate(unittest.TestCase):
+    """Wind wired through should_open_awning(), on the real 2026-09-05 numbers."""
+
+    NOW = TestObservedCeilingVeto.NOW
+    SUN = TestObservedCeilingVeto.SUN
+
+    # Clear, sunny, calm FORECAST (so only wind can close it).
+    WEATHER = dict(
+        TestObservedCeilingVeto.INCIDENT_WEATHER,
+        wind_speed=5.6, cloud_cover=10.0, cloud_cover_low=5.0, cloud_cover_mid=0.0,
+    )
+    GUSTY_METAR = {"ceiling_ft": None, "cover": None, "wind_mph": 25.0,
+                   "gust_mph": 44.0, "wx": None, "age_min": 6.0, "raw": ""}
+
+    def _run(self, obs, *, station="KRDU", model_gust=10.0, **overrides):
+        w = _weather(**self.WEATHER)
+        w["wind_gusts_10m"] = model_gust
+        w["ghi_smoothed"], w["dni_smoothed"] = 558.0, 600.0
+        kwargs = dict(_THRESHOLDS, altitude_threshold=12.0)
+        kwargs.update(overrides)
+        with unittest.mock.patch.object(
+            awning_automation, "fetch_metar", return_value=obs
+        ) as mock_fetch, unittest.mock.patch.object(
+            awning_automation, "is_raining_on_radar", return_value=False
+        ):
+            result = should_open_awning(
+                w, _sun(**self.SUN), self.NOW, metar_station=station, **kwargs
+            )
+        return result, mock_fetch
+
+    def test_control_calm_day_opens(self):
+        (should_open, reason, _), _ = self._run(None, station=None)
+        self.assertTrue(should_open, reason)
+
+    def test_airport_gust_closes_when_the_model_is_calm(self):
+        alert: list = []
+        w = _weather(**self.WEATHER)
+        w["wind_gusts_10m"] = 10.0
+        with unittest.mock.patch.object(
+            awning_automation, "fetch_metar", return_value=self.GUSTY_METAR
+        ), unittest.mock.patch.object(
+            awning_automation, "is_raining_on_radar", return_value=False
+        ):
+            should_open, reason, conditions = should_open_awning(
+                w, _sun(**self.SUN), self.NOW, metar_station="KRDU",
+                _wind_alert=alert, **dict(_THRESHOLDS, altitude_threshold=12.0),
+            )
+        self.assertFalse(should_open)
+        self.assertEqual([k for k, v in conditions.items() if not v], ["calm"])
+        self.assertEqual(alert, ["gusts 44 mph (KRDU)"])
+        self.assertIn("Too windy (gusts 44 mph (KRDU)", reason)
+
+    def test_model_gust_alone_closes_without_any_station(self):
+        (should_open, reason, conditions), mock_fetch = self._run(
+            None, station=None, model_gust=31.0
+        )
+        self.assertFalse(should_open)
+        self.assertFalse(conditions["calm"])
+        mock_fetch.assert_not_called()
+
+    def test_gust_threshold_is_configurable(self):
+        (default_open, _, _), _ = self._run(None, station=None, model_gust=30.0)
+        (raised_open, _, _), _ = self._run(
+            None, station=None, model_gust=30.0, wind_gust_threshold=35.0
+        )
+        self.assertFalse(default_open)
+        self.assertTrue(raised_open)
+
+    def test_unavailable_airport_fails_open(self):
+        (should_open, reason, _), _ = self._run(None)
+        self.assertTrue(should_open, reason)
+
+    def test_airport_without_a_station_setting_is_never_consulted(self):
+        _, mock_fetch = self._run(self.GUSTY_METAR, station=None)
+        mock_fetch.assert_not_called()
+
+    def test_every_run_logs_a_wind_observation_line(self):
+        with self.assertLogs(awning_automation.logger, level="INFO") as logs:
+            self._run(self.GUSTY_METAR)
+        lines = [m for m in logs.output if "Wind observation:" in m]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("KRDU 25/44", lines[0])
+        self.assertIn(">= 25", lines[0])
+
+
+class TestGustNotification(unittest.TestCase):
+    """The close message names the source, not the model's calm mean wind."""
+
+    _NOT_CALM = {"sunny": True, "calm": False, "no_rain": True, "above_freezing": True,
+                 "daytime": True, "sun_high": True, "sun_facing_window": True}
+    _READINGS = dict(wind_speed=5.6, precipitation=0.0, temperature=81.2,
+                     ghi=601.0, uv_index=4.9, dni=645.0, cloud_cover=15.0)
+
+    def test_message_names_the_gust_source(self):
+        msg = awning_automation.build_close_reason(
+            self._NOT_CALM, **self._READINGS, wind_alert="gusts 44 mph (KRDU)"
+        )
+        self.assertIn("gusts 44 mph (KRDU)", msg)
+        self.assertNotIn("6 mph", msg, "the model's calm 5.6 mph is the contradiction")
+
+    def test_message_falls_back_to_the_mean_wind(self):
+        msg = awning_automation.build_close_reason(self._NOT_CALM, **self._READINGS)
+        self.assertIn("Too windy (6 mph)", msg)
+
+    def test_rain_still_outranks_wind(self):
+        conditions = dict(self._NOT_CALM, no_rain=False)
+        msg = awning_automation.build_close_reason(
+            conditions, **self._READINGS,
+            rain_attribution="radar(NEXRAD)", wind_alert="gusts 44 mph (KRDU)",
+        )
+        self.assertIn("radar(NEXRAD)", msg)
+
+    def test_main_composition_root_sends_the_gust_message(self):
+        """Real main() on the 2026-09-05 numbers: calm model, 44 mph airport gust."""
+        import sys
+        from unittest.mock import patch, MagicMock
+
+        controller = MagicMock()
+        controller.get_state.side_effect = [1, 0]
+        log_path = MagicMock()
+        log_path.parent = MagicMock()
+        weather = _weather(**TestGustGate.WEATHER)
+        weather["time"] = "2026-10-03T11:15:00"
+        weather["wind_gusts_10m"] = 10.0
+        weather["ghi_smoothed"], weather["dni_smoothed"] = 558.0, 600.0
+
+        env = {"WIND_SPEED_THRESHOLD_MPH": "15", "MIN_SUN_ALTITUDE_DEG": "12",
+               "METAR_STATION": "KRDU"}
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(sys, "argv", ["awning_automation.py"]), \
+             patch.object(awning_automation, "setup_logging", return_value=log_path), \
+             patch.object(awning_automation, "load_location_config", return_value=(35.778, -78.838)), \
+             patch.object(awning_automation, "load_telegram_config", return_value=("t", "c")), \
+             patch.object(awning_automation, "collect_weather_measurements", return_value=weather), \
+             patch.object(awning_automation, "calculate_sun_position",
+                          return_value={"azimuth": 141.6, "altitude": 42.6}), \
+             patch.object(awning_automation, "is_raining_on_radar", return_value=False), \
+             patch.object(awning_automation, "fetch_metar",
+                          return_value=TestGustGate.GUSTY_METAR), \
+             patch.object(awning_automation, "create_controller_from_env", return_value=controller), \
+             patch.object(awning_automation, "send_telegram_notification") as mock_telegram:
+            awning_automation.main()
+
+        controller.close.assert_called_once()
+        controller.open.assert_not_called()
+        sent = mock_telegram.call_args[0][2]
+        self.assertIn("gusts 44 mph (KRDU)", sent)
+
+
+class TestGetWindGustThreshold(unittest.TestCase):
+    """WIND_GUST_THRESHOLD_MPH parsing."""
+
+    def _get(self, **env):
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            return awning_automation.get_wind_gust_threshold()
+
+    def test_default_is_25(self):
+        self.assertEqual(self._get(), 25.0)
+
+    def test_custom_value(self):
+        self.assertEqual(self._get(WIND_GUST_THRESHOLD_MPH=" 30 "), 30.0)
+
+    def test_invalid_values_raise(self):
+        for label, value in {"text": "windy", "zero": "0", "negative": "-5"}.items():
+            with self.subTest(case=label):
+                with self.assertRaises(ConfigurationError):
+                    self._get(WIND_GUST_THRESHOLD_MPH=value)
+
+
+class TestFetchWeatherGusts(unittest.TestCase):
+    """fetch_weather() requests and returns the model gust without requiring it."""
+
+    @staticmethod
+    def _body(**current_overrides):
+        current = {
+            "wind_speed_10m": 5.0, "wind_gusts_10m": 11.0, "precipitation": 0.0,
+            "temperature_2m": 65.0, "shortwave_radiation": 500.0, "uv_index": 6.0,
+            "direct_normal_irradiance": 400.0, "cloud_cover": 20, "cloud_cover_low": 10,
+            "cloud_cover_mid": 5, "cloud_cover_high": 5, "is_day": 1,
+            "time": "2026-04-17T13:00",
+        }
+        current.update(current_overrides)
+        return {"current": current,
+                "daily": {"sunrise": ["2026-04-17T06:00"], "sunset": ["2026-04-17T20:00"]}}
+
+    def _fetch(self, body):
+        resp = unittest.mock.MagicMock()
+        resp.json.return_value = body
+        resp.raise_for_status.return_value = None
+        with unittest.mock.patch.object(
+            awning_automation._weather_session, "get", return_value=resp
+        ) as mock_get:
+            return fetch_weather(35.778, -78.838), mock_get
+
+    def test_gust_is_requested_and_returned(self):
+        weather, mock_get = self._fetch(self._body())
+        self.assertIn("wind_gusts_10m", mock_get.call_args.kwargs["params"]["current"])
+        self.assertNotIn("models", mock_get.call_args.kwargs["params"])
+        self.assertEqual(weather["wind_gusts_10m"], 11.0)
+
+    def test_missing_or_null_gust_degrades_instead_of_raising(self):
+        """Raising here would fail-safe-close the awning every 15 minutes."""
+        body = self._body(wind_gusts_10m=None)
+        weather, _ = self._fetch(body)
+        self.assertIsNone(weather["wind_gusts_10m"])
+        body = self._body()
+        del body["current"]["wind_gusts_10m"]
+        weather, _ = self._fetch(body)
+        self.assertIsNone(weather["wind_gusts_10m"])
 
 
 if __name__ == "__main__":

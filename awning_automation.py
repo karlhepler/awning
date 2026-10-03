@@ -328,11 +328,13 @@ def collect_weather_measurements(lat: float, lon: float) -> dict:
     """
     logger.info("Fetching weather measurement...")
     weather = fetch_weather(lat, lon)
+    gust = weather.get("wind_gusts_10m")
+    gust_text = f" (gust {gust:.0f})" if gust is not None else ""
     logger.info(
         f"Weather: GHI {weather['shortwave_radiation']:.0f} W/m², "
         f"UV {weather['uv_index']:.1f}, "
         f"DNI {weather['dni']:.0f} W/m², "
-        f"{weather['wind_speed_10m']:.1f} mph wind, "
+        f"{weather['wind_speed_10m']:.1f} mph wind{gust_text}, "
         f"{weather['precipitation']:.2f} mm/h rain, "
         f"{weather['temperature']:.1f}°F"
     )
@@ -433,7 +435,7 @@ _CROSSCHECK_TIMEOUT_S = 8
 _CROSSCHECK_MAX_SLOT_AGE_MIN = 60
 
 # Observed-ceiling veto — see the 2026-10-03 incident notes on
-# fetch_metar_ceiling(). 3000 ft is the standard aviation "low ceiling" line
+# fetch_metar(). 3000 ft is the standard aviation "low ceiling" line
 # (the MVFR boundary), not a value tuned to this house.
 DEFAULT_METAR_CEILING_FT = 3000.0
 _METAR_TIMEOUT_S = 5
@@ -442,6 +444,16 @@ _METAR_TIMEOUT_S = 5
 _METAR_MAX_AGE_MIN = 90
 # Sky-cover codes that mean the sun is actually blocked. FEW/SCT leave gaps.
 _METAR_BLOCKING_COVERS = ("BKN", "OVC", "VV")
+# Wind in a METAR is a short mean plus the peak gust of the last ~10 minutes, so
+# it goes stale far faster than a cloud deck. Past this the report is ignored
+# for wind (the next routine METAR lands ~60 min after the last).
+_METAR_WIND_MAX_AGE_MIN = 60
+_KT_TO_MPH = 1.15078
+
+# Gust gate — see the 2026-09-05 note on evaluate_wind(). 25 mph is a default,
+# not a rating: the awning's own wind sensor is installer-programmed and its
+# trigger speed is not published (Skyview/Dooya), so read it off the sensor.
+DEFAULT_WIND_GUST_THRESHOLD_MPH = 25.0
 
 # Trailing-window smoothing for the primary feed's irradiance fields.
 #
@@ -885,6 +897,31 @@ def get_sky_observation_config() -> tuple[Optional[str], float]:
     return (station or None), ceiling_ft
 
 
+def get_wind_gust_threshold() -> float:
+    """
+    Read WIND_GUST_THRESHOLD_MPH (optional, default 25).
+
+    Kept apart from get_thresholds() for the same reason as
+    get_sky_observation_config(): that tuple is unpacked positionally. The
+    default is a starting point, not a rating — the awning's own wind sensor is
+    installer-programmed (Dooya sensors take 0.1-180 km/h) and its trigger speed
+    is not published, so align this with the number shown on that sensor.
+    """
+    raw = os.getenv("WIND_GUST_THRESHOLD_MPH", str(DEFAULT_WIND_GUST_THRESHOLD_MPH)).strip()
+    try:
+        threshold = float(raw)
+    except ValueError as e:
+        raise ConfigurationError(
+            f"Invalid WIND_GUST_THRESHOLD_MPH format: {e}. Must be a number."
+        ) from e
+    if threshold <= 0:
+        raise ConfigurationError(
+            f"WIND_GUST_THRESHOLD_MPH must be > 0; a value of 0 would close the "
+            f"awning on every gust reading, including none. Received: {threshold}"
+        )
+    return threshold
+
+
 def load_telegram_config() -> tuple[Optional[str], Optional[str]]:
     """
     Load Telegram configuration from environment variables.
@@ -983,7 +1020,7 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
         "latitude": lat,
         "longitude": lon,
         "current": (
-            "wind_speed_10m,precipitation,weather_code,is_day,temperature_2m,"
+            "wind_speed_10m,wind_gusts_10m,precipitation,weather_code,is_day,temperature_2m,"
             "shortwave_radiation,uv_index,direct_normal_irradiance,"
             "cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high"
         ),
@@ -1120,6 +1157,10 @@ def fetch_weather(lat: float, lon: float, timeout: int = 10) -> dict:
 
         return {
             "wind_speed_10m": current["wind_speed_10m"],
+            # Not in required_fields on purpose: a missing/null gust must degrade
+            # to "no gust data" (the gate falls back to mean wind and the METAR),
+            # not raise and fail-safe-close the awning every 15 minutes.
+            "wind_gusts_10m": current.get("wind_gusts_10m"),
             "precipitation": current["precipitation"],
             "weather_code": current.get("weather_code"),
             "temperature": current["temperature_2m"],
@@ -1360,16 +1401,23 @@ def fetch_crosscheck_irradiance(
         return None
 
 
-def fetch_metar_ceiling(
+def fetch_metar(
     station: str,
     timeout: int = _METAR_TIMEOUT_S,
     _now_utc: Optional[datetime] = None,
 ) -> Optional[dict]:
     """
-    Fetch the nearest airport's latest METAR and report its lowest cloud ceiling.
+    Fetch the nearest airport's latest METAR: lowest cloud ceiling, wind and gust.
 
-    Why this exists — the 2026-10-03 incident
-    -----------------------------------------
+    One request, one report, three observed facts the forecast can get wrong.
+    The wind half exists because of 2026-09-05: at 15:09 KRDU recorded 25 mph
+    sustained with a 44 mph gust while the model said 9 / 10 mph, and the awning
+    was open reporting ~6 mph (it closed 15 minutes later only because radar
+    showed rain). Over six weeks the model missed 5 of 5 sustained >=15 mph
+    and 7 of 7 gusts >=25 mph at this station. Wind is converted from knots.
+
+    Why the ceiling exists — the 2026-10-03 incident
+    ------------------------------------------------
     Every input to the sunny gate (GHI, UV, DNI, cloud cover) is a model product
     from one Open-Meteo `best_match` response, which resolves to GFS/HRRR here.
     At 11:15 it read 15% cloud, DNI 645, GHI 601 and the awning stayed open while
@@ -1390,6 +1438,7 @@ def fetch_metar_ceiling(
     Fails open: returns None on ANY error, an empty result, or a report older
     than _METAR_MAX_AGE_MIN, so an outage reverts to forecast-only behavior and
     can never wedge the awning closed. Mirrors fetch_crosscheck_irradiance().
+    The caller applies the tighter _METAR_WIND_MAX_AGE_MIN to the wind fields.
 
     Args:
         station: ICAO station code, e.g. "KRDU"
@@ -1398,8 +1447,10 @@ def fetch_metar_ceiling(
 
     Returns:
         Dict with 'ceiling_ft' (lowest BKN/OVC/VV base, or None when there is no
-        such layer), 'cover' (that layer's code, or None), 'age_min' and 'raw'
-        (the report text); or None if no usable observation is available.
+        such layer), 'cover' (that layer's code, or None), 'wind_mph' and
+        'gust_mph' (None when the report carries none), 'wx' (present-weather
+        string such as "-DZ", or None), 'age_min' and 'raw' (the report text);
+        or None if no usable observation is available.
     """
     url = "https://aviationweather.gov/api/data/metar"
     params = {"ids": station, "format": "json", "hours": 2}
@@ -1432,6 +1483,9 @@ def fetch_metar_ceiling(
         return {
             "ceiling_ft": ceiling_ft,
             "cover": cover,
+            "wind_mph": _knots_to_mph(latest.get("wspd")),
+            "gust_mph": _knots_to_mph(latest.get("wgst")),
+            "wx": latest.get("wxString"),
             "age_min": age_min,
             "raw": latest.get("rawOb", ""),
         }
@@ -1441,6 +1495,17 @@ def fetch_metar_ceiling(
         return None
     except Exception as e:
         logger.warning(f"Sky observation: parse error: {e} — no veto")
+        return None
+
+
+def _knots_to_mph(knots) -> Optional[float]:
+    """Convert a METAR wind value in knots to mph; None for absent/non-numeric
+    (variable-wind reports and missing gusts must not become 0 or raise)."""
+    if knots is None or isinstance(knots, bool):
+        return None
+    try:
+        return float(knots) * _KT_TO_MPH
+    except (TypeError, ValueError):
         return None
 
 
@@ -1966,6 +2031,77 @@ def evaluate_rain_gate(
     return True
 
 
+def evaluate_wind(
+    model_mean_mph: float,
+    model_gust_mph: Optional[float],
+    mean_threshold_mph: float,
+    gust_threshold_mph: float,
+    metar: Optional[dict] = None,
+    station: Optional[str] = None,
+) -> tuple[bool, str, Optional[str]]:
+    """
+    Decide whether the wind is calm enough, using the WORSE of model and airport.
+
+    Why gusts, and why the airport — the 2026-09-05 near miss
+    ---------------------------------------------------------
+    The gate used to compare only the model's mean 10 m wind to the threshold.
+    At 15:09 that day KRDU recorded 25 mph sustained with a 44 mph gust while
+    the model said 9 mph mean / 10 mph gust. Your Pi log has the awning open at
+    15:00 and 15:15 reporting ~6 mph; it closed at 15:30 only because radar
+    showed rain. Gusts are what damage an awning, and the model cannot see
+    thunderstorm outflow. Observed wind can only make the gate stricter, never
+    looser, so a stale or missing observation reverts to model-only behavior.
+
+    A METAR older than _METAR_WIND_MAX_AGE_MIN is ignored for wind (it carries a
+    short mean plus the last ~10 minutes' peak gust). A missing/null model gust
+    is skipped rather than treated as windy: Open-Meteo omitting it must not
+    close the awning every 15 minutes.
+
+    Returns:
+        (calm, log_line, alert). `alert` is a short reason such as
+        "gusts 44 mph (KRDU)" when not calm, else None; it names the source
+        that tripped the gate so a close is attributable without the log.
+    """
+    sources = [("model", model_mean_mph, model_gust_mph)]
+    metar_note = ""
+    if metar is not None and station:
+        age = metar.get("age_min")
+        if age is not None and age <= _METAR_WIND_MAX_AGE_MIN:
+            sources.append((station, metar.get("wind_mph"), metar.get("gust_mph")))
+            metar_note = f", {station} METAR {age:.0f} min old"
+        else:
+            metar_note = f", {station} METAR too old for wind"
+
+    def worst(index: int):
+        candidates = [(s[index], s[0]) for s in sources if s[index] is not None]
+        return max(candidates) if candidates else (None, None)
+
+    mean_val, mean_src = worst(1)
+    gust_val, gust_src = worst(2)
+
+    mean_ok = mean_val is None or mean_val < mean_threshold_mph
+    gust_ok = gust_val is None or gust_val < gust_threshold_mph
+    calm = mean_ok and gust_ok
+
+    def fmt(value):
+        return "n/a" if value is None else f"{value:.0f}"
+
+    per_source = ", ".join(f"{s[0]} {fmt(s[1])}/{fmt(s[2])}" for s in sources)
+    line = (
+        f"{per_source} mph (mean/gust){metar_note} → "
+        f"worst mean {fmt(mean_val)} ({mean_src}) {'<' if mean_ok else '>='} "
+        f"{mean_threshold_mph:.0f}, worst gust {fmt(gust_val)} ({gust_src}) "
+        f"{'<' if gust_ok else '>='} {gust_threshold_mph:.0f}"
+    )
+
+    alert = None
+    if not gust_ok:
+        alert = f"gusts {gust_val:.0f} mph ({gust_src})"
+    elif not mean_ok:
+        alert = f"wind {mean_val:.0f} mph ({mean_src})"
+    return calm, line, alert
+
+
 def should_open_awning(
     weather: dict,
     sun_position: dict,
@@ -1991,7 +2127,9 @@ def should_open_awning(
     metar_station: Optional[str] = None,
     metar_ceiling_ft: float = DEFAULT_METAR_CEILING_FT,
     _attribution: Optional[list] = None,
+    wind_gust_threshold: float = DEFAULT_WIND_GUST_THRESHOLD_MPH,
     _sky_veto: Optional[list] = None,
+    _wind_alert: Optional[list] = None,
 ) -> tuple[bool, str, dict]:
     """
     Determine if awning should be open based on ALL conditions.
@@ -2046,7 +2184,10 @@ def should_open_awning(
         weather: Weather data from fetch_weather()
         sun_position: Sun position data from calculate_sun_position()
         current_time: Current datetime
-        wind_threshold: Maximum wind speed (mph) for "calm"
+        wind_threshold: Maximum mean wind speed (mph) for "calm"
+        wind_gust_threshold: Maximum gust (mph) for "calm". Both limits are
+            checked against the WORSE of the model and a fresh airport METAR
+            (see evaluate_wind() for the 2026-09-05 incident).
         altitude_threshold: Minimum sun altitude (degrees) above horizon
         min_ghi: Minimum global horizontal irradiance (W/m²) for sunny_model
         min_uv_index: Minimum UV Index for sunny_model; gated by cloud_cover <
@@ -2071,7 +2212,7 @@ def should_open_awning(
         metar_station: ICAO code of the nearest airport (e.g. "KRDU"). When set,
             an OBSERVED broken/overcast layer below metar_ceiling_ft vetoes a
             "sunny" verdict, rescue included — an observation outranks a model.
-            None (default) disables the veto. See fetch_metar_ceiling() for the
+            None (default) disables the veto. See fetch_metar() for the
             2026-10-03 incident. Close-only: it can never open the awning.
         metar_ceiling_ft: Cloud base (feet AGL) below which a BKN/OVC/VV layer
             vetoes sunny (default 3000, the aviation low-ceiling line)
@@ -2091,6 +2232,9 @@ def should_open_awning(
             make an unrelated close announce a rain message. Lets main() name the
             real reason in the Telegram message instead of "Not enough sun" with
             the forecast's healthy numbers.
+        _wind_alert: Optional list; if provided and the wind gate closed, a
+            short reason such as "gusts 44 mph (KRDU)" is appended, so the
+            Telegram message can name the source that tripped it.
 
     Returns:
         Tuple of (should_open, reason, conditions_dict)
@@ -2182,7 +2326,8 @@ def should_open_awning(
     # additive property provable by reading one line.
     sunny_primary = sunny_model and sunny_observed and not_overcast
 
-    is_calm = wind_speed < wind_threshold
+    # `is_calm` is decided below, after the optional METAR fetch, because the
+    # airport's observed wind joins the model's.
     rain_attribution: list = []
     no_rain = evaluate_rain_gate(
         weather,
@@ -2331,7 +2476,7 @@ def should_open_awning(
         # main()'s fail-safe and close the awning, turning a fail-open feature
         # into a fail-closed one.
         try:
-            sky_obs = fetch_metar_ceiling(metar_station)
+            sky_obs = fetch_metar(metar_station)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning(f"Sky observation: unexpected error: {e} — no veto")
             sky_obs = None
@@ -2359,6 +2504,22 @@ def should_open_awning(
                 )
 
     is_sunny = sunny_forecast and not sky_vetoed
+
+    # Wind: the WORSE of the model and (when fetched above) the airport's report.
+    # The METAR is only fetched when the forecast could still open the awning, so
+    # when it was not, this falls back to the model alone — and the awning is
+    # closed regardless, so nothing is lost.
+    is_calm, wind_line, wind_alert = evaluate_wind(
+        wind_speed,
+        weather.get("wind_gusts_10m"),
+        wind_threshold,
+        wind_gust_threshold,
+        metar=sky_obs,
+        station=metar_station,
+    )
+    if _wind_alert is not None and wind_alert:
+        _wind_alert.append(wind_alert)
+    logger.info(f"Wind observation: {wind_line}")
 
     # Logged on EVERY run (like `Rain signals:`), so a future false reading is
     # diagnosable from the log alone.
@@ -2492,7 +2653,10 @@ def should_open_awning(
     if not is_sunny:
         reasons.append(f"Not sunny: {sunny_trace}")
     if not is_calm:
-        reasons.append(f"Too windy ({wind_speed} >= {wind_threshold} mph)")
+        reasons.append(
+            f"Too windy ({wind_alert}; mean limit {wind_threshold} mph, "
+            f"gust limit {wind_gust_threshold:.0f} mph)"
+        )
     if not no_rain:
         attr = rain_attribution[0] if rain_attribution else f"actual_precip={precipitation}mm"
         reasons.append(f"Raining ({attr})")
@@ -2533,6 +2697,7 @@ def build_close_reason(
     cloud_cover: float,
     rain_attribution: Optional[str] = None,
     sky_veto: Optional[str] = None,
+    wind_alert: Optional[str] = None,
 ) -> str:
     """
     Build a human-readable close reason string for Telegram notifications.
@@ -2548,6 +2713,11 @@ def build_close_reason(
     "0.0 mm/h" because no rain was measured, which reads as a contradiction.
     Falls back to the precipitation value when no attribution is supplied.
 
+    The wind branch names the source that tripped the gate (wind_alert, e.g.
+    "gusts 44 mph (KRDU)"): the model's own mean wind is usually calm when an
+    observed gust is what closed the awning, so printing it would contradict
+    the headline — the same trap as the rain and sky branches.
+
     The not-sunny branch does the same for the observed-ceiling veto: when
     sky_veto names the airport report that fired, the message says so rather
     than printing the forecast's healthy GHI/DNI under "Not enough sun" (the
@@ -2562,6 +2732,8 @@ def build_close_reason(
         return f"🌧️ Awning closed: Rain starting ({precip} mm/h)"
 
     if not conditions["calm"]:
+        if wind_alert:
+            return f"💨 Awning closed: Too windy ({wind_alert})"
         wind_mph = int(round(wind_speed))
         return f"💨 Awning closed: Too windy ({wind_mph} mph)"
 
@@ -2600,6 +2772,7 @@ def _format_friendly_telegram_message(
     cloud_cover: float = 100.0,
     rain_attribution: Optional[str] = None,
     sky_veto: Optional[str] = None,
+    wind_alert: Optional[str] = None,
 ) -> str:
     """
     Format a human-friendly Telegram notification message.
@@ -2618,6 +2791,7 @@ def _format_friendly_telegram_message(
             in the message so a close is attributable without reading the log.
         sky_veto: Which airport report fired the observed-ceiling veto, e.g.
             "KRDU reports BKN016". Named in the message for the same reason.
+        wind_alert: Which wind source tripped the gate, e.g. "gusts 44 mph (KRDU)".
 
     Returns:
         Friendly message string with appropriate emoji
@@ -2633,6 +2807,7 @@ def _format_friendly_telegram_message(
         ghi, uv_index, dni, cloud_cover,
         rain_attribution=rain_attribution,
         sky_veto=sky_veto,
+        wind_alert=wind_alert,
     )
 
 
@@ -2671,13 +2846,14 @@ def main() -> None:
         # Get thresholds
         wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold, radar_veto_dni, radar_veto_cloud_pct, min_dni_direct, sun_azimuth_min, sun_azimuth_max, sunny_crosscheck_enabled = get_thresholds()
         metar_station, metar_ceiling_ft = get_sky_observation_config()
+        wind_gust_threshold = get_wind_gust_threshold()
         logger.info(
             f"Thresholds: model=(GHI >= {min_ghi:.0f} W/m² "
             f"OR [UV >= {min_uv_index:.1f} AND cloud < {max_cloud_cover:.0f}%] "
             f"OR DNI >= {min_dni_direct:.0f} W/m² direct-beam bypass), "
             f"consistency=(DNI >= {min_dni:.0f} W/m² OR cloud < {max_cloud_cover:.0f}%), "
             f"overcast ceiling=cloud < {overcast_threshold:.0f}% (DNI guard >= {min_dni_cirrus:.0f} W/m²), "
-            f"Wind < {wind_threshold} mph, Rain precip=0 AND prob < {rain_probability_threshold}%, "
+            f"Wind < {wind_threshold} mph mean / < {wind_gust_threshold:.0f} mph gust, Rain precip=0 AND prob < {rain_probability_threshold}%, "
             f"Temp > {min_temperature_f:.0f}°F, "
             f"Sun altitude >= {altitude_threshold}°, "
             f"Sun facing window ({sun_azimuth_min:.0f}°-{sun_azimuth_max:.0f}°), "
@@ -2738,6 +2914,7 @@ def main() -> None:
         # Evaluate all conditions
         rain_attribution_out: list = []
         sky_veto_out: list = []
+        wind_alert_out: list = []
         should_open, reason, conditions = should_open_awning(
             weather,
             sun_position,
@@ -2762,11 +2939,14 @@ def main() -> None:
             sunny_crosscheck_enabled=sunny_crosscheck_enabled,
             metar_station=metar_station,
             metar_ceiling_ft=metar_ceiling_ft,
+            wind_gust_threshold=wind_gust_threshold,
             _attribution=rain_attribution_out,
             _sky_veto=sky_veto_out,
+            _wind_alert=wind_alert_out,
         )
         rain_attribution = rain_attribution_out[0] if rain_attribution_out else None
         sky_veto = sky_veto_out[0] if sky_veto_out else None
+        wind_alert = wind_alert_out[0] if wind_alert_out else None
 
         # Log conditions with checkmarks/crosses
         condition_symbols = {
@@ -2823,6 +3003,7 @@ def main() -> None:
                 weather.get("cloud_cover", 100.0),
                 rain_attribution=rain_attribution,
                 sky_veto=sky_veto,
+                wind_alert=wind_alert,
             )
             send_telegram_notification(telegram_token, telegram_chat_id, msg)
 
