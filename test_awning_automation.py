@@ -6147,6 +6147,125 @@ class TestSunshineCompositionRoot(unittest.TestCase):
         controller.open.assert_called_once()
 
 
+class TestAlertThrottle(unittest.TestCase):
+    """A Bond outage fails every run; the alert must not."""
+
+    def setUp(self):
+        import tempfile
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.dir = Path(d.name)
+        self.file = self.dir / ".alert-state.json"
+
+    def _send(self, now, key="bond_api_error", file=None, interval=3600.0):
+        return awning_automation.should_send_alert(file or self.file, key, interval, now=now)
+
+    def test_first_alert_goes_out_then_is_suppressed_for_an_hour(self):
+        self.assertTrue(self._send(1000.0))
+        self.assertFalse(self._send(1000.0 + 15 * 60), "next cron run, 15 minutes later")
+        self.assertFalse(self._send(1000.0 + 3599))
+        self.assertTrue(self._send(1000.0 + 3600), "an hour on, say it again")
+        self.assertFalse(self._send(1000.0 + 3600 + 60))
+
+    def test_kinds_are_independent(self):
+        self.assertTrue(self._send(1000.0, key="a"))
+        self.assertTrue(self._send(1001.0, key="b"))
+        self.assertFalse(self._send(1002.0, key="a"))
+
+    def test_every_failure_mode_errs_on_the_side_of_alerting(self):
+        self.assertTrue(awning_automation.should_send_alert(None, "k"), "no state file configured")
+        self.file.write_text("not json {{{")
+        self.assertTrue(self._send(1000.0), "corrupt file")
+        self.assertFalse(self._send(1001.0), "...and it recovered by rewriting the file")
+        self.file.write_text("[1, 2, 3]")
+        self.assertTrue(self._send(2000.0), "wrong JSON shape")
+        missing_dir = self.dir / "nope" / ".alert-state.json"
+        self.assertTrue(self._send(3000.0, file=missing_dir), "unwritable location")
+        self.assertTrue(self._send(3001.0, file=missing_dir), "...and nothing is suppressed there")
+
+    def test_a_clock_that_went_backwards_does_not_silence_alerts_forever(self):
+        self.assertTrue(self._send(10_000.0))
+        self.assertTrue(self._send(5_000.0), "now < last: do not treat it as 'recent'")
+
+
+class TestBondOutageAlerts(unittest.TestCase):
+    """Real main() with Bond failing on every run, 15 minutes apart."""
+
+    def _run_once(self, log_path):
+        import sys
+        from unittest.mock import patch, MagicMock
+        controller = MagicMock()
+        controller.get_state.side_effect = awning_automation.BondAPIError("bridge unreachable")
+        weather = _weather(**TestGustGate.WEATHER)
+        weather["time"] = "2026-10-03T11:15:00"
+        weather["ghi_smoothed"], weather["dni_smoothed"] = 558.0, 600.0
+        env = {"WIND_SPEED_THRESHOLD_MPH": "15", "MIN_SUN_ALTITUDE_DEG": "12"}
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(sys, "argv", ["awning_automation.py"]), \
+             patch.object(awning_automation, "setup_logging", return_value=log_path), \
+             patch.object(awning_automation, "load_location_config", return_value=(35.778, -78.838)), \
+             patch.object(awning_automation, "load_telegram_config", return_value=("t", "c")), \
+             patch.object(awning_automation, "collect_weather_measurements", return_value=weather), \
+             patch.object(awning_automation, "calculate_sun_position",
+                          return_value={"azimuth": 141.6, "altitude": 42.6}), \
+             patch.object(awning_automation, "is_raining_on_radar", return_value=False), \
+             patch.object(awning_automation, "create_controller_from_env", return_value=controller), \
+             patch.object(awning_automation, "send_telegram_notification") as tg:
+            with self.assertRaises(SystemExit) as ctx:
+                awning_automation.main()
+        self.assertEqual(ctx.exception.code, 1)
+        return tg
+
+    def test_repeated_outage_alerts_once_and_every_run_still_fails_loudly_in_the_log(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            log_path = Path(d) / "awning-2026-10-03.log"
+            first = self._run_once(log_path)
+            second = self._run_once(log_path)
+            third = self._run_once(log_path)
+        self.assertEqual(first.call_count, 1)
+        self.assertIn("Bond API error: bridge unreachable", first.call_args[0][2])
+        self.assertEqual(second.call_count, 0, "15 minutes later: same outage, no new message")
+        self.assertEqual(third.call_count, 0)
+
+    def test_with_an_unusable_log_location_it_still_alerts(self):
+        from unittest.mock import MagicMock
+        tg = self._run_once(MagicMock())        # not a real Path: throttling is skipped
+        self.assertEqual(tg.call_count, 1)
+
+
+class TestDryRunStateReport(unittest.TestCase):
+    def _state_line(self, state):
+        import sys
+        from unittest.mock import patch, MagicMock
+        controller = MagicMock()
+        controller.get_state.return_value = state
+        weather = _weather(**TestGustGate.WEATHER)
+        weather["time"] = "2026-10-03T11:15:00"
+        weather["ghi_smoothed"], weather["dni_smoothed"] = 558.0, 600.0
+        env = {"WIND_SPEED_THRESHOLD_MPH": "15", "MIN_SUN_ALTITUDE_DEG": "12"}
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(sys, "argv", ["awning_automation.py", "--dry-run"]), \
+             patch.object(awning_automation, "setup_logging", return_value=MagicMock()), \
+             patch.object(awning_automation, "load_location_config", return_value=(35.778, -78.838)), \
+             patch.object(awning_automation, "load_telegram_config", return_value=(None, None)), \
+             patch.object(awning_automation, "collect_weather_measurements", return_value=weather), \
+             patch.object(awning_automation, "calculate_sun_position",
+                          return_value={"azimuth": 141.6, "altitude": 42.6}), \
+             patch.object(awning_automation, "is_raining_on_radar", return_value=False), \
+             patch.object(awning_automation, "create_controller_from_env", return_value=controller):
+            with self.assertLogs(awning_automation.logger, level="INFO") as logs:
+                awning_automation.main()
+        controller.open.assert_not_called()
+        controller.close.assert_not_called()
+        return next(m for m in logs.output if "Current awning state" in m)
+
+    def test_open_closed_and_unknown(self):
+        self.assertIn("OPEN", self._state_line(1))
+        self.assertIn("CLOSED", self._state_line(0))
+        self.assertIn("UNKNOWN", self._state_line(None))
+
+
 class TestFailSafeClose(unittest.TestCase):
     """
     main()'s fail-safe: when the automation cannot make a trustworthy decision it

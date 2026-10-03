@@ -11,7 +11,8 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
-        pythonEnv = pkgs.python3.withPackages (ps: with ps; [
+        # What the app needs at runtime. Keep in step with requirements.txt.
+        runtimePackages = ps: with ps; [
           requests
           python-dotenv
           rich
@@ -19,18 +20,20 @@
           pandas
           tenacity
           pillow
-          pytest
-        ]);
+        ];
+        pythonEnv = pkgs.python3.withPackages runtimePackages;
+        # The dev shell adds pytest; it no longer ships inside the app closure.
+        devPythonEnv = pkgs.python3.withPackages (ps: runtimePackages ps ++ [ ps.pytest ]);
 
         awning = pkgs.writeScriptBin "awning" ''
           #!${pkgs.bash}/bin/bash
-          export PYTHONPATH="${./.}:$PYTHONPATH"
+          export PYTHONPATH="${./.}''${PYTHONPATH:+:$PYTHONPATH}"
           exec ${pythonEnv}/bin/python3 ${./awning.py} "$@"
         '';
 
         awning-automation = pkgs.writeScriptBin "awning-automation" ''
           #!${pkgs.bash}/bin/bash
-          export PYTHONPATH="${./.}:$PYTHONPATH"
+          export PYTHONPATH="${./.}''${PYTHONPATH:+:$PYTHONPATH}"
           exec ${pythonEnv}/bin/python3 ${./awning_automation.py} "$@"
         '';
       in
@@ -43,7 +46,7 @@
 
         devShells.default = pkgs.mkShell {
           buildInputs = [
-            pythonEnv
+            devPythonEnv
             pkgs.jq  # For compatibility with existing workflow if needed
           ];
 

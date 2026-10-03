@@ -23,8 +23,9 @@ logger = logging.getLogger(__name__)
 # Bond Open/Close/Stop actions are idempotent in practice (Open-while-open
 # is a no-op), so PUT is safe to retry.
 # NOTE: ToggleOpen is the exception — it is non-idempotent. A retry on
-# ToggleOpen after a lost-response could double-toggle the awning. ToggleOpen
-# is only used by the manual CLI (awning.py), not by automation.
+# ToggleOpen after a lost-response would double-toggle the awning, so it is sent
+# on a separate single-shot session that never retries. ToggleOpen is only used
+# by the manual CLI (awning.py), not by automation.
 _BOND_RETRY_TOTAL = 5
 _BOND_RETRY_STATUS_FORCELIST = [429, 500, 502, 503, 504]
 _BOND_RETRY_BACKOFF_FACTOR = 1.0
@@ -74,9 +75,13 @@ class _LoggingRetry(Retry):
         )
 
 
-def _make_bond_session() -> requests.Session:
+def _make_bond_session(retries: bool = True) -> requests.Session:
     """
-    Create a requests.Session with exponential-backoff retry for the Bond API.
+    Create a requests.Session for the Bond API.
+
+    retries=True (default) adds exponential-backoff retry. retries=False builds a
+    plain single-shot session, used for the one non-idempotent action (ToggleOpen).
+    The remainder of this docstring describes the retrying session.
 
     Retries on 5xx server errors (including 503), 429 rate-limit, and
     connection-level errors. Includes PUT so Bond action commands (Open,
@@ -92,10 +97,11 @@ def _make_bond_session() -> requests.Session:
         raise_on_status=False,  # let raise_for_status() decide after retries
         _service_name="Bond API",
     )
-    adapter = HTTPAdapter(max_retries=retry)
     session = requests.Session()
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
+    if retries:
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
     return session
 
 
@@ -132,6 +138,12 @@ class BondAwningController:
         self.headers = {"BOND-Token": bond_token}
         self._session = _make_bond_session()
         self._session.headers.update(self.headers)
+        # ToggleOpen is NOT idempotent: if Bond carries it out but the reply is
+        # lost, a retry toggles the awning straight back. It gets a session that
+        # never retries (the old comment above admitted the risk; nothing
+        # prevented it). Open/Close/Stop stay on the retrying session.
+        self._single_shot_session = _make_bond_session(retries=False)
+        self._single_shot_session.headers.update(self.headers)
 
     def _send_action(self, action: str) -> None:
         """
@@ -144,8 +156,9 @@ class BondAwningController:
             BondAPIError: If the API request fails after all retries
         """
         url = f"{self.base_url}/actions/{action}"
+        session = self._single_shot_session if action == "ToggleOpen" else self._session
         try:
-            self._put_request(url)
+            self._put_request(url, session)
         except requests.RequestException as e:
             raise BondAPIError(f"Failed to send action '{action}': {e}") from e
 
@@ -191,9 +204,9 @@ class BondAwningController:
         response.raise_for_status()
         return response.json()
 
-    def _put_request(self, url: str) -> None:
-        """Make a PUT request using the retry-equipped session."""
-        response = self._session.put(url, json={}, timeout=self.timeout)
+    def _put_request(self, url: str, session: Optional[requests.Session] = None) -> None:
+        """Make a PUT request (retry-equipped session unless one is given)."""
+        response = (session or self._session).put(url, json={}, timeout=self.timeout)
         response.raise_for_status()
 
     def open(self) -> None:
@@ -245,12 +258,16 @@ def load_config(env_file: Optional[Path] = None) -> tuple[str, str, str]:
         Tuple of (bond_host, bond_token, device_id)
 
     Raises:
-        ConfigurationError: If required environment variables are missing
+        ConfigurationError: If an explicitly given env_file does not exist, or
+            required environment variables are missing
     """
     # Load .env file
     if env_file:
-        if env_file.exists():
-            load_dotenv(env_file)
+        # An explicit path that does not exist is a typo, not "no config": silently
+        # skipping it produced a misleading "BOND_TOKEN is not set" instead.
+        if not env_file.exists():
+            raise ConfigurationError(f".env file not found: {env_file}")
+        load_dotenv(env_file)
     else:
         # Search for .env in current working directory first, then script directory
         cwd_env_file = Path.cwd() / ".env"

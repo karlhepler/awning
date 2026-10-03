@@ -53,14 +53,16 @@ except ImportError:
             if result.returncode == 0:
                 store_paths = json.loads(result.stdout)
                 for store_path in store_paths:
-                    site_packages = (
-                        Path(store_path) / "lib" / "python3.13" / "site-packages"
-                    )
-                    if site_packages.exists():
+                    # Any python3.X: this used to hard-code python3.13 and went
+                    # silently dead the day nixpkgs moved Python.
+                    for site_packages in sorted(Path(store_path).glob("lib/python3.*/site-packages")):
                         path_str = str(site_packages)
                         if path_str not in sys.path:
                             sys.path.insert(0, path_str)
                         break
+                    else:
+                        continue
+                    break
     except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError, OSError):
         # nix not available or evaluation failed — leave sys.path as-is
         pass

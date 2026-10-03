@@ -106,7 +106,7 @@ If any condition fails the awning closes. If the automation cannot get a trustwo
 ### Tests
 
 ```bash
-nix develop -c python3 -m unittest test_awning_automation test_awning_controller
+nix develop -c python3 -m unittest test_awning_automation test_awning_controller test_awning_cli
 ```
 
 The tests never touch the network.

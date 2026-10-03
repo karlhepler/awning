@@ -144,6 +144,11 @@ class AwningCLI:
         """Execute info command."""
         try:
             info = self.controller.get_info()
+            if not isinstance(info, dict):
+                # A bridge answering with a list/string/null would otherwise die
+                # with AttributeError on info.items().
+                console.print(f"[bold red]✗ Error:[/bold red] Unexpected device info response: {info!r}")
+                sys.exit(1)
 
             # Create a table for device information
             table = Table(show_header=False, box=None, padding=(0, 2))
@@ -236,7 +241,13 @@ def main() -> None:
         "info": cli.cmd_info,
     }
 
-    command_map[command]()
+    # Any failure the commands do not handle themselves (a malformed reply, a bug)
+    # becomes a one-line error instead of a raw traceback. SystemExit passes through.
+    try:
+        command_map[command]()
+    except Exception as e:
+        console.print(f"[bold red]✗ Unexpected error:[/bold red] {type(e).__name__}: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

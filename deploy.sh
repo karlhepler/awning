@@ -5,6 +5,22 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REMOTE_DIR=".config/awning"
 
+# Read KEY from .env the way python-dotenv does for the cases that matter here.
+# The old `grep | cut -d= -f2` kept quotes (PI_HOST="1.2.3.4" became the SSH target
+# karlhepler@"1.2.3.4"), kept inline `# comments`, and truncated any value that
+# contains '=' (a token such as abc=def lost everything after the '=').
+env_get() {
+    local line
+    line=$(grep -m1 "^$1=" "$SCRIPT_DIR/.env" 2>/dev/null) || return 0
+    line="${line#*=}"
+    case "$line" in
+        \"*\") line="${line#\"}"; line="${line%%\"*}" ;;
+        \'*\') line="${line#\'}"; line="${line%%\'*}" ;;
+        *) line="${line%%[[:space:]]#*}"; line="${line%"${line##*[![:space:]]}"}" ;;
+    esac
+    printf '%s' "$line"
+}
+
 # PI_HOST override: the Pi has no avahi-daemon installed, so "orangepi3-lts.local"
 # has never resolved via mDNS — the bare hostname only ever worked because the
 # router's own DNS/DHCP registered it, and that registration goes stale after a
@@ -12,15 +28,20 @@ REMOTE_DIR=".config/awning"
 # offline left the name unresolvable on the operator's Mac even after the Pi came
 # back, because the resolver had negatively cached it). Set PI_HOST in .env to an
 # IP or a name that does resolve to skip relying on that registration entirely.
-PI_HOST=$(grep '^PI_HOST=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 || echo "")
+PI_HOST=$(env_get PI_HOST)
 SERVER="karlhepler@${PI_HOST:-orangepi3-lts}"
 
 # Get version from git
 VERSION=$(git -C "$SCRIPT_DIR" rev-parse --short HEAD)
+# Say so when the code being deployed is not exactly that commit.
+if [ -n "$(git -C "$SCRIPT_DIR" status --porcelain --untracked-files=no)" ]; then
+    VERSION="${VERSION}-dirty"
+    echo "Warning: uncommitted changes will be deployed (version: $VERSION)"
+fi
 
 # Load Telegram config from .env
-TELEGRAM_BOT_TOKEN=$(grep '^TELEGRAM_BOT_TOKEN=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 || echo "")
-TELEGRAM_CHAT_ID=$(grep '^TELEGRAM_CHAT_ID=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 || echo "")
+TELEGRAM_BOT_TOKEN=$(env_get TELEGRAM_BOT_TOKEN)
+TELEGRAM_CHAT_ID=$(env_get TELEGRAM_CHAT_ID)
 
 # Function to send Telegram notification
 send_telegram() {
@@ -35,10 +56,10 @@ send_telegram() {
 
 # Discover Bond Bridge IP via mDNS
 echo "Discovering Bond Bridge IP via mDNS..."
-BOND_ID=$(grep '^BOND_ID=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 || echo "")
+BOND_ID=$(env_get BOND_ID)
 if [ -z "$BOND_ID" ]; then
     # Fall back to extracting from BOND_HOST if it's a hostname
-    BOND_HOST=$(grep '^BOND_HOST=' "$SCRIPT_DIR/.env" | cut -d= -f2)
+    BOND_HOST=$(env_get BOND_HOST)
     if [[ "$BOND_HOST" =~ ^[A-Za-z] ]]; then
         BOND_ID=$(echo "$BOND_HOST" | sed 's/^bond-//' | sed 's/\..*$//' | tr '[:lower:]' '[:upper:]')
     fi
@@ -148,9 +169,10 @@ echo
 
 # Log deploy start to remote log file (dated log in logs directory)
 echo "Logging deploy start..."
-TODAY=$(date '+%Y-%m-%d')
-LOG_FILE="\$HOME/.config/awning/logs/awning-$TODAY.log"
-lan-run sshpass -e ssh "$SERVER" "echo '' >> $LOG_FILE && echo '$(date '+%Y-%m-%d %H:%M:%S') - INFO - 🚀 Deploy started (version: $VERSION)' >> $LOG_FILE"
+# The date and the timestamp are expanded by the Pi's shell (its clock and timezone),
+# not this Mac's: the log file name must match the one cron appends to.
+LOG_FILE='$HOME/.config/awning/logs/awning-$(date +%Y-%m-%d).log'
+lan-run sshpass -e ssh "$SERVER" "echo '' >> $LOG_FILE && echo \"\$(date '+%Y-%m-%d %H:%M:%S') - INFO - 🚀 Deploy started (version: $VERSION)\" >> $LOG_FILE"
 
 # Configure cron (removes existing awning entry first)
 # Python logs to stderr only; cron captures all output to log file
@@ -160,7 +182,7 @@ CRON_CMD='*/15 * * * * $HOME/.config/awning/venv/bin/python $HOME/.config/awning
 lan-run sshpass -e ssh "$SERVER" "(crontab -l 2>/dev/null | grep -v 'awning_automation'; echo '$CRON_CMD') | crontab -"
 
 # Log deploy complete to remote log file (dated log in logs directory)
-lan-run sshpass -e ssh "$SERVER" "echo '$(date '+%Y-%m-%d %H:%M:%S') - INFO - ✅ Deploy complete (version: $VERSION)' >> $LOG_FILE && echo '' >> $LOG_FILE"
+lan-run sshpass -e ssh "$SERVER" "echo \"\$(date '+%Y-%m-%d %H:%M:%S') - INFO - ✅ Deploy complete (version: $VERSION)\" >> $LOG_FILE && echo '' >> $LOG_FILE"
 
 # Create/update symlink to today's log
 lan-run sshpass -e ssh "$SERVER" "ln -sf ~/.config/awning/logs/awning-\$(date '+%Y-%m-%d').log ~/awning.log"

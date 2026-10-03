@@ -74,11 +74,13 @@ Designed to run as a cron job or Kubernetes scheduled job.
 """
 
 import io
+import json
 import logging
 import math
 import os
 import statistics
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -3135,6 +3137,43 @@ def _format_friendly_telegram_message(
 
 
 DEFAULT_LOG_RETENTION_DAYS = 30
+# A Bond outage (most often: the Bridge's DHCP lease changed) fails EVERY run, and
+# an alert per run is 96 identical messages a day. One an hour is enough to know.
+BOND_ALERT_MIN_INTERVAL_S = 3600.0
+
+
+def should_send_alert(
+    state_file: Optional[Path],
+    key: str,
+    min_interval_s: float = BOND_ALERT_MIN_INTERVAL_S,
+    now: Optional[float] = None,
+) -> bool:
+    """
+    True if an alert of this kind has not gone out within min_interval_s, and record
+    that it is going out now.
+
+    Never raises, and every failure answers True: with no state file, an unreadable
+    or corrupt one, or a read-only disk, a duplicate alert is far better than a
+    silent one. State is a small JSON map {key: epoch_seconds}.
+    """
+    if state_file is None:
+        return True
+    now = time.time() if now is None else now
+    try:
+        try:
+            state = json.loads(state_file.read_text())
+            if not isinstance(state, dict):
+                state = {}
+        except (OSError, ValueError):
+            state = {}
+        last = state.get(key)
+        if isinstance(last, (int, float)) and 0 <= now - last < min_interval_s:
+            return False
+        state[key] = now
+        state_file.write_text(json.dumps(state))
+    except Exception as e:
+        logger.warning(f"Alert throttle unavailable ({e}) — sending anyway")
+    return True
 
 
 def get_log_retention_days() -> int:
@@ -3372,8 +3411,10 @@ def main() -> None:
         if dry_run:
             # Only check state in dry-run mode (for reporting)
             current_state = controller.get_state()
-            is_open = current_state == 1
-            logger.info(f"Current awning state: {'OPEN' if is_open else 'CLOSED'}")
+            # Bond answers {} (no "open" key) when it does not know; calling that
+            # CLOSED would be a guess.
+            state_text = {1: "OPEN", 0: "CLOSED"}.get(current_state, "UNKNOWN")
+            logger.info(f"Current awning state: {state_text}")
             logger.info(f"Would set awning to: {'OPEN' if should_open else 'CLOSED'}")
             logger.info("Dry-run complete (no action taken)")
             return
@@ -3436,7 +3477,9 @@ def main() -> None:
         sys.exit(1)
     except BondAPIError as e:
         logger.error(f"Bond API error: {e}")
-        if telegram_token:
+        # Throttled: a changed Bridge IP fails every run (see BOND_ALERT_MIN_INTERVAL_S).
+        state_file = log_path.parent / ".alert-state.json" if isinstance(log_path, Path) else None
+        if telegram_token and should_send_alert(state_file, "bond_api_error"):
             msg = f"🚨 Bond API error: {e}"
             send_telegram_notification(telegram_token, telegram_chat_id, msg)
         sys.exit(1)

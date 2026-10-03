@@ -159,6 +159,30 @@ class TestRetryPolicy(BondControllerTestCase):
         self.assertTrue(any(f"attempt {total}/{total}" in m for m in retry_lines))
         self.assertFalse(any(f"attempt {total + 1}/" in m for m in retry_lines))
 
+    def test_toggle_is_never_retried(self):
+        """ToggleOpen is not idempotent: a retry after a lost reply flips it straight back."""
+        for status in (500, 503, 429):
+            with self.subTest(status=status):
+                self.bond.requests.clear()
+                self.bond.default_status = status
+                with self.assertRaises(BondAPIError):
+                    self.controller.toggle()
+                self.assertEqual(len(self.bond.requests), 1, "exactly one attempt")
+                self.assertEqual(self.bond.requests[0][1], "/v2/devices/dev42/actions/ToggleOpen")
+                self.assertEqual(self.bond.requests[0][2].get("BOND-Token"), "secret-token")
+
+    def test_toggle_succeeds_in_one_request_when_bond_answers(self):
+        self.controller.toggle()
+        self.assertEqual(len(self.bond.requests), 1)
+
+    def test_the_idempotent_actions_keep_their_retries(self):
+        for call in ("open", "close", "stop"):
+            with self.subTest(call=call):
+                self.bond.requests.clear()
+                self.bond.script = [503]
+                getattr(self.controller, call)()
+                self.assertEqual(len(self.bond.requests), 2)
+
     def test_client_errors_are_not_retried(self):
         """A wrong token (401) will not fix itself; retrying only delays the alert."""
         for status in (401, 404):
@@ -177,6 +201,9 @@ class TestRetryPolicy(BondControllerTestCase):
 
 
 class TestLoadConfig(unittest.TestCase):
+    def _empty_env(self):
+        return self._env_file("")
+
     def _env_file(self, text):
         d = tempfile.TemporaryDirectory()
         self.addCleanup(d.cleanup)
@@ -188,6 +215,13 @@ class TestLoadConfig(unittest.TestCase):
         path = self._env_file("BOND_TOKEN=tok\nBOND_HOST=10.0.0.9\nDEVICE_ID=abc\n")
         with unittest.mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(load_config(path), ("10.0.0.9", "tok", "abc"))
+
+    def test_a_mistyped_explicit_env_file_is_named_not_reported_as_a_missing_token(self):
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(ConfigurationError) as ctx:
+                load_config(Path("/nonexistent/typo.env"))
+        self.assertIn("/nonexistent/typo.env", str(ctx.exception))
+        self.assertNotIn("BOND_TOKEN", str(ctx.exception))
 
     def test_each_missing_or_blank_variable_is_named_in_the_error(self):
         base = {"BOND_TOKEN": "tok", "BOND_HOST": "h", "DEVICE_ID": "d"}
@@ -201,13 +235,13 @@ class TestLoadConfig(unittest.TestCase):
                         env[missing] = value
                     with unittest.mock.patch.dict(os.environ, env, clear=True):
                         with self.assertRaises(ConfigurationError) as ctx:
-                            load_config(Path("/nonexistent/.env"))
+                            load_config(self._empty_env())
                     self.assertIn(missing, str(ctx.exception))
 
     def test_values_are_stripped(self):
         env = {"BOND_TOKEN": " tok ", "BOND_HOST": " 10.0.0.9 ", "DEVICE_ID": " abc "}
         with unittest.mock.patch.dict(os.environ, env, clear=True):
-            self.assertEqual(load_config(Path("/nonexistent/.env")), ("10.0.0.9", "tok", "abc"))
+            self.assertEqual(load_config(self._empty_env()), ("10.0.0.9", "tok", "abc"))
 
     def test_an_already_exported_variable_beats_the_file(self):
         """python-dotenv does not override; a stale shell export would win. Pinned."""
@@ -218,7 +252,7 @@ class TestLoadConfig(unittest.TestCase):
     def test_create_controller_builds_the_documented_base_url(self):
         env = {"BOND_TOKEN": "tok", "BOND_HOST": "10.0.0.9", "DEVICE_ID": "abc"}
         with unittest.mock.patch.dict(os.environ, env, clear=True):
-            controller = create_controller_from_env(Path("/nonexistent/.env"))
+            controller = create_controller_from_env(self._empty_env())
         self.assertEqual(controller.base_url, "http://10.0.0.9/v2/devices/abc")
 
 

@@ -1,5 +1,6 @@
 # Environment variables (contains sensitive token)
 .env
+.env.bak
 
 # macOS
 .DS_Store
