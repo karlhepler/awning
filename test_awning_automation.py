@@ -1740,16 +1740,16 @@ class TestGetThresholdsMinDniCirrusWM2Validation(unittest.TestCase):
         self.assertIn("0", str(ctx.exception))
 
     def test_min_dni_cirrus_above_min_dni_raises(self):
-        """MIN_DNI_CIRRUS_WM2 > MIN_DIRECT_IRRADIANCE_WM2 is logically inconsistent → ConfigurationError."""
+        """MIN_DNI_CIRRUS_WM2 > MIN_DNI_WM2 is logically inconsistent → ConfigurationError."""
         # Default MIN_DNI_WM2=50; set MIN_DNI_CIRRUS_WM2=60 to exceed it.
         env = {**self._REQUIRED_ENV, "MIN_DNI_CIRRUS_WM2": "60", "MIN_DNI_WM2": "50"}
         with unittest.mock.patch.dict(os.environ, env):
             with self.assertRaises(ConfigurationError) as ctx:
                 get_thresholds()
-        self.assertIn("MIN_DIRECT_IRRADIANCE_WM2", str(ctx.exception))
+        self.assertRegex(str(ctx.exception), r"<= MIN_DNI_WM2 \(50")  # a variable that exists
 
     def test_min_dni_cirrus_equal_to_min_dni_is_valid(self):
-        """MIN_DNI_CIRRUS_WM2 == MIN_DIRECT_IRRADIANCE_WM2 is at the boundary → no error."""
+        """MIN_DNI_CIRRUS_WM2 == MIN_DNI_WM2 is at the boundary → no error."""
         # Both set to 50: cirrus guard == Layer 2 threshold, which is valid.
         env = {**self._REQUIRED_ENV, "MIN_DNI_CIRRUS_WM2": "50", "MIN_DNI_WM2": "50"}
         with unittest.mock.patch.dict(os.environ, env):
@@ -1758,7 +1758,7 @@ class TestGetThresholdsMinDniCirrusWM2Validation(unittest.TestCase):
         self.assertEqual(result[8], 50.0)
 
     def test_min_dni_cirrus_below_min_dni_is_valid(self):
-        """MIN_DNI_CIRRUS_WM2 < MIN_DIRECT_IRRADIANCE_WM2 is the expected configuration → no error."""
+        """MIN_DNI_CIRRUS_WM2 < MIN_DNI_WM2 is the expected configuration → no error."""
         # Default: MIN_DNI_CIRRUS_WM2=30, MIN_DNI_WM2=50 — standard deployment.
         env = {**self._REQUIRED_ENV, "MIN_DNI_CIRRUS_WM2": "30", "MIN_DNI_WM2": "50"}
         with unittest.mock.patch.dict(os.environ, env):
@@ -4945,7 +4945,7 @@ class TestObservedCeilingVeto(unittest.TestCase):
     The 2026-10-03 incident: forecast said sunny, the sky said otherwise.
 
     At 11:15 the primary feed read 15% cloud / DNI 645 / GHI 601 — every sunny
-    layer passed — while KRDU (12 km away) had gone BKN016 at 11:04 and rain was
+    layer passed — while KRDU (13.7 km away) had gone BKN016 at 11:04 and rain was
     falling at Sanford. The awning stayed open under a darkening sky.
     """
 

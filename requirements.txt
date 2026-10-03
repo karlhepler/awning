@@ -3,6 +3,5 @@ python-dotenv
 rich
 pvlib
 pandas
-pytz
 tenacity
 Pillow

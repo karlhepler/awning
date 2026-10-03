@@ -48,7 +48,11 @@ class _LoggingRetry(Retry):
     def increment(self, method=None, url=None, response=None, error=None, _pool=None, _stacktrace=None):
         attempt_num = len(self.history) + 1
 
-        if response is not None:
+        # When the budget is spent super().increment() raises instead of retrying,
+        # so "retrying (attempt 6/5)" would be a lie in the log.
+        if attempt_num > _BOND_RETRY_TOTAL:
+            pass
+        elif response is not None:
             status = response.status
             logger.warning(
                 f"{self._service_name} returned {status}, retrying "

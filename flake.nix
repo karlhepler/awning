@@ -17,7 +17,6 @@
           rich
           pvlib
           pandas
-          pytz
           tenacity
           pillow
           pytest

@@ -147,6 +147,18 @@ class TestRetryPolicy(BondControllerTestCase):
         self.assertIn("Open", str(ctx.exception))
         self.assertEqual(len(self.bond.requests), awning_controller._BOND_RETRY_TOTAL + 1)
 
+    def test_log_never_claims_a_retry_beyond_the_budget(self):
+        """The old log said 'retrying (attempt 6/5)' on the final failure."""
+        self.bond.default_status = 503
+        with self.assertLogs(awning_controller.logger, level="WARNING") as logs:
+            with self.assertRaises(BondAPIError):
+                self.controller.open()
+        retry_lines = [m for m in logs.output if "retrying" in m]
+        total = awning_controller._BOND_RETRY_TOTAL
+        self.assertEqual(len(retry_lines), total)
+        self.assertTrue(any(f"attempt {total}/{total}" in m for m in retry_lines))
+        self.assertFalse(any(f"attempt {total + 1}/" in m for m in retry_lines))
+
     def test_client_errors_are_not_retried(self):
         """A wrong token (401) will not fix itself; retrying only delays the alert."""
         for status in (401, 404):

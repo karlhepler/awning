@@ -14,8 +14,9 @@ Sunshine detection uses a two-layer gate plus a hard cloud-cover ceiling:
     sunny_model = (shortwave_radiation >= MIN_GHI_WM2)
                   OR (uv_index >= MIN_UV_INDEX AND cloud_cover < MAX_CLOUD_COVER_PCT)
                   OR (dni >= MIN_DNI_DIRECT_WM2)
-    GHI (shortwave_radiation) comes from ECMWF. UV Index comes from GFS — a completely
-    separate NWP model. Either signal alone is sufficient: the awning has two jobs —
+    GHI (shortwave_radiation) and UV Index both come from Open-Meteo's best_match feed,
+    which resolves to NOAA GFS/HRRR at this location, so they are NOT independent
+    corroboration of each other. Either signal alone is sufficient: the awning has two jobs —
     block UV (relevant even on cloudy-high-UV days) AND block heat/brightness.
     The UV arm is gated by cloud_cover (reusing the Layer 2 threshold, no new knob):
     uv_index and shortwave_radiation are both horizontal-plane measurements from the
@@ -65,8 +66,9 @@ Sunshine detection uses a two-layer gate plus a hard cloud-cover ceiling:
 
 All three layers must agree before the awning opens.
 
-Each cron run makes a single weather API call. Open-Meteo caches responses within
-sub-minute windows, so the 15-minute cron cadence is the effective sampling interval.
+Each cron run makes one primary Open-Meteo call, plus small optional extras only when
+they could change the outcome (a second-opinion model call, the airport METAR, radar).
+The 15-minute cron cadence is the effective sampling interval.
 
 Designed to run as a cron job or Kubernetes scheduled job.
 """
@@ -239,7 +241,11 @@ class _WeatherLoggingRetry(Retry):
     def increment(self, method=None, url=None, response=None, error=None, _pool=None, _stacktrace=None):
         attempt_num = len(self.history) + 1
 
-        if response is not None:
+        # When the budget is spent super().increment() raises instead of retrying,
+        # so "retrying (attempt 6/5)" would be a lie in the log.
+        if attempt_num > _WEATHER_RETRY_TOTAL:
+            pass
+        elif response is not None:
             status = response.status
             logger.warning(
                 f"weather API returned {status}, retrying "
@@ -658,9 +664,10 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
         )
 
     # Get overcast threshold (optional, default 95%)
-    # Layer 3 hard ceiling: when cloud_cover_mid >= this value, DNI is overridden and
-    # awning stays closed regardless of DNI. Uses MID-level cloud cover (altostratus/
-    # altocumulus), NOT total cloud cover. Total saturates to 100% when high cirrus
+    # Layer 3 hard ceiling: when max(cloud_cover_low, cloud_cover_mid, cloud_cover_high)
+    # >= this value, the awning stays closed unless DNI proves sun is arriving. Uses the
+    # per-layer max (stratus/cumulus, altostratus/altocumulus, cirrostratus), NOT total
+    # cloud cover. Total saturates to 100% when high cirrus
     # is present even when the sun is visibly shining (cirrus is thin and does not
     # block awning-relevant sun). Mid-level clouds are the optical layer that
     # determines whether direct sun reaches the ground. Set above MAX_CLOUD_COVER_PCT
@@ -699,7 +706,7 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
         )
     if min_dni_cirrus > min_dni:
         raise ConfigurationError(
-            f"MIN_DNI_CIRRUS_WM2 ({min_dni_cirrus}) must be <= MIN_DIRECT_IRRADIANCE_WM2 "
+            f"MIN_DNI_CIRRUS_WM2 ({min_dni_cirrus}) must be <= MIN_DNI_WM2 "
             f"({min_dni}). The Layer 3 DNI guard threshold must be at or below the "
             f"Layer 2 DNI threshold; otherwise the guard fires for a narrower range "
             f"than Layer 2, which is logically inconsistent."
@@ -2146,7 +2153,7 @@ def should_open_awning(
         sunny_model = (shortwave_radiation >= min_ghi)
                       OR (uv_index >= min_uv_index AND cloud_cover < max_cloud_cover)
                       OR (dni >= min_dni_direct)
-        GHI comes from ECMWF; UV Index from GFS — cross-model OR gate. The UV arm
+        GHI and UV both come from the primary best_match feed (GFS/HRRR here). The UV arm
         is gated by cloud_cover (reusing the Layer 2 threshold, no new knob) since
         GHI and UV are both horizontal-plane measurements from the same feed and
         uv_index tracks uv_index_clear_sky too closely under cloud to trust alone
@@ -2461,7 +2468,7 @@ def should_open_awning(
     # Observed-ceiling veto — close-only, the mirror image of the rescue above.
     #
     # Every layer and both rescue tiers read MODEL output. On 2026-10-03 the
-    # model said 15% cloud / DNI 645 while the airport 12 km away reported a
+    # model said 15% cloud / DNI 645 while the airport 13.7 km away reported a
     # broken deck at 1,600 ft and rain fell nearby, so the awning stayed open
     # under a darkening sky. A real observation outranks a forecast, so this
     # runs last and overrides the rescue too. It only ever clears `sunny`; it

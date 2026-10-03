@@ -77,7 +77,7 @@ Set these in the `.env` file:
 
 ## Weather Automation
 
-Automatically open/close awning based on weather conditions. See `.env.example` for configuration options.
+Automatically opens and closes the awning from the weather. Every 15 minutes (cron) it looks at the conditions and acts immediately; nothing is debounced. See `.env.example` for every setting.
 
 ```bash
 # Run automation
@@ -87,12 +87,29 @@ nix run .#automation
 nix run .#automation -- --dry-run
 ```
 
-The automation opens the awning only when ALL conditions are met:
-1. Sunny (cloud cover below threshold)
-2. Calm (wind speed below threshold)
-3. No rain
-4. Daytime (between sunrise and sunset)
-5. Sun facing SE (azimuth 90°-180°)
+The automation opens the awning only when ALL seven conditions are met:
+
+1. **Sunny**: a three-layer check of the forecast (solar radiation, UV and direct sun; cloud cover; a hard overcast ceiling), with a second-opinion rescue from two other models when the primary feed looks broken, and a close-only veto when the nearest airport reports a low broken or overcast cloud deck
+2. **Calm**: average wind AND gusts below their limits, using the worse of the forecast and the airport's latest report
+3. **No rain**: current or recent precipitation, rain probability, weather code, and live radar
+4. **Above the minimum temperature** (default 45°F)
+5. **Daytime**: between sunrise and sunset
+6. **Sun high enough** above the horizon (clears trees and rooftops)
+7. **Sun facing the window**: the sun's compass direction is inside the arc you configure
+
+If any condition fails the awning closes. If the automation cannot get a trustworthy answer (weather service down, or an unexpected error before a command is sent) it closes the awning as a fail-safe. Data comes from [Open-Meteo](https://open-meteo.com) (forecast), [RainViewer](https://www.rainviewer.com) (radar) and [aviationweather.gov](https://aviationweather.gov) (airport observations, optional). Details, thresholds and the incidents behind each rule are in `CLAUDE.md`.
+
+### Deploying to a Raspberry Pi / Orange Pi
+
+`./deploy.sh` copies the scripts and your `.env` to the device and installs the cron job. It needs your interactive password, so you run it yourself.
+
+### Tests
+
+```bash
+nix develop -c python3 -m unittest test_awning_automation test_awning_controller
+```
+
+The tests never touch the network.
 
 ## Development
 
