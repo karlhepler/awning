@@ -196,6 +196,12 @@ def cleanup_old_logs(log_dir: Path, retention_days: int = 30) -> None:
         log_dir: Directory containing log files
         retention_days: Number of days to keep log files (default: 30)
     """
+    if retention_days < 1:
+        # A zero/negative window moves the cutoff to today or the future, which
+        # would delete the log cron is writing to right now.
+        logger.warning(f"Ignoring log cleanup: retention_days={retention_days} < 1")
+        return
+
     cutoff = date.today() - timedelta(days=retention_days)
 
     for log_file in log_dir.glob("awning-*.log"):
@@ -2811,6 +2817,74 @@ def _format_friendly_telegram_message(
     )
 
 
+DEFAULT_LOG_RETENTION_DAYS = 30
+
+
+def get_log_retention_days() -> int:
+    """
+    Read LOG_RETENTION_DAYS, falling back to the default instead of raising.
+
+    Log cleanup runs AFTER the awning has already moved, so a bad value must not
+    become an exception: that used to skip the heartbeat (a false "automation is
+    down" alarm on every run), and a negative value deleted today's log.
+    """
+    raw = os.environ.get("LOG_RETENTION_DAYS", str(DEFAULT_LOG_RETENTION_DAYS)).strip()
+    try:
+        days = int(raw)
+    except ValueError:
+        days = 0
+    if days < 1:
+        logger.warning(
+            f"Invalid LOG_RETENTION_DAYS {raw!r} (need an integer >= 1) — "
+            f"using {DEFAULT_LOG_RETENTION_DAYS}"
+        )
+        return DEFAULT_LOG_RETENTION_DAYS
+    return days
+
+
+def _fail_safe_close(
+    env_file: Optional[Path],
+    telegram_token: Optional[str],
+    telegram_chat_id: Optional[str],
+    cause: str,
+) -> None:
+    """
+    Close the awning because the automation cannot make a trustworthy decision.
+
+    Always SENDS Close rather than only closing when Bond says the awning is open.
+    Bond's stored state drifts whenever the physical remote is used (one-way RF —
+    see OPEN_ON_OPEN.md), so "Bond says closed" does not mean it is, and a
+    duplicate Close at the limit switch is physically harmless. The old
+    `if state == 1` guard meant a drifted state silently skipped the one command
+    that mattered.
+
+    Telegram is still quiet when Bond already reported closed, so a long outage
+    does not send 96 identical messages a day. Never raises.
+    """
+    logger.warning("Attempting to close awning as fail-safe...")
+
+    def notify(message: str) -> None:
+        if telegram_token:
+            send_telegram_notification(telegram_token, telegram_chat_id, message)
+
+    try:
+        controller = create_controller_from_env(env_file)
+        try:
+            state = controller.get_state()
+        except Exception as e:
+            logger.warning(f"Could not read awning state before fail-safe close: {e}")
+            state = None
+        controller.close()
+        logger.info("Awning closed as fail-safe")
+        if state != 0:
+            notify(f"⚠️ Awning CLOSED (fail-safe)\n{cause}")
+        else:
+            logger.info("Bond already reported closed; Close re-sent, no notification")
+    except Exception as fail_safe_error:
+        logger.error(f"Fail-safe close failed: {fail_safe_error}")
+        notify(f"🚨 ALERT: {cause} AND fail-safe close failed!\n{fail_safe_error}")
+
+
 def main() -> None:
     """Main entry point for awning automation."""
     # Parse command-line arguments
@@ -2837,6 +2911,10 @@ def main() -> None:
 
     # Initialize telegram config (will be loaded in try block)
     telegram_token, telegram_chat_id = None, None
+    # True once an Open/Close command has been SENT. After that point a failure
+    # (Telegram, log cleanup, heartbeat) must not trigger a fail-safe close that
+    # would undo a correct decision.
+    actuated = False
 
     try:
         # Load location configuration
@@ -2982,10 +3060,12 @@ def main() -> None:
         if should_open:
             logger.info("Opening awning...")
             controller.open()
+            actuated = True
             logger.info("Awning set to OPEN")
         else:
             logger.info("Closing awning...")
             controller.close()
+            actuated = True
             logger.info("Awning set to CLOSED")
 
         # Get state after action and notify only if it changed
@@ -3009,9 +3089,12 @@ def main() -> None:
 
         logger.info("Automation complete")
 
-        # Cleanup old log files
-        retention_days = int(os.environ.get("LOG_RETENTION_DAYS", "30"))
-        cleanup_old_logs(log_path.parent, retention_days)
+        # Cleanup old log files. Housekeeping must never block the heartbeat: it
+        # runs after the awning has moved, and a failure here is not an outage.
+        try:
+            cleanup_old_logs(log_path.parent, get_log_retention_days())
+        except Exception as e:
+            logger.warning(f"Log cleanup failed (ignored): {e}")
 
         # Heartbeat: only reached once the full run — fetch, decide, actuate,
         # cleanup — has succeeded without exception. See ping_heartbeat().
@@ -3023,25 +3106,9 @@ def main() -> None:
         sys.exit(1)
     except WeatherAPIError as e:
         logger.error(f"Weather API error: {e}")
-        # Fail-safe: try to close awning if we can't get weather
+        # Fail-safe: close the awning if we can't get weather
         if not dry_run:
-            logger.warning("Attempting to close awning as fail-safe...")
-            try:
-                controller = create_controller_from_env()
-                state = controller.get_state()
-                if state == 1:  # If open
-                    controller.close()
-                    logger.info("Awning closed as fail-safe")
-                    if telegram_token:
-                        msg = f"⚠️ Awning CLOSED (fail-safe)\nWeather API error: {e}"
-                        send_telegram_notification(telegram_token, telegram_chat_id, msg)
-                else:
-                    logger.info("Awning already closed")
-            except Exception as fail_safe_error:
-                logger.error(f"Fail-safe close failed: {fail_safe_error}")
-                if telegram_token:
-                    msg = f"🚨 ALERT: Weather API failed AND fail-safe close failed!\n{fail_safe_error}"
-                    send_telegram_notification(telegram_token, telegram_chat_id, msg)
+            _fail_safe_close(env_file, telegram_token, telegram_chat_id, f"Weather API error: {e}")
         sys.exit(1)
     except BondAPIError as e:
         logger.error(f"Bond API error: {e}")
@@ -3050,7 +3117,13 @@ def main() -> None:
             send_telegram_notification(telegram_token, telegram_chat_id, msg)
         sys.exit(1)
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        # Same fail-safe as a weather outage, but only while no command has been
+        # sent: any bug between "got weather" and "told the awning what to do"
+        # used to leave it wherever it was — open, in a storm. ConfigurationError
+        # is handled above and deliberately not closed (a typo caught at deploy).
+        if not dry_run and not actuated:
+            _fail_safe_close(env_file, telegram_token, telegram_chat_id, f"Unexpected error: {e}")
         sys.exit(1)
 
 

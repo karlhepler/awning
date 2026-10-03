@@ -5645,5 +5645,202 @@ class TestFetchWeatherGusts(unittest.TestCase):
         self.assertIsNone(weather["wind_gusts_10m"])
 
 
+class TestFailSafeClose(unittest.TestCase):
+    """
+    main()'s fail-safe: when the automation cannot make a trustworthy decision it
+    must leave the awning CLOSED, and must never close a correctly-opened one.
+
+    Two holes this pins shut:
+      * only WeatherAPIError used to trigger it — any other bug between "got the
+        weather" and "told the awning what to do" left it open, in a storm;
+      * it sent Close only `if state == 1`, so a drifted Bond state (physical
+        remote use is invisible to Bond; see OPEN_ON_OPEN.md) skipped the one
+        command that mattered.
+    """
+
+    HAPPY = dict(TestGustGate.WEATHER)
+
+    def _main(self, *, weather_exc=None, decide_exc=None, state=1, state_exc=None,
+              controller_factory_exc=None, argv=None, env=None, telegram=("t", "c"),
+              post_patches=None):
+        """Run the real main(); return (controller, telegram_mock, exit_code)."""
+        import contextlib
+        import sys
+        from unittest.mock import patch, MagicMock
+
+        controller = MagicMock()
+        if state_exc is not None:
+            controller.get_state.side_effect = state_exc
+        else:
+            controller.get_state.return_value = state
+        log_path = MagicMock()
+        log_path.parent = MagicMock()
+        weather = _weather(**self.HAPPY)
+        weather["time"] = "2026-10-03T11:15:00"
+        weather["ghi_smoothed"], weather["dni_smoothed"] = 558.0, 600.0
+
+        base_env = {"WIND_SPEED_THRESHOLD_MPH": "15", "MIN_SUN_ALTITUDE_DEG": "12"}
+        base_env.update(env or {})
+        exit_code = None
+        with contextlib.ExitStack() as stack:
+            enter = stack.enter_context
+            enter(patch.dict(os.environ, base_env, clear=True))
+            enter(patch.object(sys, "argv", argv or ["awning_automation.py"]))
+            enter(patch.object(awning_automation, "setup_logging", return_value=log_path))
+            enter(patch.object(awning_automation, "load_location_config", return_value=(35.778, -78.838)))
+            enter(patch.object(awning_automation, "load_telegram_config", return_value=telegram))
+            enter(patch.object(awning_automation, "calculate_sun_position",
+                               return_value={"azimuth": 141.6, "altitude": 42.6}))
+            enter(patch.object(awning_automation, "is_raining_on_radar", return_value=False))
+            if weather_exc is not None:
+                enter(patch.object(awning_automation, "collect_weather_measurements",
+                                   side_effect=weather_exc))
+            else:
+                enter(patch.object(awning_automation, "collect_weather_measurements",
+                                   return_value=weather))
+            if decide_exc is not None:
+                enter(patch.object(awning_automation, "should_open_awning", side_effect=decide_exc))
+            if controller_factory_exc is not None:
+                factory = enter(patch.object(awning_automation, "create_controller_from_env",
+                                             side_effect=controller_factory_exc))
+            else:
+                factory = enter(patch.object(awning_automation, "create_controller_from_env",
+                                             return_value=controller))
+            tg = enter(patch.object(awning_automation, "send_telegram_notification"))
+            for target, kwargs in (post_patches or []):
+                enter(patch.object(awning_automation, target, **kwargs))
+            try:
+                awning_automation.main()
+            except SystemExit as e:
+                exit_code = e.code
+        self.factory = factory
+        return controller, tg, exit_code
+
+    def test_control_happy_path_opens_and_exits_cleanly(self):
+        controller, _, code = self._main(state=0)
+        controller.open.assert_called_once()
+        controller.close.assert_not_called()
+        self.assertIsNone(code)
+
+    # --- the new hole: an arbitrary bug before the awning is told what to do ---
+    def test_unexpected_error_before_actuation_closes_the_awning(self):
+        controller, tg, code = self._main(decide_exc=RuntimeError("boom"), state=1)
+        controller.close.assert_called_once()
+        controller.open.assert_not_called()
+        self.assertEqual(code, 1)
+        self.assertIn("Unexpected error: boom", tg.call_args[0][2])
+        self.assertIn("fail-safe", tg.call_args[0][2].lower())
+
+    def test_unexpected_error_in_dry_run_never_touches_the_awning(self):
+        controller, tg, code = self._main(
+            decide_exc=RuntimeError("boom"), argv=["awning_automation.py", "--dry-run"]
+        )
+        controller.close.assert_not_called()
+        self.assertEqual(code, 1)
+
+    def test_configuration_error_does_not_close(self):
+        """A typo caught at deploy time is not a reason to move the awning."""
+        controller, _, code = self._main(env={"WIND_GUST_THRESHOLD_MPH": "windy"})
+        controller.close.assert_not_called()
+        controller.open.assert_not_called()
+        self.assertEqual(code, 1)
+
+    # --- the second hole: only close when Bond believed it open ---
+    def test_weather_outage_sends_close_even_when_bond_thinks_it_is_closed(self):
+        controller, tg, code = self._main(weather_exc=WeatherAPIError("down"), state=0)
+        controller.close.assert_called_once()
+        self.assertEqual(code, 1)
+        tg.assert_not_called()          # already closed per Bond: no 96-a-day spam
+
+    def test_weather_outage_notifies_when_it_was_open(self):
+        controller, tg, _ = self._main(weather_exc=WeatherAPIError("down"), state=1)
+        controller.close.assert_called_once()
+        tg.assert_called_once()
+        self.assertIn("Weather API error: down", tg.call_args[0][2])
+
+    def test_unreadable_state_still_closes_and_notifies(self):
+        controller, tg, _ = self._main(
+            weather_exc=WeatherAPIError("down"), state_exc=RuntimeError("bond hiccup")
+        )
+        controller.close.assert_called_once()
+        tg.assert_called_once()
+
+    def test_fail_safe_uses_the_same_env_file_as_the_run(self):
+        self._main(weather_exc=WeatherAPIError("down"),
+                   argv=["awning_automation.py", "--env-file=/etc/awning/.env"])
+        self.assertEqual(self.factory.call_args[0][0], Path("/etc/awning/.env"))
+
+    def test_a_failing_fail_safe_raises_the_alarm(self):
+        controller, tg, code = self._main(
+            weather_exc=WeatherAPIError("down"),
+            controller_factory_exc=RuntimeError("bond unreachable"),
+        )
+        self.assertEqual(code, 1)
+        sent = tg.call_args[0][2]
+        self.assertIn("ALERT", sent)
+        self.assertIn("fail-safe close failed", sent)
+        self.assertIn("bond unreachable", sent)
+
+    # --- must not undo a correct decision ---
+    def test_error_after_actuation_never_closes_an_open_awning(self):
+        """Telegram blows up AFTER the awning was correctly opened: leave it open."""
+        controller, tg, code = self._main(
+            state_exc=[0, 1],            # closed before, open after => Telegram path runs
+            post_patches=[("send_telegram_notification", dict(side_effect=RuntimeError("tg bug")))],
+        )
+        controller.open.assert_called_once()
+        controller.close.assert_not_called()
+        self.assertEqual(code, 1)
+
+    def test_log_cleanup_failure_is_ignored_and_the_heartbeat_still_fires(self):
+        with unittest.mock.patch.object(awning_automation, "ping_heartbeat") as ping:
+            controller, _, code = self._main(
+                state=0,
+                env={"HEARTBEAT_PING_URL": "https://hc.example/ping"},
+                post_patches=[("cleanup_old_logs", dict(side_effect=OSError("disk")))],
+            )
+        controller.open.assert_called_once()
+        controller.close.assert_not_called()
+        self.assertIsNone(code)
+        ping.assert_called_once_with("https://hc.example/ping")
+
+
+class TestLogRetention(unittest.TestCase):
+    """LOG_RETENTION_DAYS must degrade to the default, never raise or delete today."""
+
+    def _days(self, **env):
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            return awning_automation.get_log_retention_days()
+
+    def test_default_and_valid_values(self):
+        self.assertEqual(self._days(), 30)
+        self.assertEqual(self._days(LOG_RETENTION_DAYS=" 7 "), 7)
+
+    def test_invalid_values_fall_back_with_a_warning(self):
+        for label, value in {"suffix": "30d", "text": "forever", "zero": "0",
+                             "negative": "-5", "float": "2.5", "empty": ""}.items():
+            with self.subTest(case=label):
+                with self.assertLogs(awning_automation.logger, level="WARNING") as logs:
+                    self.assertEqual(self._days(LOG_RETENTION_DAYS=value), 30)
+                self.assertTrue(any("LOG_RETENTION_DAYS" in m for m in logs.output))
+
+    def test_cleanup_never_deletes_todays_log_even_for_a_bad_window(self):
+        import tempfile
+        from datetime import date, timedelta
+        with tempfile.TemporaryDirectory() as d:
+            log_dir = Path(d)
+            today = log_dir / f"awning-{date.today().isoformat()}.log"
+            old = log_dir / f"awning-{(date.today() - timedelta(days=40)).isoformat()}.log"
+            today.write_text("live"), old.write_text("old")
+            for bad in (0, -5):
+                with self.subTest(retention=bad):
+                    awning_automation.cleanup_old_logs(log_dir, bad)
+                    self.assertTrue(today.exists(), "today's log must survive")
+                    self.assertTrue(old.exists(), "a bad window deletes nothing at all")
+            awning_automation.cleanup_old_logs(log_dir, 30)
+            self.assertTrue(today.exists())
+            self.assertFalse(old.exists(), "a sane window still prunes old logs")
+
+
 if __name__ == "__main__":
     unittest.main()

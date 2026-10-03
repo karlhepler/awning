@@ -158,6 +158,10 @@ class BondAwningController:
         url = f"{self.base_url}/state"
         try:
             data = self._get_request(url)
+            if not isinstance(data, dict):
+                # A bridge answering with a list/string/null would otherwise die
+                # with AttributeError, which no caller handles.
+                raise BondAPIError(f"Unexpected state response: {data!r}")
             return data.get("open")
         except requests.RequestException as e:
             raise BondAPIError(f"Failed to get state: {e}") from e

@@ -177,7 +177,9 @@ Measured over 14 days (420 daytime 15-min slots), smoothing plus the Tier-2 resc
 
    Both bounds are env-tunable, so the arc can be recalibrated on the device **without redeploying code**.
 
-If ANY condition fails, the awning closes. Fail-safe: closes awning if weather API is unavailable.
+If ANY condition fails, the awning closes.
+
+**Fail-safe (`_fail_safe_close()`):** if the automation cannot make a trustworthy decision it closes the awning. That now covers the weather API being unavailable **and any unexpected exception raised before a command has been sent** (previously only `WeatherAPIError` did, so an ordinary bug between "got the weather" and "told the awning what to do" left it wherever it was — open, in a storm). It **always sends Close** rather than only when Bond reports open: Bond's state drifts whenever the physical remote is used (one-way RF, see `OPEN_ON_OPEN.md`), and a duplicate Close at the limit switch is harmless. Telegram stays quiet when Bond already said closed, so a long outage does not send 96 identical messages a day. It is deliberately **not** triggered by `ConfigurationError` (a deploy-time typo) or by anything after the command is sent — a Telegram, log-cleanup or heartbeat failure must never undo a correct decision (`actuated` flag). It uses the same `--env-file` as the run. Tests: `TestFailSafeClose`.
 
 **Each cron run acts immediately on the current conditions** — all conditions met opens the awning, any condition failing closes it, with no debounce or vote-counting between runs. (An earlier anti-flapping hysteresis that required two consecutive "open" votes was removed on 2026-06-24: Open-Meteo's irradiance/cloud data is hourly so it does not jitter between 15-min runs, rain-driven close is already immediate, and the RainViewer clear-sky veto removed the main flap source — so the debounce only added a ~30-minute open lag.)
 
@@ -252,7 +254,7 @@ See `.env.example` for full documentation. Key variables:
 
 **Optional:**
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` - For notifications
-- `LOG_RETENTION_DAYS` - Days to keep logs (default: 30)
+- `LOG_RETENTION_DAYS` - Days to keep logs, integer >= 1 (default: 30). An invalid value (`30d`, `0`, a negative number) logs a warning and uses 30; it never raises and never deletes today's log
 - `BOND_ID` - For mDNS discovery in deploy.sh
 - `HEARTBEAT_PING_URL` - Dead-man's-switch URL (e.g. healthchecks.io) pinged after every successful run; alerts off-box when the automation stops running entirely (see Logging above)
 - `PI_HOST` - Overrides the `orangepi3-lts` hostname `deploy.sh` SSHes to; not mDNS (avahi isn't installed on the Pi) — see Deployment above
