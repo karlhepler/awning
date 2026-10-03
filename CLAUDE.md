@@ -211,13 +211,17 @@ If ANY condition fails, the awning closes.
 
 **Deploy script (`deploy.sh`):**
 1. Discovers Bond Bridge IP via mDNS (using `BOND_ID` from `.env`)
-2. Sends Telegram notification (deploy start)
-3. Creates Python venv on remote if needed
-4. Installs dependencies via pip — **`deploy.sh` carries its own hardcoded package list** (`requests python-dotenv rich pvlib pandas pytz tenacity Pillow`); it does NOT read `requirements.txt`. 🚨 When adding a new runtime dependency you MUST add it to BOTH `requirements.txt` (for local/Nix dev) AND the pip-install line in `deploy.sh` (for the Pi), or the deploy will crash on import.
-5. Copies scripts and `.env` to `~/.config/awning/`
-6. Configures cron job (every 15 minutes)
-7. Runs dry-run verification
+2. Sends Telegram notification (deploy start). Telegram is best effort: an outage never aborts a deploy
+3. Creates Python venv on remote if needed. `python3-venv` is checked first with no secret in the command; only if it is missing is the sudo password sent, via a private temp file that `sudo -S` reads from stdin (never in a process list, safe for passwords containing quotes). `lan-run` does **not** forward stdin, which is why a pipe straight into `ssh` is not an option
+4. Installs dependencies from the **pinned `requirements.txt`** (copied to the Pi and installed with `pip install -r`). This is now the single source of truth; the script no longer carries its own list. 🚨 When adding a runtime dependency, add it to `requirements.txt` (pinned) **and** `flake.nix` (Nix dev shell). The pins match what was verified running on the Pi on 2026-10-03
+5. Backs up the running `awning_automation.py`, `awning_controller.py` and `.env` as `*.prev`, then copies `.env` (set to mode 600) **before** the scripts, so a cron run in between never pairs new code with an old `.env`
+6. **Verifies with a dry-run before touching cron.** If it fails, the previous files are restored, a failure Telegram is sent, and the script exits 1 *without* changing the cron job or reporting success. (Before 2026-10-03 it was written `cmd && echo ""` under `set -e`, which does not exit when the left side fails: a broken build stayed live, the cron job was replaced and "Deploy complete" was announced. Reproduced by execution)
+7. Configures cron job (every 15 minutes)
 8. Sends Telegram notification (deploy complete)
+
+The password prompt uses `read -r`; without it a password containing a backslash was silently altered and authentication failed.
+
+**Testing `deploy.sh` without a Pi:** it cannot be run by Claude (it needs the interactive password), but its control flow was exercised end to end against stubbed `ssh`/`scp`/`sshpass`/`sudo`/`crontab`/`curl` and a fake home directory, in five scenarios (success; failed dry-run with rollback; missing venv with a hostile password; Telegram outage; first deploy). The same harness fails on the previous script. The first real run is still the true test: report anything odd.
 
 **Remote structure:**
 - Scripts: `~/.config/awning/awning_automation.py`, `awning_controller.py`

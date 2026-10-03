@@ -26,9 +26,10 @@ TELEGRAM_CHAT_ID=$(grep '^TELEGRAM_CHAT_ID=' "$SCRIPT_DIR/.env" 2>/dev/null | cu
 send_telegram() {
     local message="$1"
     if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
-        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+        # Best effort: a Telegram outage must never abort (or fail) a deploy.
+        curl -s --max-time 10 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -H "Content-Type: application/json" \
-            -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"${message}\"}" > /dev/null
+            -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"${message}\"}" > /dev/null || true
     fi
 }
 
@@ -66,7 +67,9 @@ fi
 echo "Deploying awning automation (version: $VERSION)..."
 
 # Prompt for password
-read -s -p "Enter SSH password for $SERVER: " PASSWORD
+# -r: without it read treats backslashes as escapes, so a password containing one
+# was silently altered and authentication failed.
+read -r -s -p "Enter SSH password for $SERVER: " PASSWORD
 echo
 
 # Export for sshpass
@@ -75,9 +78,24 @@ export SSHPASS="$PASSWORD"
 # Send deploy start notification
 send_telegram "🚀 Deploying awning automation (${VERSION})..."
 
-# Ensure python3-venv is installed
+# Ensure python3-venv is installed.
+# The check runs first and carries no secret. Only when the package is actually
+# missing (a first-time setup) is the sudo password needed, and then it travels in
+# a private temp file that sudo reads from stdin: it never appears in a process
+# list (ssh's argv on this Mac, bash -c on the Pi), and a password containing a
+# quote cannot break out of the command. lan-run does not forward stdin, so piping
+# straight into ssh is not an option.
 echo "Ensuring python3-venv is installed..."
-lan-run sshpass -e ssh "$SERVER" "dpkg -s python3-venv > /dev/null 2>&1 || (echo '$PASSWORD' | sudo -S apt-get update && echo '$PASSWORD' | sudo -S apt-get install -y python3-venv)"
+if ! lan-run sshpass -e ssh "$SERVER" "dpkg -s python3-venv > /dev/null 2>&1"; then
+    echo "python3-venv is missing; installing it (needs sudo)..."
+    PW_FILE=$(mktemp)
+    trap 'rm -f "$PW_FILE"' EXIT
+    chmod 600 "$PW_FILE"
+    printf '%s\n' "$PASSWORD" > "$PW_FILE"
+    lan-run sshpass -e scp -q "$PW_FILE" "$SERVER:.awning-sudo-pw"
+    lan-run sshpass -e ssh "$SERVER" "chmod 600 ~/.awning-sudo-pw; sudo -S -p '' apt-get update < ~/.awning-sudo-pw && sudo -S -p '' apt-get install -y python3-venv < ~/.awning-sudo-pw; rc=\$?; rm -f ~/.awning-sudo-pw; exit \$rc"
+    rm -f "$PW_FILE"
+fi
 
 # Create remote directory, logs directory, and venv (only if venv doesn't exist)
 echo "Setting up remote directory and virtual environment..."
@@ -93,18 +111,40 @@ lan-run sshpass -e ssh "$SERVER" "
     fi
 "
 
-# Install Python dependencies
-# NOTE: Keep this list in sync with requirements.txt
+# Install Python dependencies from the pinned requirements.txt (the single source
+# of truth; this script used to carry its own hard-coded, unpinned list).
 echo "Installing Python dependencies..."
-lan-run sshpass -e ssh "$SERVER" "~/$REMOTE_DIR/venv/bin/pip install requests python-dotenv rich pvlib pandas pytz tenacity Pillow"
+lan-run sshpass -e scp -q "$SCRIPT_DIR/requirements.txt" "$SERVER:~/$REMOTE_DIR/requirements.txt"
+lan-run sshpass -e ssh "$SERVER" "~/$REMOTE_DIR/venv/bin/pip install -r ~/$REMOTE_DIR/requirements.txt"
 
-# Copy Python scripts
+# Keep the version that is running now, so a build that fails verification below
+# can be rolled back instead of left live under the existing cron job.
+echo "Backing up the currently deployed version..."
+lan-run sshpass -e ssh "$SERVER" "cd ~/$REMOTE_DIR && for f in awning_controller.py awning_automation.py .env; do if [ -f \$f ]; then cp -p \$f \$f.prev; fi; done"
+
+# Copy .env first, then the scripts, so a cron run that lands between the two
+# never pairs new code with an old .env.
+echo "Copying .env..."
+lan-run sshpass -e scp "$SCRIPT_DIR/.env" "$SERVER:~/$REMOTE_DIR/.env"
+lan-run sshpass -e ssh "$SERVER" "chmod 600 ~/$REMOTE_DIR/.env"
+
 echo "Copying scripts..."
 lan-run sshpass -e scp "$SCRIPT_DIR/awning_controller.py" "$SCRIPT_DIR/awning_automation.py" "$SERVER:~/$REMOTE_DIR/"
 
-# Copy .env file
-echo "Copying .env..."
-lan-run sshpass -e scp "$SCRIPT_DIR/.env" "$SERVER:~/$REMOTE_DIR/.env"
+# Verify BEFORE touching the cron job. A failed dry-run (config error, Bond
+# unreachable, ImportError) used to be ignored: it was written as `cmd && echo ""`
+# under `set -e`, which does not exit when the left side of && fails, so the
+# script went on to report "Deploy complete" for a broken build that was already
+# live. Now it rolls back and stops.
+echo "Verifying deployment (dry-run)..."
+if ! lan-run sshpass -e ssh "$SERVER" "~/$REMOTE_DIR/venv/bin/python ~/$REMOTE_DIR/awning_automation.py --env-file=~/$REMOTE_DIR/.env --dry-run"; then
+    echo "ERROR: dry-run failed. Rolling back to the previous version..." >&2
+    lan-run sshpass -e ssh "$SERVER" "cd ~/$REMOTE_DIR && for f in awning_controller.py awning_automation.py .env; do if [ -f \$f.prev ]; then mv -f \$f.prev \$f; fi; done" || echo "WARNING: rollback command failed - check ~/$REMOTE_DIR on the device" >&2
+    send_telegram "❌ Deploy FAILED dry-run verification (version ${VERSION}); rolled back to the previous version."
+    echo "Deploy FAILED (version: $VERSION). The previous version is restored; the cron job was not changed." >&2
+    exit 1
+fi
+echo
 
 # Log deploy start to remote log file (dated log in logs directory)
 echo "Logging deploy start..."
@@ -118,10 +158,6 @@ lan-run sshpass -e ssh "$SERVER" "echo '' >> $LOG_FILE && echo '$(date '+%Y-%m-%
 echo "Configuring cron job..."
 CRON_CMD='*/15 * * * * $HOME/.config/awning/venv/bin/python $HOME/.config/awning/awning_automation.py --env-file=$HOME/.config/awning/.env >> $HOME/.config/awning/logs/awning-$(date +\%Y-\%m-\%d).log 2>&1'
 lan-run sshpass -e ssh "$SERVER" "(crontab -l 2>/dev/null | grep -v 'awning_automation'; echo '$CRON_CMD') | crontab -"
-
-# Verify deployment
-echo "Verifying deployment..."
-lan-run sshpass -e ssh "$SERVER" "~/$REMOTE_DIR/venv/bin/python ~/$REMOTE_DIR/awning_automation.py --env-file=~/$REMOTE_DIR/.env --dry-run" && echo ""
 
 # Log deploy complete to remote log file (dated log in logs directory)
 lan-run sshpass -e ssh "$SERVER" "echo '$(date '+%Y-%m-%d %H:%M:%S') - INFO - ✅ Deploy complete (version: $VERSION)' >> $LOG_FILE && echo '' >> $LOG_FILE"

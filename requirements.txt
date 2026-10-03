@@ -1,7 +1,14 @@
-requests
-python-dotenv
-rich
-pvlib
-pandas
-tenacity
-Pillow
+# Runtime dependencies, pinned to the versions running on the Orange Pi
+# (verified on the device 2026-10-03). deploy.sh installs exactly this file.
+# Unpinned installs meant a rebuilt venv could silently pull newer major versions
+# that the Nix-pinned test environment had never run against.
+#
+# Transitive dependencies (numpy, pytz, urllib3, ...) are left to pip.
+# rich is only used by the awning.py CLI; it is harmless on the Pi.
+requests==2.32.5
+python-dotenv==1.2.1
+rich==14.2.0
+pvlib==0.13.1
+pandas==2.3.3
+tenacity==9.1.2
+Pillow==12.2.0
