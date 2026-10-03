@@ -93,6 +93,40 @@ import awning_automation
 from awning_automation import should_open_awning, ConfigurationError, get_thresholds, WeatherAPIError, fetch_weather, evaluate_rain_gate
 
 
+# ---------------------------------------------------------------------------
+# Hermeticity guard
+# ---------------------------------------------------------------------------
+# is_raining_on_radar() fetches the LIVE RainViewer radar through plain
+# requests.get, and many tests pass lat/lon to should_open_awning() without
+# mocking it. They passed only while the sky over the house happened to be dry:
+# on 2026-10-03, with real rain nearby, nine of them failed on a clean checkout
+# of HEAD with 'Raining (radar(NEXRAD))'. Blocking requests.get for the whole
+# module makes them independent of the weather. The radar already treats any
+# RequestException as "no radar rain" (fail-open), so a blocked call behaves
+# exactly like an outage. Tests that mock requests.get themselves patch on top
+# of this and are unaffected; the weather fetchers go through _weather_session,
+# which tests already patch separately.
+_network_guard = None
+
+
+def setUpModule():
+    import requests
+
+    global _network_guard
+    _network_guard = unittest.mock.patch.object(
+        requests,
+        "get",
+        side_effect=requests.exceptions.ConnectionError(
+            "live network blocked in unit tests — mock requests.get explicitly"
+        ),
+    )
+    _network_guard.start()
+
+
+def tearDownModule():
+    _network_guard.stop()
+
+
 class TestShouldOpenAwningOrGate(unittest.TestCase):
     """Tests for the GHI-OR-UV sunny gate in should_open_awning()."""
 
@@ -5154,6 +5188,147 @@ class TestObservedCeilingVetoCompositionRoot(unittest.TestCase):
             {"METAR_STATION": "KRDU", "METAR_CEILING_FT": "1000"}, self.BROKEN_DECK
         )
         controller.open.assert_called_once()
+
+
+class TestObservedCeilingVetoNotification(unittest.TestCase):
+    """
+    The Telegram close message must name the sky veto, not the forecast numbers.
+
+    Without this, the 2026-10-03 close would have announced "Not enough sun
+    (GHI 601 W/m², UV 4.9, DNI 645 W/m², cloud 15%)" — healthy numbers under a
+    "not enough sun" headline, the same self-contradiction the rain attribution
+    fixed for rain closes.
+    """
+
+    _CONDITIONS_NOT_SUNNY = {
+        "sunny": False,
+        "calm": True,
+        "no_rain": True,
+        "above_freezing": True,
+        "daytime": True,
+        "sun_high": True,
+        "sun_facing_window": True,
+    }
+    _READINGS = dict(
+        wind_speed=7.3, precipitation=0.0, temperature=81.2,
+        ghi=601.0, uv_index=4.9, dni=645.0, cloud_cover=15.0,
+    )
+
+    def test_message_names_the_airport_report(self):
+        msg = awning_automation.build_close_reason(
+            self._CONDITIONS_NOT_SUNNY, **self._READINGS,
+            sky_veto="KRDU reports BKN016",
+        )
+        self.assertIn("KRDU reports BKN016", msg)
+        self.assertNotIn("Not enough sun", msg)
+        self.assertNotIn("GHI", msg, "the forecast's healthy numbers are the contradiction")
+
+    def test_message_falls_back_without_a_veto(self):
+        msg = awning_automation.build_close_reason(
+            self._CONDITIONS_NOT_SUNNY, **self._READINGS
+        )
+        self.assertIn("Not enough sun", msg)
+        self.assertIn("GHI 601", msg)
+
+    def test_rain_still_outranks_the_veto(self):
+        conditions = dict(self._CONDITIONS_NOT_SUNNY, no_rain=False)
+        msg = awning_automation.build_close_reason(
+            conditions, **self._READINGS,
+            rain_attribution="radar(NEXRAD)", sky_veto="KRDU reports BKN016",
+        )
+        self.assertIn("radar(NEXRAD)", msg)
+        self.assertNotIn("KRDU", msg)
+
+    def test_should_open_awning_fills_only_the_sky_out_param(self):
+        """The rain out-param is read positionally as a rain signal; keep it clean."""
+        weather = _weather(**TestObservedCeilingVeto.INCIDENT_WEATHER)
+        rain_out, sky_out = [], []
+        with unittest.mock.patch.object(
+            awning_automation, "fetch_metar_ceiling",
+            return_value={"ceiling_ft": 1600.0, "cover": "BKN", "age_min": 11.0, "raw": ""},
+        ), unittest.mock.patch.object(
+            awning_automation, "is_raining_on_radar", return_value=False
+        ):
+            should_open, _, _ = should_open_awning(
+                weather, _sun(**TestObservedCeilingVeto.SUN),
+                TestObservedCeilingVeto.NOW, metar_station="KRDU",
+                _attribution=rain_out, _sky_veto=sky_out,
+                **dict(_THRESHOLDS, altitude_threshold=12.0),
+            )
+        self.assertFalse(should_open)
+        self.assertEqual(sky_out, ["KRDU reports BKN016"])
+        self.assertEqual(rain_out, [])
+
+    def test_sky_out_param_stays_empty_without_a_veto(self):
+        weather = _weather(**TestObservedCeilingVeto.INCIDENT_WEATHER)
+        sky_out = []
+        with unittest.mock.patch.object(
+            awning_automation, "fetch_metar_ceiling",
+            return_value={"ceiling_ft": None, "cover": None, "age_min": 11.0, "raw": ""},
+        ), unittest.mock.patch.object(
+            awning_automation, "is_raining_on_radar", return_value=False
+        ):
+            should_open, _, _ = should_open_awning(
+                weather, _sun(**TestObservedCeilingVeto.SUN),
+                TestObservedCeilingVeto.NOW, metar_station="KRDU",
+                _sky_veto=sky_out,
+                **dict(_THRESHOLDS, altitude_threshold=12.0),
+            )
+        self.assertTrue(should_open)
+        self.assertEqual(sky_out, [])
+
+    def test_main_composition_root_sends_the_sky_message(self):
+        """
+        Drive the real main() on the 2026-10-03 11:15 numbers with Telegram on.
+        The unit tests inject sky_veto directly, so they would stay green even if
+        main() never plumbed it through — and a --dry-run returns before the
+        notification block, so it cannot exercise this path either.
+        """
+        import sys
+        from unittest.mock import patch, MagicMock
+
+        mock_controller = MagicMock()
+        mock_controller.get_state.side_effect = [1, 0]  # open before, closed after
+        mock_log_path = MagicMock()
+        mock_log_path.parent = MagicMock()
+
+        weather = _weather(
+            shortwave_radiation=601.0, uv_index=4.9, dni=645.0, cloud_cover=15.0,
+            cloud_cover_low=16.0, cloud_cover_mid=3.0, cloud_cover_high=0.0,
+            wind_speed=7.3, temperature=81.2,
+            sunrise="2026-10-03T07:12:00", sunset="2026-10-03T18:56:00",
+        )
+        weather["time"] = "2026-10-03T11:15:00"
+        weather["ghi_smoothed"] = 558.0
+        weather["dni_smoothed"] = 600.0
+
+        env = {
+            "WIND_SPEED_THRESHOLD_MPH": "15",
+            "MIN_SUN_ALTITUDE_DEG": "12",
+            "METAR_STATION": "KRDU",
+        }
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(sys, "argv", ["awning_automation.py"]), \
+             patch.object(awning_automation, "setup_logging", return_value=mock_log_path), \
+             patch.object(awning_automation, "load_location_config", return_value=(35.778, -78.838)), \
+             patch.object(awning_automation, "load_telegram_config", return_value=("fake_token", "fake_chat")), \
+             patch.object(awning_automation, "collect_weather_measurements", return_value=weather), \
+             patch.object(awning_automation, "calculate_sun_position",
+                          return_value={"azimuth": 141.6, "altitude": 42.6}), \
+             patch.object(awning_automation, "is_raining_on_radar", return_value=False), \
+             patch.object(awning_automation, "fetch_metar_ceiling",
+                          return_value={"ceiling_ft": 1600.0, "cover": "BKN",
+                                        "age_min": 11.0, "raw": ""}), \
+             patch.object(awning_automation, "create_controller_from_env",
+                          return_value=mock_controller), \
+             patch.object(awning_automation, "send_telegram_notification") as mock_telegram:
+            awning_automation.main()
+
+        mock_controller.close.assert_called_once()
+        mock_telegram.assert_called_once()
+        sent = mock_telegram.call_args[0][2]
+        self.assertIn("KRDU reports BKN016", sent)
+        self.assertNotIn("Not enough sun", sent)
 
 
 if __name__ == "__main__":

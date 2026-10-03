@@ -1991,6 +1991,7 @@ def should_open_awning(
     metar_station: Optional[str] = None,
     metar_ceiling_ft: float = DEFAULT_METAR_CEILING_FT,
     _attribution: Optional[list] = None,
+    _sky_veto: Optional[list] = None,
 ) -> tuple[bool, str, dict]:
     """
     Determine if awning should be open based on ALL conditions.
@@ -2083,6 +2084,13 @@ def should_open_awning(
             element [0] and hands it to build_close_reason(), whose first branch
             is the RAIN branch. The cross-model sun rescue therefore must NOT
             append here; its detail rides in the returned reason string.
+        _sky_veto: Optional list; if provided and the observed-ceiling veto
+            fired, a short description such as "KRDU reports BKN016" is
+            appended. A separate out-param from _attribution on purpose: that one
+            is read positionally as a RAIN signal, so a sky string there would
+            make an unrelated close announce a rain message. Lets main() name the
+            real reason in the Telegram message instead of "Not enough sun" with
+            the forecast's healthy numbers.
 
     Returns:
         Tuple of (should_open, reason, conditions_dict)
@@ -2336,6 +2344,10 @@ def should_open_awning(
                 sky_status = f"{where}: no BKN/OVC layer → no veto"
             elif ceiling_ft < metar_ceiling_ft:
                 sky_vetoed = True
+                if _sky_veto is not None:
+                    _sky_veto.append(
+                        f"{metar_station} reports {sky_obs['cover']}{ceiling_ft / 100:03.0f}"
+                    )
                 sky_status = (
                     f"{where}: {sky_obs['cover']}{ceiling_ft / 100:03.0f} → "
                     f"ceiling {ceiling_ft:.0f} ft < {metar_ceiling_ft:.0f} → VETO"
@@ -2520,6 +2532,7 @@ def build_close_reason(
     dni: float,
     cloud_cover: float,
     rain_attribution: Optional[str] = None,
+    sky_veto: Optional[str] = None,
 ) -> str:
     """
     Build a human-readable close reason string for Telegram notifications.
@@ -2534,6 +2547,11 @@ def build_close_reason(
     a radar-triggered or probability-triggered close truthfully reports
     "0.0 mm/h" because no rain was measured, which reads as a contradiction.
     Falls back to the precipitation value when no attribution is supplied.
+
+    The not-sunny branch does the same for the observed-ceiling veto: when
+    sky_veto names the airport report that fired, the message says so rather
+    than printing the forecast's healthy GHI/DNI under "Not enough sun" (the
+    2026-10-03 close would otherwise have announced GHI 601, DNI 645, cloud 15%).
 
     Priority order: rain > wind > cold > not sunny > nighttime > sun position.
     """
@@ -2552,6 +2570,8 @@ def build_close_reason(
         return f"❄️ Awning closed: Too cold ({temp_f}°F)"
 
     if not conditions["sunny"]:
+        if sky_veto:
+            return f"☁️ Awning closed: Low cloud deck — {sky_veto}"
         return (
             f"☁️ Awning closed: Not enough sun "
             f"(GHI {ghi:.0f} W/m², UV {uv_index:.1f}, "
@@ -2579,6 +2599,7 @@ def _format_friendly_telegram_message(
     dni: float = 0.0,
     cloud_cover: float = 100.0,
     rain_attribution: Optional[str] = None,
+    sky_veto: Optional[str] = None,
 ) -> str:
     """
     Format a human-friendly Telegram notification message.
@@ -2595,6 +2616,8 @@ def _format_friendly_telegram_message(
         cloud_cover: Total cloud cover percentage (Layer 2 observational gate)
         rain_attribution: Which rain signal(s) fired, e.g. "radar(NEXRAD)". Named
             in the message so a close is attributable without reading the log.
+        sky_veto: Which airport report fired the observed-ceiling veto, e.g.
+            "KRDU reports BKN016". Named in the message for the same reason.
 
     Returns:
         Friendly message string with appropriate emoji
@@ -2609,6 +2632,7 @@ def _format_friendly_telegram_message(
         conditions, wind_speed, precipitation, temperature,
         ghi, uv_index, dni, cloud_cover,
         rain_attribution=rain_attribution,
+        sky_veto=sky_veto,
     )
 
 
@@ -2713,6 +2737,7 @@ def main() -> None:
 
         # Evaluate all conditions
         rain_attribution_out: list = []
+        sky_veto_out: list = []
         should_open, reason, conditions = should_open_awning(
             weather,
             sun_position,
@@ -2738,8 +2763,10 @@ def main() -> None:
             metar_station=metar_station,
             metar_ceiling_ft=metar_ceiling_ft,
             _attribution=rain_attribution_out,
+            _sky_veto=sky_veto_out,
         )
         rain_attribution = rain_attribution_out[0] if rain_attribution_out else None
+        sky_veto = sky_veto_out[0] if sky_veto_out else None
 
         # Log conditions with checkmarks/crosses
         condition_symbols = {
@@ -2795,6 +2822,7 @@ def main() -> None:
                 weather.get("dni", 0.0),
                 weather.get("cloud_cover", 100.0),
                 rain_attribution=rain_attribution,
+                sky_veto=sky_veto,
             )
             send_telegram_notification(telegram_token, telegram_chat_id, msg)
 
