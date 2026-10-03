@@ -432,6 +432,17 @@ _CROSSCHECK_TIMEOUT_S = 8
 # early-morning slot rescue a late-afternoon run.
 _CROSSCHECK_MAX_SLOT_AGE_MIN = 60
 
+# Observed-ceiling veto — see the 2026-10-03 incident notes on
+# fetch_metar_ceiling(). 3000 ft is the standard aviation "low ceiling" line
+# (the MVFR boundary), not a value tuned to this house.
+DEFAULT_METAR_CEILING_FT = 3000.0
+_METAR_TIMEOUT_S = 5
+# METARs are hourly plus a SPECI whenever the sky changes, so a report can
+# legitimately be ~60 min old. Anything past this is stale, not a measurement.
+_METAR_MAX_AGE_MIN = 90
+# Sky-cover codes that mean the sun is actually blocked. FEW/SCT leave gaps.
+_METAR_BLOCKING_COVERS = ("BKN", "OVC", "VV")
+
 # Trailing-window smoothing for the primary feed's irradiance fields.
 #
 # The primary (`best_match`) feed resolves to GFS/HRRR here, and its 15-minute
@@ -838,6 +849,40 @@ def get_thresholds() -> tuple[float, float, float, float, float, float, float, f
         )
 
     return wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold, radar_veto_dni, radar_veto_cloud_pct, min_dni_direct, sun_azimuth_min, sun_azimuth_max, sunny_crosscheck_enabled
+
+
+def get_sky_observation_config() -> tuple[Optional[str], float]:
+    """
+    Read the observed-ceiling veto settings from the environment.
+
+    Kept apart from get_thresholds() on purpose: that 16-tuple is unpacked
+    positionally in main() and throughout the tests, and this feature is
+    optional and has nothing to do with the forecast thresholds.
+
+    Returns:
+        (metar_station, metar_ceiling_ft). metar_station is None when
+        METAR_STATION is unset or blank, which turns the veto off.
+    """
+    station = os.getenv("METAR_STATION", "").strip().upper()
+    if station and not (station.isalnum() and 3 <= len(station) <= 4):
+        raise ConfigurationError(
+            f"Invalid METAR_STATION value: {station!r}. "
+            f"Must be a 3-4 character ICAO/FAA station code such as KRDU."
+        )
+
+    ceiling_str = os.getenv("METAR_CEILING_FT", str(DEFAULT_METAR_CEILING_FT))
+    try:
+        ceiling_ft = float(ceiling_str)
+    except ValueError:
+        raise ConfigurationError(
+            f"Invalid METAR_CEILING_FT value: {ceiling_str!r}. Must be a number."
+        )
+    if ceiling_ft <= 0:
+        raise ConfigurationError(
+            f"METAR_CEILING_FT ({ceiling_ft}) must be > 0."
+        )
+
+    return (station or None), ceiling_ft
 
 
 def load_telegram_config() -> tuple[Optional[str], Optional[str]]:
@@ -1312,6 +1357,90 @@ def fetch_crosscheck_irradiance(
         return None
     except Exception as e:
         logger.warning(f"Sun crosscheck: parse error: {e} — no rescue")
+        return None
+
+
+def fetch_metar_ceiling(
+    station: str,
+    timeout: int = _METAR_TIMEOUT_S,
+    _now_utc: Optional[datetime] = None,
+) -> Optional[dict]:
+    """
+    Fetch the nearest airport's latest METAR and report its lowest cloud ceiling.
+
+    Why this exists — the 2026-10-03 incident
+    -----------------------------------------
+    Every input to the sunny gate (GHI, UV, DNI, cloud cover) is a model product
+    from one Open-Meteo `best_match` response, which resolves to GFS/HRRR here.
+    At 11:15 it read 15% cloud, DNI 645, GHI 601 and the awning stayed open while
+    the sky closed in and rain fell nearby:
+
+        KRDU 11:04  BKN016 OVC250   (broken deck at 1,600 ft; 10:51 was SCT016)
+        KJNX 11:15  BKN013 OVC048
+        KTTA 10:35  +RA, 11:15 -DZ
+
+    Only ICON saw it; ECMWF agreed with GFS. This is the mirror image of the
+    2026-08-14/16 incidents, where the model invented cloud that was not there.
+    The cross-model rescue can only turn "not sunny" into "sunny", so it cannot
+    help: the code had no OBSERVED sky signal at all. Radar guards rain only.
+
+    Only the lowest BKN/OVC/VV layer counts. FEW/SCT leave gaps for the sun, and
+    a high layer (BKN250, cirrus) does not block it. Heights are feet AGL.
+
+    Fails open: returns None on ANY error, an empty result, or a report older
+    than _METAR_MAX_AGE_MIN, so an outage reverts to forecast-only behavior and
+    can never wedge the awning closed. Mirrors fetch_crosscheck_irradiance().
+
+    Args:
+        station: ICAO station code, e.g. "KRDU"
+        timeout: Request timeout in seconds
+        _now_utc: Test injection point for the current UTC time
+
+    Returns:
+        Dict with 'ceiling_ft' (lowest BKN/OVC/VV base, or None when there is no
+        such layer), 'cover' (that layer's code, or None), 'age_min' and 'raw'
+        (the report text); or None if no usable observation is available.
+    """
+    url = "https://aviationweather.gov/api/data/metar"
+    params = {"ids": station, "format": "json", "hours": 2}
+
+    try:
+        reports = _fetch_weather_request(url, params, timeout)
+        if not isinstance(reports, list) or not reports:
+            logger.warning(f"Sky observation: no METAR returned for {station} — no veto")
+            return None
+
+        # Do not assume the API's ordering: take the newest by observation time.
+        latest = max(reports, key=lambda r: r["obsTime"])
+        now_utc = _now_utc or datetime.now(timezone.utc)
+        age_min = (now_utc.timestamp() - float(latest["obsTime"])) / 60.0
+        if age_min > _METAR_MAX_AGE_MIN:
+            logger.warning(
+                f"Sky observation: {station} report is {age_min:.0f} min old "
+                f"(max {_METAR_MAX_AGE_MIN}) — no veto"
+            )
+            return None
+
+        blocking = [
+            (float(layer["base"]), layer["cover"])
+            for layer in (latest.get("clouds") or [])
+            if layer.get("cover") in _METAR_BLOCKING_COVERS
+            and layer.get("base") is not None
+        ]
+        ceiling_ft, cover = min(blocking) if blocking else (None, None)
+
+        return {
+            "ceiling_ft": ceiling_ft,
+            "cover": cover,
+            "age_min": age_min,
+            "raw": latest.get("rawOb", ""),
+        }
+
+    except requests.RequestException as e:
+        logger.warning(f"Sky observation: API error: {e} — no veto")
+        return None
+    except Exception as e:
+        logger.warning(f"Sky observation: parse error: {e} — no veto")
         return None
 
 
@@ -1859,6 +1988,8 @@ def should_open_awning(
     sun_azimuth_min: float = DEFAULT_SUN_AZIMUTH_MIN_DEG,
     sun_azimuth_max: float = DEFAULT_SUN_AZIMUTH_MAX_DEG,
     sunny_crosscheck_enabled: bool = DEFAULT_SUNNY_CROSSCHECK_ENABLED,
+    metar_station: Optional[str] = None,
+    metar_ceiling_ft: float = DEFAULT_METAR_CEILING_FT,
     _attribution: Optional[list] = None,
 ) -> tuple[bool, str, dict]:
     """
@@ -1936,6 +2067,13 @@ def should_open_awning(
             DNI >= min_dni_direct. See fetch_crosscheck_irradiance() for the
             2026-08-14 incident that motivated it. Rescue-only: it can never
             cause a close that would not already happen.
+        metar_station: ICAO code of the nearest airport (e.g. "KRDU"). When set,
+            an OBSERVED broken/overcast layer below metar_ceiling_ft vetoes a
+            "sunny" verdict, rescue included — an observation outranks a model.
+            None (default) disables the veto. See fetch_metar_ceiling() for the
+            2026-10-03 incident. Close-only: it can never open the awning.
+        metar_ceiling_ft: Cloud base (feet AGL) below which a BKN/OVC/VV layer
+            vetoes sunny (default 3000, the aviation low-ceiling line)
         _attribution: Optional list; if provided and the rain gate closed, the
             attribution string naming the signal(s) that fired is appended.
             Lets main() name the real signal in the Telegram message. It cannot
@@ -2159,11 +2297,61 @@ def should_open_awning(
                 f"weakest={weakest:.0f} {comparison} {bar:.0f} → {verdict}"
             )
 
-    is_sunny = sunny_primary or sunny_rescued or sunny_rescued_observed
+    sunny_forecast = sunny_primary or sunny_rescued or sunny_rescued_observed
+
+    # Observed-ceiling veto — close-only, the mirror image of the rescue above.
+    #
+    # Every layer and both rescue tiers read MODEL output. On 2026-10-03 the
+    # model said 15% cloud / DNI 645 while the airport 12 km away reported a
+    # broken deck at 1,600 ft and rain fell nearby, so the awning stayed open
+    # under a darkening sky. A real observation outranks a forecast, so this
+    # runs last and overrides the rescue too. It only ever clears `sunny`; it
+    # has no path to set it, so it cannot cause an open.
+    #
+    # Fetched only when it could change the outcome: the forecast already says
+    # sunny and the sun gates are open (same skip shape as the crosscheck).
+    sky_vetoed = False
+    sky_obs = None
+    if not metar_station:
+        sky_status = "disabled"
+    elif not sunny_forecast:
+        sky_status = "skipped(not_sunny)"
+    elif not (is_day and sun_high_enough and sun_facing_se):
+        sky_status = "skipped(sun_gates_closed)"
+    else:
+        # Belt and braces, as for the crosscheck: an exception here would reach
+        # main()'s fail-safe and close the awning, turning a fail-open feature
+        # into a fail-closed one.
+        try:
+            sky_obs = fetch_metar_ceiling(metar_station)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(f"Sky observation: unexpected error: {e} — no veto")
+            sky_obs = None
+        if sky_obs is None:
+            sky_status = "unavailable"
+        else:
+            ceiling_ft = sky_obs["ceiling_ft"]
+            where = f"{metar_station} (METAR {sky_obs['age_min']:.0f} min old)"
+            if ceiling_ft is None:
+                sky_status = f"{where}: no BKN/OVC layer → no veto"
+            elif ceiling_ft < metar_ceiling_ft:
+                sky_vetoed = True
+                sky_status = (
+                    f"{where}: {sky_obs['cover']}{ceiling_ft / 100:03.0f} → "
+                    f"ceiling {ceiling_ft:.0f} ft < {metar_ceiling_ft:.0f} → VETO"
+                )
+            else:
+                sky_status = (
+                    f"{where}: {sky_obs['cover']}{ceiling_ft / 100:03.0f} → "
+                    f"ceiling {ceiling_ft:.0f} ft >= {metar_ceiling_ft:.0f} → no veto"
+                )
+
+    is_sunny = sunny_forecast and not sky_vetoed
 
     # Logged on EVERY run (like `Rain signals:`), so a future false reading is
     # diagnosable from the log alone.
     logger.info(f"Sun crosscheck: {crosscheck_status}")
+    logger.info(f"Sky observation: {sky_status}")
 
     # Same rationale: show what the gate actually read versus what the feed
     # reported this instant, so a suspect decision can be traced to the smoothing
@@ -2278,6 +2466,14 @@ def should_open_awning(
                 f"(model ok: {model_trace}, overcast ok: {overcast_trace}; "
                 f"primary consistency disagreed: {obs_trace})"
             )
+
+    if sky_vetoed and sky_obs is not None:
+        sunny_trace = (
+            f"OBSERVED CEILING VETO: {metar_station} reports "
+            f"{sky_obs['cover']}{sky_obs['ceiling_ft'] / 100:03.0f} "
+            f"({sky_obs['ceiling_ft']:.0f} ft < {metar_ceiling_ft:.0f} ft) "
+            f"(forecast said sunny: {sunny_trace})"
+        )
 
     # Build detailed reason string
     reasons = []
@@ -2450,6 +2646,7 @@ def main() -> None:
 
         # Get thresholds
         wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold, radar_veto_dni, radar_veto_cloud_pct, min_dni_direct, sun_azimuth_min, sun_azimuth_max, sunny_crosscheck_enabled = get_thresholds()
+        metar_station, metar_ceiling_ft = get_sky_observation_config()
         logger.info(
             f"Thresholds: model=(GHI >= {min_ghi:.0f} W/m² "
             f"OR [UV >= {min_uv_index:.1f} AND cloud < {max_cloud_cover:.0f}%] "
@@ -2464,7 +2661,11 @@ def main() -> None:
             f"sunny_crosscheck=({'on' if sunny_crosscheck_enabled else 'off'}, "
             f"{'+'.join(_CROSSCHECK_MODELS)} all DNI >= {min_dni_direct:.0f} W/m² full "
             f"| >= {min_dni:.0f} W/m² consistency), "
-            f"irradiance_smoothing={_SMOOTHING_SLOTS}-slot median"
+            f"irradiance_smoothing={_SMOOTHING_SLOTS}-slot median, "
+            + (
+                f"sky_veto=({metar_station} BKN/OVC/VV < {metar_ceiling_ft:.0f} ft)"
+                if metar_station else "sky_veto=(off)"
+            )
         )
 
         # Load Telegram config (optional)
@@ -2534,6 +2735,8 @@ def main() -> None:
             sun_azimuth_min=sun_azimuth_min,
             sun_azimuth_max=sun_azimuth_max,
             sunny_crosscheck_enabled=sunny_crosscheck_enabled,
+            metar_station=metar_station,
+            metar_ceiling_ft=metar_ceiling_ft,
             _attribution=rain_attribution_out,
         )
         rain_attribution = rain_attribution_out[0] if rain_attribution_out else None

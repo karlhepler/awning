@@ -4709,5 +4709,452 @@ class TestHeartbeatCompositionRoot(unittest.TestCase):
         mock_ping.assert_not_called()
 
 
+class TestFetchMetarCeiling(unittest.TestCase):
+    """fetch_metar_ceiling() — request shape, newest-report selection, fail-open."""
+
+    NOW = datetime(2026, 10, 3, 15, 15, 0, tzinfo=timezone.utc)  # 11:15 EDT
+
+    # The three real KRDU reports aviationweather.gov returned on 2026-10-03.
+    SPECI_1104 = {
+        "obsTime": 1791039840,  # 15:04Z
+        "clouds": [{"cover": "BKN", "base": 1600}, {"cover": "OVC", "base": 25000}],
+        "rawOb": "SPECI KRDU 031504Z 05009KT 10SM BKN016 OVC250 24/20 A3014",
+    }
+    METAR_1051 = {
+        "obsTime": 1791039060,  # 14:51Z
+        "clouds": [{"cover": "SCT", "base": 1600}, {"cover": "SCT", "base": 25000}],
+        "rawOb": "METAR KRDU 031451Z 04011KT 10SM SCT016 SCT250 24/20 A3014",
+    }
+    METAR_0951 = {
+        "obsTime": 1791035460,  # 13:51Z
+        "clouds": [{"cover": "FEW", "base": 25000}],
+        "rawOb": "METAR KRDU 031351Z 07008KT 10SM FEW250 25/20 A3013",
+    }
+
+    def _call(self, response=None, side_effect=None, now=None):
+        mock_resp = unittest.mock.Mock()
+        mock_resp.json.return_value = response
+        mock_resp.raise_for_status.return_value = None
+        with unittest.mock.patch.object(
+            awning_automation._weather_session,
+            "get",
+            side_effect=side_effect,
+            return_value=None if side_effect else mock_resp,
+        ) as mock_get:
+            result = awning_automation.fetch_metar_ceiling(
+                "KRDU", _now_utc=now or self.NOW
+            )
+        return result, mock_get
+
+    def test_request_shape(self):
+        _, mock_get = self._call([self.SPECI_1104])
+        self.assertEqual(
+            mock_get.call_args.args[0], "https://aviationweather.gov/api/data/metar"
+        )
+        params = mock_get.call_args.kwargs["params"]
+        self.assertEqual(params["ids"], "KRDU")
+        self.assertEqual(params["format"], "json")
+
+    def test_reads_the_incident_speci(self):
+        result, _ = self._call([self.SPECI_1104, self.METAR_1051, self.METAR_0951])
+        self.assertEqual(result["ceiling_ft"], 1600.0)
+        self.assertEqual(result["cover"], "BKN")
+        self.assertAlmostEqual(result["age_min"], 11.0, places=0)
+        self.assertIn("BKN016", result["raw"])
+
+    def test_picks_newest_regardless_of_api_ordering(self):
+        """Oldest-first must still read the 11:04 SPECI, not the clear 09:51 METAR."""
+        result, _ = self._call([self.METAR_0951, self.METAR_1051, self.SPECI_1104])
+        self.assertEqual(result["ceiling_ft"], 1600.0)
+
+    def test_scattered_and_few_layers_are_not_a_ceiling(self):
+        """10:51 was SCT016 SCT250 — gaps in the sky, so no ceiling at all."""
+        result, _ = self._call([self.METAR_1051], now=datetime(
+            2026, 10, 3, 15, 0, 0, tzinfo=timezone.utc))
+        self.assertIsNotNone(result)
+        self.assertIsNone(result["ceiling_ft"])
+        self.assertIsNone(result["cover"])
+
+    def test_lowest_blocking_layer_wins(self):
+        report = dict(self.SPECI_1104, clouds=[
+            {"cover": "SCT", "base": 500},   # not blocking, ignored
+            {"cover": "OVC", "base": 2500},
+            {"cover": "BKN", "base": 1200},
+        ])
+        result, _ = self._call([report])
+        self.assertEqual(result["ceiling_ft"], 1200.0)
+        self.assertEqual(result["cover"], "BKN")
+
+    def test_vertical_visibility_counts(self):
+        report = dict(self.SPECI_1104, clouds=[{"cover": "VV", "base": 300}])
+        result, _ = self._call([report])
+        self.assertEqual(result["ceiling_ft"], 300.0)
+        self.assertEqual(result["cover"], "VV")
+
+    def test_layer_with_null_base_is_ignored(self):
+        report = dict(self.SPECI_1104, clouds=[{"cover": "BKN", "base": None}])
+        result, _ = self._call([report])
+        self.assertIsNotNone(result)
+        self.assertIsNone(result["ceiling_ft"])
+
+    def test_clear_sky_report_has_no_clouds_key(self):
+        report = {"obsTime": self.SPECI_1104["obsTime"], "rawOb": "METAR KRDU CLR"}
+        result, _ = self._call([report])
+        self.assertIsNone(result["ceiling_ft"])
+
+    def test_stale_report_fails_open(self):
+        """A 2-hour-old overcast report must not veto a run now."""
+        result, _ = self._call(
+            [self.SPECI_1104],
+            now=datetime(2026, 10, 3, 17, 15, 0, tzinfo=timezone.utc),
+        )
+        self.assertIsNone(result)
+
+    def test_fail_open_cases(self):
+        cases = {
+            "empty list": [],
+            "non-list body": {"error": "nope"},
+            "null body": None,
+            "missing obsTime": [{"clouds": [{"cover": "OVC", "base": 800}]}],
+            "garbage obsTime": [{"obsTime": "yesterday", "clouds": []}],
+        }
+        for label, body in cases.items():
+            with self.subTest(case=label):
+                result, _ = self._call(body)
+                self.assertIsNone(result, f"{label} must fail open")
+
+    def test_network_error_fails_open(self):
+        import requests
+        result, _ = self._call(
+            side_effect=requests.exceptions.ConnectionError("no route")
+        )
+        self.assertIsNone(result)
+
+    def test_malformed_json_fails_open(self):
+        result, _ = self._call(side_effect=ValueError("not json"))
+        self.assertIsNone(result)
+
+
+class TestGetSkyObservationConfig(unittest.TestCase):
+    """METAR_STATION / METAR_CEILING_FT parsing."""
+
+    def _get(self, **env):
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            return awning_automation.get_sky_observation_config()
+
+    def test_unset_disables_the_veto_with_default_ceiling(self):
+        self.assertEqual(self._get(), (None, 3000.0))
+
+    def test_blank_station_disables_the_veto(self):
+        self.assertEqual(self._get(METAR_STATION="   "), (None, 3000.0))
+
+    def test_station_is_normalized_to_uppercase(self):
+        self.assertEqual(self._get(METAR_STATION=" krdu "), ("KRDU", 3000.0))
+
+    def test_custom_ceiling(self):
+        self.assertEqual(
+            self._get(METAR_STATION="KRDU", METAR_CEILING_FT="2000"), ("KRDU", 2000.0)
+        )
+
+    def test_invalid_values_raise(self):
+        cases = {
+            "station too long": dict(METAR_STATION="KRDUX"),
+            "station too short": dict(METAR_STATION="KR"),
+            "station punctuation": dict(METAR_STATION="KR-U"),
+            "ceiling not a number": dict(METAR_STATION="KRDU", METAR_CEILING_FT="high"),
+            "ceiling zero": dict(METAR_STATION="KRDU", METAR_CEILING_FT="0"),
+            "ceiling negative": dict(METAR_STATION="KRDU", METAR_CEILING_FT="-5"),
+        }
+        for label, env in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(ConfigurationError):
+                    self._get(**env)
+
+    def test_get_thresholds_tuple_shape_is_untouched(self):
+        """main() and 21 tests unpack the 16-tuple positionally; it must not grow."""
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"WIND_SPEED_THRESHOLD_MPH": "15", "MIN_SUN_ALTITUDE_DEG": "15"},
+            clear=True,
+        ):
+            self.assertEqual(len(get_thresholds()), 16)
+
+
+class TestObservedCeilingVeto(unittest.TestCase):
+    """
+    The 2026-10-03 incident: forecast said sunny, the sky said otherwise.
+
+    At 11:15 the primary feed read 15% cloud / DNI 645 / GHI 601 — every sunny
+    layer passed — while KRDU (12 km away) had gone BKN016 at 11:04 and rain was
+    falling at Sanford. The awning stayed open under a darkening sky.
+    """
+
+    # The exact readings the Pi logged at 11:15 on 2026-10-03 (smoothed values
+    # are what the sunny gate actually reads).
+    INCIDENT_WEATHER = dict(
+        shortwave_radiation=601.0,
+        uv_index=4.9,
+        dni=645.0,
+        cloud_cover=15.0,
+        cloud_cover_low=16.0,
+        cloud_cover_mid=3.0,
+        cloud_cover_high=0.0,
+        wind_speed=7.3,
+        temperature=81.2,
+        sunrise="2026-10-03T07:12:00",
+        sunset="2026-10-03T18:56:00",
+    )
+    SUN = dict(azimuth=141.6, altitude=42.6)
+    NOW = datetime(2026, 10, 3, 11, 15, 0, tzinfo=timezone.utc)
+
+    @staticmethod
+    def _obs(ceiling_ft, cover="BKN"):
+        return {
+            "ceiling_ft": ceiling_ft,
+            "cover": cover if ceiling_ft is not None else None,
+            "age_min": 11.0,
+            "raw": "",
+        }
+
+    def _run(self, obs, *, station="KRDU", weather=None, sun=None, **overrides):
+        """Evaluate the incident with fetch_metar_ceiling returning `obs`."""
+        w = _weather(**(weather or self.INCIDENT_WEATHER))
+        if weather is None:
+            # Only the real incident carries its logged smoothed values; a
+            # custom fixture falls back to its own instantaneous readings.
+            w["ghi_smoothed"] = 558.0
+            w["dni_smoothed"] = 600.0
+        kwargs = dict(_THRESHOLDS, altitude_threshold=12.0)
+        kwargs.update(overrides)
+        with unittest.mock.patch.object(
+            awning_automation, "fetch_metar_ceiling", return_value=obs
+        ) as mock_fetch, unittest.mock.patch.object(
+            awning_automation, "is_raining_on_radar", return_value=False
+        ):
+            result = should_open_awning(
+                w,
+                _sun(**(sun or self.SUN)),
+                self.NOW,
+                metar_station=station,
+                **kwargs,
+            )
+        return result, mock_fetch
+
+    def test_control_incident_opens_without_the_veto(self):
+        """Proves the fixture really is 'all green' on forecast alone."""
+        (should_open, reason, conditions), mock_fetch = self._run(None, station=None)
+        self.assertTrue(should_open, reason)
+        mock_fetch.assert_not_called()
+
+    def test_broken_low_deck_closes_the_incident(self):
+        (should_open, reason, conditions), _ = self._run(self._obs(1600.0))
+        self.assertFalse(should_open)
+        self.assertFalse(conditions["sunny"])
+        self.assertIn("OBSERVED CEILING VETO", reason)
+        self.assertIn("BKN016", reason)
+
+    def test_only_sunny_is_affected(self):
+        (_, _, conditions), _ = self._run(self._obs(1600.0))
+        self.assertEqual(
+            [k for k, v in conditions.items() if not v], ["sunny"]
+        )
+
+    def test_scattered_layer_at_1051_stays_open(self):
+        (should_open, reason, _), _ = self._run(self._obs(None))
+        self.assertTrue(should_open, reason)
+
+    def test_high_cirrus_deck_does_not_veto(self):
+        (should_open, reason, _), _ = self._run(self._obs(25000.0, "BKN"))
+        self.assertTrue(should_open, reason)
+
+    def test_broken_cloud_at_6000_ft_does_not_veto(self):
+        """08-16 12:33 afternoon (BKN060) is a day the operator wanted open."""
+        (should_open, reason, _), _ = self._run(self._obs(6000.0, "BKN"))
+        self.assertTrue(should_open, reason)
+
+    def test_ceiling_boundary_is_strict(self):
+        (open_at, _, _), _ = self._run(self._obs(3000.0, "OVC"))
+        (open_below, _, _), _ = self._run(self._obs(2900.0, "OVC"))
+        self.assertTrue(open_at)
+        self.assertFalse(open_below)
+
+    def test_ceiling_is_configurable(self):
+        (default_open, _, _), _ = self._run(self._obs(4000.0, "OVC"))
+        (raised_open, _, _), _ = self._run(
+            self._obs(4000.0, "OVC"), metar_ceiling_ft=5000.0
+        )
+        self.assertTrue(default_open)
+        self.assertFalse(raised_open)
+
+    def test_unavailable_observation_fails_open(self):
+        (should_open, reason, _), _ = self._run(None)
+        self.assertTrue(should_open, reason)
+
+    def test_raising_fetch_fails_open(self):
+        w = _weather(**self.INCIDENT_WEATHER)
+        with unittest.mock.patch.object(
+            awning_automation, "fetch_metar_ceiling", side_effect=RuntimeError("boom")
+        ), unittest.mock.patch.object(
+            awning_automation, "is_raining_on_radar", return_value=False
+        ):
+            should_open, reason, _ = should_open_awning(
+                w, _sun(**self.SUN), self.NOW, metar_station="KRDU",
+                **dict(_THRESHOLDS, altitude_threshold=12.0),
+            )
+        self.assertTrue(should_open, reason)
+
+    def test_no_fetch_when_station_unset(self):
+        _, mock_fetch = self._run(self._obs(1600.0), station=None)
+        mock_fetch.assert_not_called()
+
+    def test_no_fetch_when_forecast_already_not_sunny(self):
+        dark = dict(self.INCIDENT_WEATHER, shortwave_radiation=50.0, uv_index=0.5,
+                    dni=0.0, cloud_cover=100.0)
+        (should_open, _, conditions), mock_fetch = self._run(
+            self._obs(None), weather=dark
+        )
+        self.assertFalse(conditions["sunny"])
+        mock_fetch.assert_not_called()
+
+    def test_no_fetch_when_sun_gates_closed(self):
+        """Azimuth 300 is off the window: nothing to veto, so spend no request."""
+        _, mock_fetch = self._run(
+            self._obs(1600.0), sun=dict(azimuth=300.0, altitude=20.0)
+        )
+        mock_fetch.assert_not_called()
+
+    def test_clear_observation_never_opens_a_closed_awning(self):
+        """Close-only: a perfect sky cannot rescue a forecast that says dark."""
+        dark = dict(self.INCIDENT_WEATHER, shortwave_radiation=50.0, uv_index=0.5,
+                    dni=0.0, cloud_cover=100.0)
+        w = _weather(**dark)
+        with unittest.mock.patch.object(
+            awning_automation, "fetch_metar_ceiling", return_value=self._obs(None)
+        ), unittest.mock.patch.object(
+            awning_automation, "is_raining_on_radar", return_value=False
+        ):
+            should_open, _, conditions = should_open_awning(
+                w, _sun(**self.SUN), self.NOW, metar_station="KRDU",
+                **dict(_THRESHOLDS, altitude_threshold=12.0),
+            )
+        self.assertFalse(should_open)
+        self.assertFalse(conditions["sunny"])
+
+    def test_veto_beats_the_cross_model_rescue(self):
+        """
+        An observation outranks a model: when the cross-model rescue engages on
+        a collapsed primary feed but the airport reports a low overcast deck,
+        the awning still closes.
+        """
+        collapsed = dict(
+            self.INCIDENT_WEATHER, shortwave_radiation=150.0, uv_index=2.0,
+            dni=0.0, cloud_cover=100.0, cloud_cover_low=0.0, cloud_cover_high=100.0,
+        )
+        crosscheck = {
+            "dni": {"ecmwf_ifs025": 574.0, "icon_seamless": 754.0},
+            "ghi": {"ecmwf_ifs025": None, "icon_seamless": None},
+            "slot_time": "2026-10-03T11:15",
+        }
+        w = _weather(**collapsed)
+        kwargs = dict(_THRESHOLDS, altitude_threshold=12.0, lat=35.778, lon=-78.838)
+
+        def run(obs):
+            with unittest.mock.patch.object(
+                awning_automation, "fetch_crosscheck_irradiance", return_value=crosscheck
+            ), unittest.mock.patch.object(
+                awning_automation, "fetch_metar_ceiling", return_value=obs
+            ), unittest.mock.patch.object(
+                awning_automation, "is_raining_on_radar", return_value=False
+            ):
+                return should_open_awning(
+                    w, _sun(**self.SUN), self.NOW, metar_station="KRDU", **kwargs
+                )
+
+        rescued_open, rescued_reason, _ = run(self._obs(None))
+        self.assertTrue(rescued_open, rescued_reason)  # control: rescue engages
+        vetoed_open, vetoed_reason, _ = run(self._obs(1600.0))
+        self.assertFalse(vetoed_open)
+        self.assertIn("OBSERVED CEILING VETO", vetoed_reason)
+
+    def test_logs_a_sky_observation_line_every_run(self):
+        with self.assertLogs(awning_automation.logger, level="INFO") as logs:
+            self._run(self._obs(1600.0))
+            self._run(None, station=None)
+        lines = [m for m in logs.output if "Sky observation:" in m]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("VETO", lines[0])
+        self.assertIn("disabled", lines[1])
+
+
+class TestObservedCeilingVetoCompositionRoot(unittest.TestCase):
+    """
+    Drive the real main() on the 2026-10-03 11:15 numbers.
+
+    The unit tests above pass metar_station straight into should_open_awning(),
+    so they would stay green even if main() never read METAR_STATION or never
+    forwarded it — and a --dry-run cannot exercise that wiring on the Pi's
+    behalf. This is the test that catches a missing kwarg.
+    """
+
+    def _run(self, env_extra, metar_result):
+        import sys
+        from unittest.mock import patch, MagicMock
+
+        mock_controller = MagicMock()
+        mock_controller.get_state.side_effect = [1, 0]  # open before the run
+        mock_log_path = MagicMock()
+        mock_log_path.parent = MagicMock()
+
+        weather = _weather(
+            shortwave_radiation=601.0, uv_index=4.9, dni=645.0, cloud_cover=15.0,
+            cloud_cover_low=16.0, cloud_cover_mid=3.0, cloud_cover_high=0.0,
+            wind_speed=7.3, temperature=81.2,
+            sunrise="2026-10-03T07:12:00", sunset="2026-10-03T18:56:00",
+        )
+        weather["time"] = "2026-10-03T11:15:00"
+        weather["ghi_smoothed"] = 558.0
+        weather["dni_smoothed"] = 600.0
+
+        # Deliberately NOT patching get_thresholds or get_sky_observation_config.
+        env = {"WIND_SPEED_THRESHOLD_MPH": "15", "MIN_SUN_ALTITUDE_DEG": "12"}
+        env.update(env_extra)
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(sys, "argv", ["awning_automation.py"]), \
+             patch.object(awning_automation, "setup_logging", return_value=mock_log_path), \
+             patch.object(awning_automation, "load_location_config", return_value=(35.778, -78.838)), \
+             patch.object(awning_automation, "load_telegram_config", return_value=(None, None)), \
+             patch.object(awning_automation, "collect_weather_measurements", return_value=weather), \
+             patch.object(awning_automation, "calculate_sun_position",
+                          return_value={"azimuth": 141.6, "altitude": 42.6}), \
+             patch.object(awning_automation, "is_raining_on_radar", return_value=False), \
+             patch.object(awning_automation, "fetch_metar_ceiling",
+                          return_value=metar_result) as mock_fetch, \
+             patch.object(awning_automation, "create_controller_from_env",
+                          return_value=mock_controller):
+            awning_automation.main()
+        return mock_controller, mock_fetch
+
+    BROKEN_DECK = {"ceiling_ft": 1600.0, "cover": "BKN", "age_min": 11.0, "raw": ""}
+
+    def test_main_closes_on_observed_low_deck(self):
+        controller, mock_fetch = self._run({"METAR_STATION": "KRDU"}, self.BROKEN_DECK)
+        mock_fetch.assert_called_once_with("KRDU")
+        controller.close.assert_called_once()
+        controller.open.assert_not_called()
+
+    def test_main_stays_open_when_station_unset(self):
+        controller, mock_fetch = self._run({}, self.BROKEN_DECK)
+        mock_fetch.assert_not_called()
+        controller.open.assert_called_once()
+        controller.close.assert_not_called()
+
+    def test_main_honors_a_raised_ceiling_setting(self):
+        """METAR_CEILING_FT must reach the gate: 1600 ft is not below 1000."""
+        controller, _ = self._run(
+            {"METAR_STATION": "KRDU", "METAR_CEILING_FT": "1000"}, self.BROKEN_DECK
+        )
+        controller.open.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
