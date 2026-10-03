@@ -5282,7 +5282,7 @@ class TestObservedCeilingVetoNotification(unittest.TestCase):
                 **dict(_THRESHOLDS, altitude_threshold=12.0),
             )
         self.assertFalse(should_open)
-        self.assertEqual(sky_out, ["KRDU reports BKN016"])
+        self.assertEqual(sky_out, ["Low cloud deck — KRDU reports BKN016"])
         self.assertEqual(rain_out, [])
 
     def test_sky_out_param_stays_empty_without_a_veto(self):
@@ -5643,6 +5643,508 @@ class TestFetchWeatherGusts(unittest.TestCase):
         del body["current"]["wind_gusts_10m"]
         weather, _ = self._fetch(body)
         self.assertIsNone(weather["wind_gusts_10m"])
+
+
+class TestFetchEconet(unittest.TestCase):
+    """fetch_econet() — parsing the real REED payload, freshness, fallback, fail-open."""
+
+    # Trimmed from the live REED response of 2026-10-03 11:55 EDT.
+    REED_1155 = {
+        "station": "REED", "active": 1, "ob_et": "2026-10-03 11:55:00",
+        "ws": 1, "gust": 4, "wd": 94, "precip": 0, "sr": 44.9,
+        "sr_clear_sky": 740.44, "sr_percent": 6, "hours": 0, "mins": 2,
+    }
+
+    def _fetch(self, responses, stations=("REED", "LAKE", "CAMP")):
+        """`responses` maps station -> payload | Exception; records the calls."""
+        calls = []
+
+        def fake_get(url, params=None, headers=None, timeout=None):
+            calls.append((url, params, headers, timeout))
+            result = responses[params["station"]]
+            if isinstance(result, Exception):
+                raise result
+            resp = unittest.mock.Mock()
+            resp.raise_for_status.return_value = None
+            if isinstance(result, ValueError):
+                resp.json.side_effect = result
+            else:
+                resp.json.return_value = result
+            return resp
+
+        with unittest.mock.patch.object(awning_automation.requests, "get", side_effect=fake_get):
+            return awning_automation.fetch_econet(stations), calls
+
+    def test_parses_the_real_payload(self):
+        reading, calls = self._fetch({"REED": self.REED_1155})
+        self.assertEqual(reading["station"], "REED")
+        self.assertAlmostEqual(reading["sr"], 44.9)
+        self.assertAlmostEqual(reading["clear_sky"], 740.44)
+        self.assertEqual(reading["percent"], 6)
+        self.assertEqual((reading["ws"], reading["gust"], reading["precip"]), (1, 4, 0))
+        self.assertEqual(reading["age_min"], 2)
+        self.assertEqual(len(calls), 1, "stops at the first fresh station")
+
+    def test_request_shape(self):
+        _, calls = self._fetch({"REED": self.REED_1155})
+        url, params, headers, timeout = calls[0]
+        self.assertEqual(url, "https://econet.climate.ncsu.edu/m/current/currentconditions.php")
+        self.assertEqual(params["station"], "REED")
+        self.assertIn("req", params, "cache-buster: the endpoint sends max-age=14400")
+        self.assertIn("awning", headers["User-Agent"])
+        self.assertLessEqual(timeout, 10)
+
+    def test_falls_through_unusable_stations_in_order(self):
+        import requests
+        stale = dict(self.REED_1155, station="LAKE", hours=0, mins=45)
+        cases = {
+            "stale": stale,
+            "unknown station answers []": [],
+            "inactive": dict(self.REED_1155, active=0),
+            "null pyranometer": dict(self.REED_1155, sr=None),
+            "missing age": {k: v for k, v in self.REED_1155.items() if k != "mins"},
+            "network error": requests.exceptions.ConnectionError("down"),
+            "bad json": ValueError("not json"),
+        }
+        good = dict(self.REED_1155, station="CAMP", sr=107.7, sr_percent=14)
+        for label, bad in cases.items():
+            with self.subTest(case=label):
+                reading, calls = self._fetch({"REED": bad, "LAKE": bad, "CAMP": good})
+                self.assertEqual(reading["station"], "CAMP")
+                self.assertEqual([c[1]["station"] for c in calls], ["REED", "LAKE", "CAMP"])
+
+    def test_returns_none_when_nothing_is_usable(self):
+        import requests
+        reading, _ = self._fetch({"REED": [], "LAKE": requests.exceptions.Timeout("slow"),
+                                  "CAMP": dict(self.REED_1155, mins=30)})
+        self.assertIsNone(reading)
+
+    def test_freshness_boundary(self):
+        self.assertIsNotNone(self._fetch({"REED": dict(self.REED_1155, mins=20)})[0])
+        self.assertIsNone(self._fetch({"REED": dict(self.REED_1155, mins=21)}, ("REED",))[0])
+        self.assertIsNone(self._fetch({"REED": dict(self.REED_1155, hours=1, mins=0)}, ("REED",))[0],
+                          "hours must count, not just minutes")
+
+    def test_percent_is_computed_when_the_station_omits_it(self):
+        for omitted in (None, "n/a"):
+            with self.subTest(sr_percent=omitted):
+                payload = dict(self.REED_1155, sr=370.22, sr_percent=omitted)
+                reading, _ = self._fetch({"REED": payload}, ("REED",))
+                self.assertAlmostEqual(reading["percent"], 50.0, places=1)
+
+    def test_garbage_numbers_are_not_trusted(self):
+        for label, bad in {"bool": True, "NaN": float("nan"), "text": "bright"}.items():
+            with self.subTest(case=label):
+                reading, _ = self._fetch({"REED": dict(self.REED_1155, sr=bad)}, ("REED",))
+                self.assertIsNone(reading)
+
+    def test_missing_wind_or_rain_fields_do_not_discard_the_sun_reading(self):
+        payload = {k: v for k, v in self.REED_1155.items() if k not in ("ws", "gust", "precip")}
+        reading, _ = self._fetch({"REED": payload}, ("REED",))
+        self.assertIsNotNone(reading)
+        self.assertIsNone(reading["ws"])
+        self.assertIsNone(reading["precip"])
+
+    def test_no_stations_means_no_request(self):
+        for stations in ((), None, []):
+            with unittest.mock.patch.object(awning_automation.requests, "get") as mock_get:
+                self.assertIsNone(awning_automation.fetch_econet(stations))
+                mock_get.assert_not_called()
+
+
+class TestEvaluateSunshine(unittest.TestCase):
+    """evaluate_sunshine() — measured share of clear sky, close-only."""
+
+    @staticmethod
+    def _reading(percent, sr=100.0, clear=740.0, **extra):
+        r = {"station": "REED", "sr": sr, "clear_sky": clear, "percent": percent,
+             "ws": 1.0, "gust": 4.0, "precip": 0.0, "age_min": 2.0}
+        r.update(extra)
+        return r
+
+    def test_2026_10_03_reading_vetoes(self):
+        verdict, line = awning_automation.evaluate_sunshine(self._reading(6, sr=44.9), 50.0)
+        self.assertIs(verdict, False)
+        self.assertIn("VETO", line)
+        self.assertIn("45 W/m² = 6% of clear sky", line)
+
+    def test_the_operators_labelled_open_hours_do_not_veto(self):
+        for pct in (63, 80, 94, 99, 104):          # hours the operator wanted OPEN
+            with self.subTest(percent=pct):
+                self.assertIs(awning_automation.evaluate_sunshine(self._reading(pct), 50.0)[0], True)
+
+    def test_the_operators_labelled_closed_hours_veto(self):
+        for pct in (26, 30, 33, 37):               # hours the operator wanted CLOSED
+            with self.subTest(percent=pct):
+                self.assertIs(awning_automation.evaluate_sunshine(self._reading(pct), 50.0)[0], False)
+
+    def test_boundary_is_inclusive_of_the_threshold(self):
+        self.assertIs(awning_automation.evaluate_sunshine(self._reading(50), 50.0)[0], True)
+        self.assertIs(awning_automation.evaluate_sunshine(self._reading(49.9), 50.0)[0], False)
+
+    def test_dim_light_gives_no_verdict(self):
+        """Near dawn/dusk both numbers are tiny; the ratio is noise."""
+        verdict, line = awning_automation.evaluate_sunshine(
+            self._reading(5, sr=4.0, clear=80.0), 50.0
+        )
+        self.assertIsNone(verdict)
+        self.assertIn("too dim", line)
+        self.assertIsNone(awning_automation.evaluate_sunshine(self._reading(5, clear=149.9), 50.0)[0])
+        self.assertIs(awning_automation.evaluate_sunshine(self._reading(5, clear=150.0), 50.0)[0], False)
+
+    def test_no_reading_gives_no_verdict(self):
+        self.assertEqual(awning_automation.evaluate_sunshine(None, 50.0), (None, "unavailable"))
+
+    def test_line_logs_wind_and_rain_for_calibration(self):
+        _, line = awning_automation.evaluate_sunshine(self._reading(80, precip=0.02), 50.0)
+        self.assertIn("wind 1/4 mph", line)
+        self.assertIn("rain gauge 0.02", line)
+
+
+class TestGetSunObservationConfig(unittest.TestCase):
+    def _get(self, **env):
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            return awning_automation.get_sun_observation_config()
+
+    def test_default_is_off(self):
+        self.assertEqual(self._get(), ([], 50.0))
+
+    def test_station_list_is_split_trimmed_and_uppercased(self):
+        self.assertEqual(self._get(ECONET_STATIONS=" reed, Lake ,CAMP,, ")[0], ["REED", "LAKE", "CAMP"])
+
+    def test_percent_parsing(self):
+        self.assertEqual(self._get(MIN_SUN_PERCENT_CLEAR_SKY=" 35 ")[1], 35.0)
+        self.assertEqual(self._get(MIN_SUN_PERCENT_CLEAR_SKY="100")[1], 100.0)
+
+    def test_invalid_values_raise(self):
+        cases = {"bad station": dict(ECONET_STATIONS="RE ED"), "punctuation": dict(ECONET_STATIONS="REED;LAKE"),
+                 "too long": dict(ECONET_STATIONS="ABCDEFGHI"), "text pct": dict(MIN_SUN_PERCENT_CLEAR_SKY="half"),
+                 "zero pct": dict(MIN_SUN_PERCENT_CLEAR_SKY="0"), "negative": dict(MIN_SUN_PERCENT_CLEAR_SKY="-5"),
+                 "over 100": dict(MIN_SUN_PERCENT_CLEAR_SKY="101")}
+        for label, env in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(ConfigurationError):
+                    self._get(**env)
+
+
+class TestObservationsConfirmClear(unittest.TestCase):
+    CEILING, PCT = 3000.0, 50.0
+
+    @staticmethod
+    def _metar(ceiling=None, cover=None, wx=None, age=10.0):
+        return {"ceiling_ft": ceiling, "cover": cover, "wx": wx, "age_min": age}
+
+    @staticmethod
+    def _econet(percent=90, precip=0.0, clear=740.0):
+        return {"station": "REED", "sr": percent * clear / 100, "clear_sky": clear,
+                "percent": percent, "precip": precip, "age_min": 3.0, "ws": 1, "gust": 2}
+
+    def _check(self, metar=None, econet=None):
+        return awning_automation.observations_confirm_clear(metar, econet, self.CEILING, self.PCT)
+
+    def test_nothing_observed_cannot_contradict(self):
+        self.assertTrue(self._check()[0])
+
+    def test_agreeing_observations_confirm(self):
+        self.assertTrue(self._check(self._metar(), self._econet(90))[0])
+        self.assertTrue(self._check(self._metar(25000.0, "BKN"), None)[0], "high cirrus is not a contradiction")
+
+    def test_each_kind_of_contradiction(self):
+        cases = {
+            "low deck": (self._metar(1600.0, "BKN"), None, "BKN016"),
+            "drizzle at the airport": (self._metar(wx="-DZ"), None, "-DZ"),
+            "rain at the airport": (self._metar(wx="+TSRA"), None, "+TSRA"),
+            "rain gauge": (None, self._econet(90, precip=0.02), "rain gauge"),
+            "dark sky measured": (None, self._econet(6), "6% of clear sky"),
+        }
+        for label, (metar, econet, expect) in cases.items():
+            with self.subTest(case=label):
+                ok, why = self._check(metar, econet)
+                self.assertFalse(ok)
+                self.assertIn(expect, why)
+
+    def test_haze_and_mist_are_not_precipitation(self):
+        for wx in ("BR", "HZ", "FG", "FU"):
+            with self.subTest(wx=wx):
+                self.assertTrue(self._check(self._metar(wx=wx))[0])
+
+    def test_a_stale_airport_weather_report_is_not_held_against_the_sky(self):
+        self.assertTrue(self._check(self._metar(wx="-DZ", age=75.0))[0])
+
+    def test_dim_light_does_not_count_as_a_dark_sky(self):
+        self.assertTrue(self._check(None, self._econet(5, clear=100.0))[0])
+
+
+class TestRadarVetoCorroboration(unittest.TestCase):
+    """
+    The clear-sky radar veto must not let a FORECAST overrule an OBSERVATION.
+
+    2026-10-03 11:15: the model said DNI 645 / 16% low cloud (the veto wants
+    >= 650 / < 15%) beneath a real 1,600 ft deck with rain nearby. The bars were
+    missed by a whisker; one slightly cleaner forecast and radar's correct hit
+    would have been thrown away.
+    """
+
+    CLEAR_MODEL = dict(
+        precipitation=0.0, hourly_precip_prob=0, minutely_15_precip=[0, 0, 0], weather_code=0,
+        dni=700.0, cloud_cover_low=5.0, cloud_cover_mid=0.0,
+    )
+
+    def _gate(self, veto_check=None, radar=True):
+        attribution = []
+        with unittest.mock.patch.object(awning_automation, "is_raining_on_radar", return_value=radar):
+            result = evaluate_rain_gate(
+                dict(self.CLEAR_MODEL), 20, lat=35.778, lon=-78.838,
+                _attribution=attribution, veto_check=veto_check,
+            )
+        return result, attribution
+
+    def test_original_behavior_is_unchanged_without_a_check(self):
+        result, attribution = self._gate(None)
+        self.assertTrue(result, "model-clear sky still vetoes the radar hit")
+        self.assertEqual(attribution, [])
+
+    def test_a_confirming_check_keeps_the_veto(self):
+        result, _ = self._gate(lambda: (True, "observations do not contradict clear sky"))
+        self.assertTrue(result)
+
+    def test_a_contradicting_check_withholds_the_veto_and_closes(self):
+        with self.assertLogs(awning_automation.logger, level="INFO") as logs:
+            result, attribution = self._gate(lambda: (False, "airport reports BKN016"))
+        self.assertFalse(result)
+        self.assertEqual(attribution, ["radar(NEXRAD)"])
+        text = "\n".join(logs.output)
+        self.assertIn("NOT vetoed", text)
+        self.assertIn("airport reports BKN016", text)
+
+    def test_a_broken_check_keeps_the_original_veto(self):
+        def boom():
+            raise RuntimeError("obs bug")
+        result, _ = self._gate(boom)
+        self.assertTrue(result, "an observation bug must not change the gate's verdict")
+
+    def test_the_check_is_only_consulted_when_a_veto_is_actually_in_play(self):
+        calls = []
+        def check():
+            calls.append(1)
+            return True, ""
+        self._gate(check, radar=False)                       # no radar hit
+        self.assertEqual(calls, [])
+        with unittest.mock.patch.object(awning_automation, "is_raining_on_radar", return_value=True):
+            cloudy = dict(self.CLEAR_MODEL, cloud_cover_low=60.0, dni=100.0)   # veto conditions not met
+            evaluate_rain_gate(cloudy, 20, lat=35.778, lon=-78.838, veto_check=check)
+        self.assertEqual(calls, [], "cloudy model: radar already closes, nothing to corroborate")
+
+
+class TestSunshineVeto(unittest.TestCase):
+    """Measured sunshine wired through should_open_awning(), on the 2026-10-03 numbers."""
+
+    NOW = TestObservedCeilingVeto.NOW
+    SUN = TestObservedCeilingVeto.SUN
+    BASE = dict(TestObservedCeilingVeto.INCIDENT_WEATHER)
+
+    @staticmethod
+    def _reed(percent=6, sr=44.9, clear=740.44, **extra):
+        r = {"station": "REED", "sr": sr, "clear_sky": clear, "percent": percent,
+             "ws": 1.0, "gust": 4.0, "precip": 0.0, "age_min": 2.0}
+        r.update(extra)
+        return r
+
+    @staticmethod
+    def _metar(**extra):
+        r = {"ceiling_ft": None, "cover": None, "wind_mph": 8.0, "gust_mph": None,
+             "wx": None, "age_min": 10.0, "raw": ""}
+        r.update(extra)
+        return r
+
+    def _run(self, econet=None, metar=None, *, stations=("REED",), station="KRDU",
+             weather=None, sun=None, radar=False, out=None, **overrides):
+        w = _weather(**(weather or self.BASE))
+        if weather is None:
+            w["ghi_smoothed"], w["dni_smoothed"] = 558.0, 600.0
+        # Coordinates are what make should_open_awning() consult the radar at all.
+        kwargs = dict(_THRESHOLDS, altitude_threshold=12.0, lat=35.778, lon=-78.838)
+        kwargs.update(overrides)
+        with unittest.mock.patch.object(awning_automation, "fetch_econet", return_value=econet) as fe, \
+             unittest.mock.patch.object(awning_automation, "fetch_metar", return_value=metar) as fm, \
+             unittest.mock.patch.object(awning_automation, "fetch_crosscheck_irradiance", return_value=None), \
+             unittest.mock.patch.object(awning_automation, "is_raining_on_radar", return_value=radar):
+            result = should_open_awning(
+                w, _sun(**(sun or self.SUN)), self.NOW, metar_station=station,
+                econet_stations=list(stations) if stations else None, _sky_veto=out, **kwargs,
+            )
+        return result, fe, fm
+
+    def test_control_clear_measured_sky_opens(self):
+        (should_open, reason, _), _, _ = self._run(self._reed(95, sr=700.0))
+        self.assertTrue(should_open, reason)
+
+    def test_dark_measured_sky_closes_despite_a_bright_forecast(self):
+        out = []
+        (should_open, reason, conditions), _, _ = self._run(self._reed(6), out=out)
+        self.assertFalse(should_open)
+        self.assertEqual([k for k, v in conditions.items() if not v], ["sunny"])
+        self.assertIn("OBSERVED SUNSHINE VETO", reason)
+        self.assertEqual(out, ["Low sunshine — REED measures 45 W/m² (6% of clear sky)"])
+
+    def test_threshold_is_configurable(self):
+        (default_open, _, _), _, _ = self._run(self._reed(40, sr=296.0))
+        (loose_open, _, _), _, _ = self._run(self._reed(40, sr=296.0), min_sun_percent=30.0)
+        self.assertFalse(default_open)
+        self.assertTrue(loose_open)
+
+    def test_unavailable_or_dim_readings_leave_the_forecast_alone(self):
+        for label, reading in {"none": None, "dawn": self._reed(5, sr=4.0, clear=80.0)}.items():
+            with self.subTest(case=label):
+                (should_open, reason, _), _, _ = self._run(reading)
+                self.assertTrue(should_open, reason)
+
+    def test_not_fetched_when_off_or_when_it_cannot_matter(self):
+        _, fe, _ = self._run(self._reed(6), stations=None)
+        fe.assert_not_called()
+        dark = dict(self.BASE, shortwave_radiation=50.0, uv_index=0.5, dni=0.0, cloud_cover=100.0)
+        _, fe, _ = self._run(self._reed(6), weather=dark)
+        fe.assert_not_called()
+        _, fe, _ = self._run(self._reed(6), sun=dict(azimuth=300.0, altitude=20.0))
+        fe.assert_not_called()
+
+    def test_close_only_a_perfect_measurement_never_opens_a_dark_forecast(self):
+        dark = dict(self.BASE, shortwave_radiation=50.0, uv_index=0.5, dni=0.0, cloud_cover=100.0)
+        (should_open, _, conditions), _, _ = self._run(self._reed(100, sr=740.0), weather=dark)
+        self.assertFalse(should_open)
+        self.assertFalse(conditions["sunny"])
+
+    def test_both_vetoes_are_reported(self):
+        out = []
+        (should_open, _, _), _, _ = self._run(
+            self._reed(6), self._metar(ceiling_ft=1600.0, cover="BKN"), out=out
+        )
+        self.assertFalse(should_open)
+        self.assertEqual(len(out), 2)
+        self.assertTrue(out[0].startswith("Low cloud deck"))
+        self.assertTrue(out[1].startswith("Low sunshine"))
+
+    def test_each_source_is_fetched_once_per_run(self):
+        _, fe, fm = self._run(self._reed(95, sr=700.0), self._metar(), radar=True,
+                              weather=dict(self.BASE, dni=700.0, cloud_cover_low=5.0))
+        self.assertEqual((fe.call_count, fm.call_count), (1, 1))
+
+    def test_station_wind_joins_the_wind_gate(self):
+        alert = []
+        w = _weather(**self.BASE)
+        with unittest.mock.patch.object(awning_automation, "fetch_econet",
+                                        return_value=self._reed(95, sr=700.0, ws=9.0, gust=31.0)), \
+             unittest.mock.patch.object(awning_automation, "is_raining_on_radar", return_value=False):
+            should_open, reason, conditions = should_open_awning(
+                w, _sun(**self.SUN), self.NOW, econet_stations=["REED"],
+                _wind_alert=alert, **dict(_THRESHOLDS, altitude_threshold=12.0),
+            )
+        self.assertFalse(should_open)
+        self.assertEqual([k for k, v in conditions.items() if not v], ["calm"])
+        self.assertEqual(alert, ["gusts 31 mph (REED)"])
+
+    def test_every_run_logs_a_sun_observation_line(self):
+        with self.assertLogs(awning_automation.logger, level="INFO") as logs:
+            self._run(self._reed(6))
+            self._run(None, stations=None)
+        lines = [m for m in logs.output if "Sun observation:" in m]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("VETO", lines[0])
+        self.assertIn("rain gauge", lines[0])
+        self.assertIn("disabled", lines[1])
+
+    # --- the radar veto no longer lets the forecast overrule the observations ---
+    CLEAR_FORECAST = dict(TestObservedCeilingVeto.INCIDENT_WEATHER,
+                          dni=700.0, cloud_cover=5.0, cloud_cover_low=5.0, cloud_cover_mid=0.0,
+                          cloud_cover_high=0.0)
+
+    def test_radar_hit_is_still_vetoed_when_observations_agree_it_is_clear(self):
+        (should_open, reason, _), _, _ = self._run(
+            self._reed(95, sr=700.0), self._metar(), radar=True, weather=self.CLEAR_FORECAST
+        )
+        self.assertTrue(should_open, reason)
+
+    def test_radar_hit_counts_when_the_airport_reports_drizzle(self):
+        (should_open, reason, conditions), _, _ = self._run(
+            None, self._metar(wx="-DZ"), radar=True, weather=self.CLEAR_FORECAST
+        )
+        self.assertFalse(should_open)
+        self.assertFalse(conditions["no_rain"])
+        self.assertIn("radar", reason)
+
+    def test_radar_hit_counts_when_the_station_rain_gauge_is_wet(self):
+        (should_open, _, conditions), _, _ = self._run(
+            self._reed(95, sr=700.0, precip=0.02), None, radar=True, weather=self.CLEAR_FORECAST
+        )
+        self.assertFalse(should_open)
+        self.assertFalse(conditions["no_rain"])
+
+    def test_radar_hit_counts_under_a_measured_dark_sky(self):
+        (should_open, _, conditions), _, _ = self._run(
+            self._reed(6), None, radar=True, weather=self.CLEAR_FORECAST
+        )
+        self.assertFalse(should_open)
+        self.assertFalse(conditions["no_rain"])
+
+    def test_without_any_configured_observation_the_original_veto_stands(self):
+        (should_open, reason, _), fe, fm = self._run(
+            None, None, stations=None, station=None, radar=True, weather=self.CLEAR_FORECAST
+        )
+        self.assertTrue(should_open, reason)
+        fe.assert_not_called()
+        fm.assert_not_called()
+
+
+class TestSunshineCompositionRoot(unittest.TestCase):
+    """Real main() with ECONET_STATIONS set: wiring, config and the Telegram message."""
+
+    def _run(self, env_extra, econet):
+        import sys
+        from unittest.mock import patch, MagicMock
+
+        controller = MagicMock()
+        controller.get_state.side_effect = [1, 0]
+        log_path = MagicMock()
+        log_path.parent = MagicMock()
+        weather = _weather(**TestObservedCeilingVeto.INCIDENT_WEATHER)
+        weather["time"] = "2026-10-03T11:55:00"
+        weather["ghi_smoothed"], weather["dni_smoothed"] = 558.0, 600.0
+        env = {"WIND_SPEED_THRESHOLD_MPH": "15", "MIN_SUN_ALTITUDE_DEG": "12"}
+        env.update(env_extra)
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(sys, "argv", ["awning_automation.py"]), \
+             patch.object(awning_automation, "setup_logging", return_value=log_path), \
+             patch.object(awning_automation, "load_location_config", return_value=(35.778, -78.838)), \
+             patch.object(awning_automation, "load_telegram_config", return_value=("t", "c")), \
+             patch.object(awning_automation, "collect_weather_measurements", return_value=weather), \
+             patch.object(awning_automation, "calculate_sun_position",
+                          return_value={"azimuth": 141.6, "altitude": 42.6}), \
+             patch.object(awning_automation, "is_raining_on_radar", return_value=False), \
+             patch.object(awning_automation, "fetch_econet", return_value=econet) as fe, \
+             patch.object(awning_automation, "create_controller_from_env", return_value=controller), \
+             patch.object(awning_automation, "send_telegram_notification") as tg:
+            awning_automation.main()
+        return controller, tg, fe
+
+    REED = {"station": "REED", "sr": 44.9, "clear_sky": 740.44, "percent": 6,
+            "ws": 1.0, "gust": 4.0, "precip": 0.0, "age_min": 2.0}
+
+    def test_main_closes_on_a_dark_measured_sky_and_says_so(self):
+        controller, tg, fe = self._run({"ECONET_STATIONS": "reed, lake"}, self.REED)
+        fe.assert_called_once_with(["REED", "LAKE"])
+        controller.close.assert_called_once()
+        sent = tg.call_args[0][2]
+        self.assertIn("Low sunshine — REED measures 45 W/m² (6% of clear sky)", sent)
+        self.assertNotIn("Not enough sun", sent)
+
+    def test_main_stays_open_when_the_feature_is_off(self):
+        controller, _, fe = self._run({}, self.REED)
+        fe.assert_not_called()
+        controller.open.assert_called_once()
+
+    def test_min_percent_setting_reaches_the_gate(self):
+        controller, _, _ = self._run({"ECONET_STATIONS": "REED", "MIN_SUN_PERCENT_CLEAR_SKY": "5"}, self.REED)
+        controller.open.assert_called_once()
 
 
 class TestFailSafeClose(unittest.TestCase):

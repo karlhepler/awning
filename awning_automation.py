@@ -462,6 +462,22 @@ _METAR_BLOCKING_COVERS = ("BKN", "OVC", "VV")
 _METAR_WIND_MAX_AGE_MIN = 60
 _KT_TO_MPH = 1.15078
 
+# Measured-sunshine veto (NC State ECONet) — see fetch_econet(). Below this share
+# of the clear-sky value the sun is blocked. Calibrated on the operator's labelled
+# days (USCRN Durham measured / pvlib clear-sky): hours wanted CLOSED read 26-37%,
+# hours wanted OPEN read 63-104% (11 hours, small sample). 50 splits them.
+DEFAULT_MIN_SUN_PERCENT = 50.0
+_ECONET_URL = "https://econet.climate.ncsu.edu/m/current/currentconditions.php"
+_ECONET_TIMEOUT_S = 5
+# The station relays every ~5 minutes, so a healthy reading is under ~10 minutes old.
+_ECONET_MAX_AGE_MIN = 20
+# Near dawn/dusk both measured and clear-sky values are tiny and their ratio is
+# noise; below this clear-sky value no verdict is given (the forecast decides).
+_ECONET_MIN_CLEAR_SKY_WM2 = 150.0
+_ECONET_USER_AGENT = "awning-automation (personal home use; github.com/karlhepler/awning)"
+# METAR present-weather codes that mean precipitation is actually falling.
+_METAR_PRECIP_CODES = ("RA", "DZ", "SN", "SG", "SH", "TS", "GR", "GS", "PL", "IC", "UP")
+
 # Gust gate — see the 2026-09-05 note on evaluate_wind(). 25 mph is a default,
 # not a rating: the awning's own wind sensor is installer-programmed and its
 # trigger speed is not published (Skyview/Dooya), so read it off the sensor.
@@ -908,6 +924,39 @@ def get_sky_observation_config() -> tuple[Optional[str], float]:
         )
 
     return (station or None), ceiling_ft
+
+
+def get_sun_observation_config() -> tuple[list, float]:
+    """
+    Read the measured-sunshine settings from the environment.
+
+    ECONET_STATIONS: comma-separated NC State ECONet station ids in order of
+    preference, e.g. "REED,LAKE,CAMP" (the first with a fresh reading wins).
+    Unset or blank turns the feature off. MIN_SUN_PERCENT_CLEAR_SKY (default 50):
+    below this share of the clear-sky value the sun counts as blocked.
+    """
+    raw = os.getenv("ECONET_STATIONS", "")
+    stations = [t.strip().upper() for t in raw.split(",") if t.strip()]
+    for station in stations:
+        if not (station.isalnum() and 2 <= len(station) <= 8):
+            raise ConfigurationError(
+                f"Invalid ECONET_STATIONS entry {station!r}. Use station ids "
+                f"such as REED,LAKE,CAMP (comma-separated)."
+            )
+
+    raw_pct = os.getenv("MIN_SUN_PERCENT_CLEAR_SKY", str(DEFAULT_MIN_SUN_PERCENT)).strip()
+    try:
+        min_percent = float(raw_pct)
+    except ValueError as e:
+        raise ConfigurationError(
+            f"Invalid MIN_SUN_PERCENT_CLEAR_SKY format: {e}. Must be a number."
+        ) from e
+    if not (0 < min_percent <= 100):
+        raise ConfigurationError(
+            f"MIN_SUN_PERCENT_CLEAR_SKY must be > 0 and <= 100, got: {min_percent}. "
+            f"0 would never veto; use an empty ECONET_STATIONS to turn the feature off."
+        )
+    return stations, min_percent
 
 
 def get_wind_gust_threshold() -> float:
@@ -1522,6 +1571,174 @@ def _knots_to_mph(knots) -> Optional[float]:
         return None
 
 
+def _finite(value) -> Optional[float]:
+    """float(value) or None for absent / non-numeric / bool / NaN / infinite."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _parse_econet(station: str, payload) -> Optional[dict]:
+    """Turn one ECONet currentconditions payload into a reading, or None if unusable."""
+    if not isinstance(payload, dict):          # an unknown station answers `[]`
+        return None
+    if payload.get("active") == 0:
+        return None
+    sr = _finite(payload.get("sr"))
+    clear_sky = _finite(payload.get("sr_clear_sky"))
+    hours, mins = _finite(payload.get("hours")), _finite(payload.get("mins"))
+    if sr is None or clear_sky is None or hours is None or mins is None:
+        return None
+    percent = _finite(payload.get("sr_percent"))
+    if percent is None and clear_sky > 0:
+        percent = sr / clear_sky * 100.0
+    if percent is None:
+        return None
+    return {
+        "station": station,
+        "sr": sr,
+        "clear_sky": clear_sky,
+        "percent": percent,
+        "ws": _finite(payload.get("ws")),
+        "gust": _finite(payload.get("gust")),
+        "precip": _finite(payload.get("precip")),
+        "age_min": hours * 60.0 + mins,
+    }
+
+
+def fetch_econet(stations, timeout: int = _ECONET_TIMEOUT_S) -> Optional[dict]:
+    """
+    Fetch the freshest MEASURED reading from the NC State ECONet stations.
+
+    Why this exists — 2026-10-03
+    ----------------------------
+    Every other sunshine input is forecast-model output, and the model was wrong:
+    at 11:45 best_match read 664 W/m² (ECMWF 544, ICON 351) while the Reedy Creek
+    station (REED, 9.1 km away, research-grade pyranometer, 1-minute data) measured
+    44.9 W/m² — 6% of clear sky — and LAKE and CAMP agreed (12%, 14%). Over 30
+    days the forecast called GHI >= 400 in 207 hours against a Durham station and
+    the measurement was below 400 in 28 of them; the reverse error was 3 of 35.
+
+    The stations are tried in the order given and the first FRESH reading wins
+    (REED 9.1 km, CAMP 14.6 km, LAKE 15.3 km). Fields used: `sr` (W/m²),
+    `sr_clear_sky`, `sr_percent`, wind `ws`/`gust` (mph, 10 m — confirmed in the
+    official API's variable list) and the rain gauge `precip`.
+
+    This is the station web page's own JSON feed: undocumented, key-free, offered
+    for "general information" use, so it can change without notice. One plain GET
+    per station, no retries: the feature is optional and FAILS OPEN, returning
+    None on any error, a stale reading (> _ECONET_MAX_AGE_MIN), a null sensor or
+    an unknown station, so an outage reverts to forecast-only behavior.
+    """
+    for station in stations or ():
+        try:
+            response = requests.get(
+                _ECONET_URL,
+                params={"station": station, "req": int(datetime.now(timezone.utc).timestamp())},
+                headers={"User-Agent": _ECONET_USER_AGENT},
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            reading = _parse_econet(station, response.json())
+        except requests.RequestException as e:
+            logger.warning(f"Sun observation: {station} API error: {e}")
+            continue
+        except Exception as e:
+            logger.warning(f"Sun observation: {station} parse error: {e}")
+            continue
+        if reading is None:
+            logger.warning(f"Sun observation: {station} has no usable reading")
+            continue
+        if reading["age_min"] > _ECONET_MAX_AGE_MIN:
+            logger.warning(
+                f"Sun observation: {station} reading is {reading['age_min']:.0f} min old "
+                f"(max {_ECONET_MAX_AGE_MIN})"
+            )
+            continue
+        return reading
+    return None
+
+
+def evaluate_sunshine(econet: Optional[dict], min_percent: float) -> tuple[Optional[bool], str]:
+    """
+    Judge the sun from a measured ECONet reading.
+
+    Returns (verdict, log_line): True = sun reaches the ground, False = blocked
+    (the close-only veto), None = no verdict (no reading, or too dim a sun for the
+    ratio to mean anything). The ratio to CLEAR SKY, not raw W/m², is what is
+    compared: it is independent of sun angle, which is why a low morning sun that
+    GHI under-reads is not mistaken for cloud.
+    """
+    if econet is None:
+        return None, "unavailable"
+    extras = f"; wind {_fmt(econet['ws'])}/{_fmt(econet['gust'])} mph, rain gauge {_fmt(econet['precip'], 2)}"
+    where = f"{econet['station']} ({econet['age_min']:.0f} min old)"
+    if econet["clear_sky"] < _ECONET_MIN_CLEAR_SKY_WM2:
+        return None, (
+            f"{where}: {econet['sr']:.0f} W/m², clear-sky {econet['clear_sky']:.0f} < "
+            f"{_ECONET_MIN_CLEAR_SKY_WM2:.0f} — too dim for a verdict{extras}"
+        )
+    sunny = econet["percent"] >= min_percent
+    return sunny, (
+        f"{where}: {econet['sr']:.0f} W/m² = {econet['percent']:.0f}% of clear sky "
+        f"({econet['clear_sky']:.0f}) {'>=' if sunny else '<'} {min_percent:.0f}% → "
+        f"{'no veto' if sunny else 'VETO'}{extras}"
+    )
+
+
+def _fmt(value, places: int = 0) -> str:
+    return "n/a" if value is None else f"{value:.{places}f}"
+
+
+def observations_confirm_clear(
+    metar: Optional[dict],
+    econet: Optional[dict],
+    ceiling_ft: float,
+    min_percent: float,
+) -> tuple[bool, str]:
+    """
+    Do the real-world observations agree with a "provably clear sky" claim?
+
+    The clear-sky radar veto throws away a radar hit when the MODEL says DNI is
+    high and rain-bearing cloud is low. That lets a forecast overrule an
+    observation, and the forecast is exactly what failed on 2026-10-03 (it said
+    15% cloud / DNI 645 beneath a 1,600 ft deck with rain nearby; the veto's bars
+    of 650 / 15% were missed by a whisker, not by design). So the veto now needs
+    the observations to POSITIVELY contradict nothing: it is withheld if the
+    airport reports a low deck or falling precipitation, or the measured sunshine
+    or rain gauge says otherwise. Absent observations cannot contradict, so with
+    nothing configured or reachable the original behavior is unchanged.
+
+    Returns (confirmed, reason); reason lists what contradicted when not confirmed.
+    """
+    contradictions = []
+    if metar is not None:
+        ceiling = metar.get("ceiling_ft")
+        if ceiling is not None and ceiling < ceiling_ft:
+            contradictions.append(
+                f"airport reports {metar.get('cover')}{ceiling / 100:03.0f}"
+            )
+        wx = metar.get("wx") or ""
+        age = metar.get("age_min")
+        if (age is None or age <= _METAR_WIND_MAX_AGE_MIN) and any(c in wx for c in _METAR_PRECIP_CODES):
+            contradictions.append(f"airport reports {wx}")
+    if econet is not None:
+        if (econet.get("precip") or 0) > 0:
+            contradictions.append(f"{econet['station']} rain gauge {econet['precip']:.2f}")
+        verdict, _ = evaluate_sunshine(econet, min_percent)
+        if verdict is False:
+            contradictions.append(
+                f"{econet['station']} measures {econet['percent']:.0f}% of clear sky"
+            )
+    if contradictions:
+        return False, "; ".join(contradictions)
+    return True, "observations do not contradict clear sky"
+
+
 def calculate_sun_position(lat: float, lon: float, dt: datetime) -> dict:
     """
     Calculate sun position using pvlib.
@@ -1804,6 +2021,7 @@ def evaluate_rain_gate(
     radar_veto_dni: float = 650.0,
     radar_veto_cloud_pct: float = 15.0,
     _attribution: Optional[list] = None,
+    veto_check=None,
 ) -> bool:
     """
     Evaluate whether it is safe (no rain) based on multiple signals.
@@ -1875,6 +2093,13 @@ def evaluate_rain_gate(
         _attribution: Optional list; if provided, a human-readable string describing
             which signal(s) closed the gate is appended. Used by should_open_awning()
             to build the Decision log message with exact signal attribution.
+        veto_check: Optional zero-argument callable returning (confirmed, reason).
+            Called ONLY when a radar hit would otherwise be vetoed as clear-sky
+            (the model says DNI is high and rain-bearing cloud is low). If it
+            returns confirmed=False — real observations contradict "clear sky" —
+            the veto is withheld and the radar hit closes the gate. This stops a
+            forecast from overruling an observation. None keeps the original
+            model-only behavior.
 
     Returns:
         True if all signals are clear (no rain); False if any signal fires (rain).
@@ -1983,17 +2208,32 @@ def evaluate_rain_gate(
             # Rain collapses DNI and elevates low/mid cloud → both fail during
             # genuine precipitation. Added after the 2026-06-24 clutter incident.
             if dni >= radar_veto_dni and rain_bearing_cloud < radar_veto_cloud_pct:
-                radar_vetoed = True
-                sig5_str = (
-                    f"radar=vetoed(DNI={dni:.0f}>={radar_veto_dni:.0f},"
-                    f"cloud={rain_bearing_cloud:.0f}%<{radar_veto_cloud_pct:.0f}%)"
-                )
-                logger.info(
-                    f"RainViewer radar hit vetoed — clear sky "
-                    f"(DNI {dni:.0f} W/m² >= {radar_veto_dni:.0f}, "
-                    f"max(cloud_low={cloud_cover_low:.0f}%, cloud_mid={cloud_cover_mid:.0f}%)"
-                    f"={rain_bearing_cloud:.0f}% < {radar_veto_cloud_pct:.0f}%)"
-                )
+                confirmed, why = True, ""
+                if veto_check is not None:
+                    try:
+                        confirmed, why = veto_check()
+                    except Exception as e:  # defensive: observations must not break the gate
+                        logger.warning(f"Radar veto check failed: {e} — keeping the original veto")
+                        confirmed, why = True, ""
+                if confirmed:
+                    radar_vetoed = True
+                    sig5_str = (
+                        f"radar=vetoed(DNI={dni:.0f}>={radar_veto_dni:.0f},"
+                        f"cloud={rain_bearing_cloud:.0f}%<{radar_veto_cloud_pct:.0f}%)"
+                    )
+                    logger.info(
+                        f"RainViewer radar hit vetoed — clear sky "
+                        f"(DNI {dni:.0f} W/m² >= {radar_veto_dni:.0f}, "
+                        f"max(cloud_low={cloud_cover_low:.0f}%, cloud_mid={cloud_cover_mid:.0f}%)"
+                        f"={rain_bearing_cloud:.0f}% < {radar_veto_cloud_pct:.0f}%)"
+                    )
+                else:
+                    sig5_fires = True
+                    sig5_str = f"radar=rain(wet_pixels>={_RADAR_MIN_WET_PIXELS},veto withheld: {why})"
+                    logger.info(
+                        f"RainViewer radar hit NOT vetoed — the forecast says clear sky "
+                        f"but observations contradict it: {why}"
+                    )
             else:
                 sig5_fires = True
                 sig5_str = f"radar=rain(wet_pixels>={_RADAR_MIN_WET_PIXELS})"
@@ -2051,6 +2291,7 @@ def evaluate_wind(
     gust_threshold_mph: float,
     metar: Optional[dict] = None,
     station: Optional[str] = None,
+    econet: Optional[dict] = None,
 ) -> tuple[bool, str, Optional[str]]:
     """
     Decide whether the wind is calm enough, using the WORSE of model and airport.
@@ -2065,7 +2306,9 @@ def evaluate_wind(
     thunderstorm outflow. Observed wind can only make the gate stricter, never
     looser, so a stale or missing observation reverts to model-only behavior.
 
-    A METAR older than _METAR_WIND_MAX_AGE_MIN is ignored for wind (it carries a
+    A fresh ECONet reading (REED, 9 km, a 10 m anemometer, mph) joins as a third
+    source; it is closer than the airport and one-minute fresh. A METAR older than
+    _METAR_WIND_MAX_AGE_MIN is ignored for wind (it carries a
     short mean plus the last ~10 minutes' peak gust). A missing/null model gust
     is skipped rather than treated as windy: Open-Meteo omitting it must not
     close the awning every 15 minutes.
@@ -2084,6 +2327,9 @@ def evaluate_wind(
             metar_note = f", {station} METAR {age:.0f} min old"
         else:
             metar_note = f", {station} METAR too old for wind"
+    if econet is not None and econet.get("age_min", 1e9) <= _ECONET_MAX_AGE_MIN:
+        sources.append((econet["station"], econet.get("ws"), econet.get("gust")))
+        metar_note += f", {econet['station']} {econet['age_min']:.0f} min old"
 
     def worst(index: int):
         candidates = [(s[index], s[0]) for s in sources if s[index] is not None]
@@ -2141,6 +2387,8 @@ def should_open_awning(
     metar_ceiling_ft: float = DEFAULT_METAR_CEILING_FT,
     _attribution: Optional[list] = None,
     wind_gust_threshold: float = DEFAULT_WIND_GUST_THRESHOLD_MPH,
+    econet_stations: Optional[list] = None,
+    min_sun_percent: float = DEFAULT_MIN_SUN_PERCENT,
     _sky_veto: Optional[list] = None,
     _wind_alert: Optional[list] = None,
 ) -> tuple[bool, str, dict]:
@@ -2238,9 +2486,16 @@ def should_open_awning(
             element [0] and hands it to build_close_reason(), whose first branch
             is the RAIN branch. The cross-model sun rescue therefore must NOT
             append here; its detail rides in the returned reason string.
-        _sky_veto: Optional list; if provided and the observed-ceiling veto
-            fired, a short description such as "KRDU reports BKN016" is
-            appended. A separate out-param from _attribution on purpose: that one
+        econet_stations: ECONet station ids in order of preference (e.g.
+            ["REED", "LAKE", "CAMP"]). When set, a fresh MEASURED reading with
+            sunshine below min_sun_percent of clear sky vetoes "sunny" (close-only,
+            like the airport veto), and its wind joins the wind gate. None/empty
+            disables it. See fetch_econet() for the 2026-10-03 incident.
+        min_sun_percent: Share of the clear-sky value below which measured
+            sunshine counts as blocked (default 50).
+        _sky_veto: Optional list; if provided and an observed-sky veto fired
+            (low cloud deck or low measured sunshine), a full short phrase such as
+            "Low cloud deck — KRDU reports BKN016" is appended per veto. A separate out-param from _attribution on purpose: that one
             is read positionally as a RAIN signal, so a sky string there would
             make an unrelated close announce a rain message. Lets main() name the
             real reason in the Telegram message instead of "Not enough sun" with
@@ -2339,8 +2594,36 @@ def should_open_awning(
     # additive property provable by reading one line.
     sunny_primary = sunny_model and sunny_observed and not_overcast
 
-    # `is_calm` is decided below, after the optional METAR fetch, because the
-    # airport's observed wind joins the model's.
+    # `is_calm` is decided below, after the optional observation fetches, because
+    # the observed wind joins the model's.
+    #
+    # Observations (airport METAR, ECONet) are fetched lazily and at most once per
+    # run, by whichever consumer needs them first: the radar-veto check below, the
+    # sky/sun vetoes, or neither.
+    observation_cache: dict = {}
+
+    def observations() -> tuple:
+        if "value" not in observation_cache:
+            metar_obs = econet_obs = None
+            if metar_station:
+                # Belt and braces, as for the crosscheck: an exception here would
+                # reach main()'s fail-safe and turn a fail-open feature fail-closed.
+                try:
+                    metar_obs = fetch_metar(metar_station)
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.warning(f"Sky observation: unexpected error: {e} — no veto")
+            if econet_stations:
+                try:
+                    econet_obs = fetch_econet(econet_stations)
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.warning(f"Sun observation: unexpected error: {e} — no veto")
+            observation_cache["value"] = (metar_obs, econet_obs)
+        return observation_cache["value"]
+
+    def radar_veto_check() -> tuple:
+        metar_obs, econet_obs = observations()
+        return observations_confirm_clear(metar_obs, econet_obs, metar_ceiling_ft, min_sun_percent)
+
     rain_attribution: list = []
     no_rain = evaluate_rain_gate(
         weather,
@@ -2350,6 +2633,7 @@ def should_open_awning(
         radar_veto_dni=radar_veto_dni,
         radar_veto_cloud_pct=radar_veto_cloud_pct,
         _attribution=rain_attribution,
+        veto_check=radar_veto_check if (metar_station or econet_stations) else None,
     )
     # Forward the rain attribution to the caller so the Telegram message can name
     # the signal that actually fired. Cannot ride in `conditions`, which must stay
@@ -2485,14 +2769,7 @@ def should_open_awning(
     elif not (is_day and sun_high_enough and sun_facing_se):
         sky_status = "skipped(sun_gates_closed)"
     else:
-        # Belt and braces, as for the crosscheck: an exception here would reach
-        # main()'s fail-safe and close the awning, turning a fail-open feature
-        # into a fail-closed one.
-        try:
-            sky_obs = fetch_metar(metar_station)
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning(f"Sky observation: unexpected error: {e} — no veto")
-            sky_obs = None
+        sky_obs = observations()[0]
         if sky_obs is None:
             sky_status = "unavailable"
         else:
@@ -2504,7 +2781,8 @@ def should_open_awning(
                 sky_vetoed = True
                 if _sky_veto is not None:
                     _sky_veto.append(
-                        f"{metar_station} reports {sky_obs['cover']}{ceiling_ft / 100:03.0f}"
+                        f"Low cloud deck — {metar_station} reports "
+                        f"{sky_obs['cover']}{ceiling_ft / 100:03.0f}"
                     )
                 sky_status = (
                     f"{where}: {sky_obs['cover']}{ceiling_ft / 100:03.0f} → "
@@ -2516,11 +2794,34 @@ def should_open_awning(
                     f"ceiling {ceiling_ft:.0f} ft >= {metar_ceiling_ft:.0f} → no veto"
                 )
 
-    is_sunny = sunny_forecast and not sky_vetoed
+    # Measured sunshine (NC State ECONet) — the same close-only invariant as the
+    # airport veto above: a fresh reading showing the sun blocked makes the verdict
+    # "not sunny"; anything else (absent, stale, dim light, sun reaching the
+    # ground) leaves the forecast verdict alone. It can never cause an open.
+    sun_vetoed = False
+    econet_obs = None
+    if not econet_stations:
+        sun_status = "disabled"
+    elif not sunny_forecast:
+        sun_status = "skipped(not_sunny)"
+    elif not (is_day and sun_high_enough and sun_facing_se):
+        sun_status = "skipped(sun_gates_closed)"
+    else:
+        econet_obs = observations()[1]
+        sun_verdict, sun_status = evaluate_sunshine(econet_obs, min_sun_percent)
+        if sun_verdict is False:
+            sun_vetoed = True
+            if _sky_veto is not None:
+                _sky_veto.append(
+                    f"Low sunshine — {econet_obs['station']} measures "
+                    f"{econet_obs['sr']:.0f} W/m² ({econet_obs['percent']:.0f}% of clear sky)"
+                )
 
-    # Wind: the WORSE of the model and (when fetched above) the airport's report.
-    # The METAR is only fetched when the forecast could still open the awning, so
-    # when it was not, this falls back to the model alone — and the awning is
+    is_sunny = sunny_forecast and not (sky_vetoed or sun_vetoed)
+
+    # Wind: the WORSE of the model and whichever observations were fetched above.
+    # Observations are only fetched when the forecast could still open the awning,
+    # so when it could not this falls back to the model alone — and the awning is
     # closed regardless, so nothing is lost.
     is_calm, wind_line, wind_alert = evaluate_wind(
         wind_speed,
@@ -2529,6 +2830,7 @@ def should_open_awning(
         wind_gust_threshold,
         metar=sky_obs,
         station=metar_station,
+        econet=econet_obs,
     )
     if _wind_alert is not None and wind_alert:
         _wind_alert.append(wind_alert)
@@ -2538,6 +2840,7 @@ def should_open_awning(
     # diagnosable from the log alone.
     logger.info(f"Sun crosscheck: {crosscheck_status}")
     logger.info(f"Sky observation: {sky_status}")
+    logger.info(f"Sun observation: {sun_status}")
 
     # Same rationale: show what the gate actually read versus what the feed
     # reported this instant, so a suspect decision can be traced to the smoothing
@@ -2661,6 +2964,13 @@ def should_open_awning(
             f"(forecast said sunny: {sunny_trace})"
         )
 
+    if sun_vetoed and econet_obs is not None:
+        sunny_trace = (
+            f"OBSERVED SUNSHINE VETO: {econet_obs['station']} measures "
+            f"{econet_obs['sr']:.0f} W/m² = {econet_obs['percent']:.0f}% of clear sky "
+            f"< {min_sun_percent:.0f}% (forecast said sunny: {sunny_trace})"
+        )
+
     # Build detailed reason string
     reasons = []
     if not is_sunny:
@@ -2756,7 +3066,7 @@ def build_close_reason(
 
     if not conditions["sunny"]:
         if sky_veto:
-            return f"☁️ Awning closed: Low cloud deck — {sky_veto}"
+            return f"☁️ Awning closed: {sky_veto}"
         return (
             f"☁️ Awning closed: Not enough sun "
             f"(GHI {ghi:.0f} W/m², UV {uv_index:.1f}, "
@@ -2932,6 +3242,7 @@ def main() -> None:
         wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold, radar_veto_dni, radar_veto_cloud_pct, min_dni_direct, sun_azimuth_min, sun_azimuth_max, sunny_crosscheck_enabled = get_thresholds()
         metar_station, metar_ceiling_ft = get_sky_observation_config()
         wind_gust_threshold = get_wind_gust_threshold()
+        econet_stations, min_sun_percent = get_sun_observation_config()
         logger.info(
             f"Thresholds: model=(GHI >= {min_ghi:.0f} W/m² "
             f"OR [UV >= {min_uv_index:.1f} AND cloud < {max_cloud_cover:.0f}%] "
@@ -2948,8 +3259,12 @@ def main() -> None:
             f"| >= {min_dni:.0f} W/m² consistency), "
             f"irradiance_smoothing={_SMOOTHING_SLOTS}-slot median, "
             + (
-                f"sky_veto=({metar_station} BKN/OVC/VV < {metar_ceiling_ft:.0f} ft)"
-                if metar_station else "sky_veto=(off)"
+                f"sky_veto=({metar_station} BKN/OVC/VV < {metar_ceiling_ft:.0f} ft), "
+                if metar_station else "sky_veto=(off), "
+            )
+            + (
+                f"sun_veto=({'>'.join(econet_stations)} < {min_sun_percent:.0f}% of clear sky)"
+                if econet_stations else "sun_veto=(off)"
             )
         )
 
@@ -3025,12 +3340,14 @@ def main() -> None:
             metar_station=metar_station,
             metar_ceiling_ft=metar_ceiling_ft,
             wind_gust_threshold=wind_gust_threshold,
+            econet_stations=econet_stations,
+            min_sun_percent=min_sun_percent,
             _attribution=rain_attribution_out,
             _sky_veto=sky_veto_out,
             _wind_alert=wind_alert_out,
         )
         rain_attribution = rain_attribution_out[0] if rain_attribution_out else None
-        sky_veto = sky_veto_out[0] if sky_veto_out else None
+        sky_veto = "; ".join(sky_veto_out) if sky_veto_out else None
         wind_alert = wind_alert_out[0] if wind_alert_out else None
 
         # Log conditions with checkmarks/crosses

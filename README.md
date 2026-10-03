@@ -97,7 +97,7 @@ The automation opens the awning only when ALL seven conditions are met:
 6. **Sun high enough** above the horizon (clears trees and rooftops)
 7. **Sun facing the window**: the sun's compass direction is inside the arc you configure
 
-If any condition fails the awning closes. If the automation cannot get a trustworthy answer (weather service down, or an unexpected error before a command is sent) it closes the awning as a fail-safe. Data comes from [Open-Meteo](https://open-meteo.com) (forecast), [RainViewer](https://www.rainviewer.com) (radar) and [aviationweather.gov](https://aviationweather.gov) (airport observations, optional). Details, thresholds and the incidents behind each rule are in `CLAUDE.md`.
+If any condition fails the awning closes. If the automation cannot get a trustworthy answer (weather service down, or an unexpected error before a command is sent) it closes the awning as a fail-safe. Data comes from [Open-Meteo](https://open-meteo.com) (forecast), [RainViewer](https://www.rainviewer.com) (radar), [aviationweather.gov](https://aviationweather.gov) (airport observations, optional) and [NC State ECONet](https://econet.climate.ncsu.edu) (measured sunshine, wind and rain from nearby research stations, optional; North Carolina only). Details, thresholds and the incidents behind each rule are in `CLAUDE.md`.
 
 ### Deploying to a Raspberry Pi / Orange Pi
 
