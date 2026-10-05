@@ -5807,20 +5807,30 @@ class TestGetSunObservationConfig(unittest.TestCase):
             return awning_automation.get_sun_observation_config()
 
     def test_default_is_off(self):
-        self.assertEqual(self._get(), ([], 50.0))
+        self.assertEqual(self._get(), ([], 50.0, 60.0))
 
     def test_station_list_is_split_trimmed_and_uppercased(self):
         self.assertEqual(self._get(ECONET_STATIONS=" reed, Lake ,CAMP,, ")[0], ["REED", "LAKE", "CAMP"])
 
     def test_percent_parsing(self):
         self.assertEqual(self._get(MIN_SUN_PERCENT_CLEAR_SKY=" 35 ")[1], 35.0)
-        self.assertEqual(self._get(MIN_SUN_PERCENT_CLEAR_SKY="100")[1], 100.0)
+        self.assertEqual(self._get(MIN_SUN_PERCENT_CLEAR_SKY="100", MIN_SUN_PERCENT_OPEN="100")[1], 100.0)
+
+    def test_open_percent_parsing_and_default(self):
+        self.assertEqual(self._get()[2], 60.0)
+        self.assertEqual(self._get(MIN_SUN_PERCENT_OPEN=" 75 ")[2], 75.0)
+        self.assertEqual(self._get(MIN_SUN_PERCENT_OPEN="50")[2], 50.0)  # equal to the close bar is allowed
 
     def test_invalid_values_raise(self):
         cases = {"bad station": dict(ECONET_STATIONS="RE ED"), "punctuation": dict(ECONET_STATIONS="REED;LAKE"),
                  "too long": dict(ECONET_STATIONS="ABCDEFGHI"), "text pct": dict(MIN_SUN_PERCENT_CLEAR_SKY="half"),
                  "zero pct": dict(MIN_SUN_PERCENT_CLEAR_SKY="0"), "negative": dict(MIN_SUN_PERCENT_CLEAR_SKY="-5"),
-                 "over 100": dict(MIN_SUN_PERCENT_CLEAR_SKY="101")}
+                 "over 100": dict(MIN_SUN_PERCENT_CLEAR_SKY="101"),
+                 "text open": dict(MIN_SUN_PERCENT_OPEN="most"), "zero open": dict(MIN_SUN_PERCENT_OPEN="0"),
+                 "negative open": dict(MIN_SUN_PERCENT_OPEN="-5"), "open over 100": dict(MIN_SUN_PERCENT_OPEN="101"),
+                 # a rescue bar under the veto bar would let one reading rescue and veto in the same run
+                 "open below close": dict(MIN_SUN_PERCENT_OPEN="40"),
+                 "close above default open": dict(MIN_SUN_PERCENT_CLEAR_SKY="70")}
         for label, env in cases.items():
             with self.subTest(case=label):
                 with self.assertRaises(ConfigurationError):
@@ -6002,17 +6012,29 @@ class TestSunshineVeto(unittest.TestCase):
     def test_not_fetched_when_off_or_when_it_cannot_matter(self):
         _, fe, _ = self._run(self._reed(6), stations=None)
         fe.assert_not_called()
-        dark = dict(self.BASE, shortwave_radiation=50.0, uv_index=0.5, dni=0.0, cloud_cover=100.0)
-        _, fe, _ = self._run(self._reed(6), weather=dark)
-        fe.assert_not_called()
+        # Gates closed: nothing to veto and nothing to rescue, so no request.
         _, fe, _ = self._run(self._reed(6), sun=dict(azimuth=300.0, altitude=20.0))
         fe.assert_not_called()
-
-    def test_close_only_a_perfect_measurement_never_opens_a_dark_forecast(self):
         dark = dict(self.BASE, shortwave_radiation=50.0, uv_index=0.5, dni=0.0, cloud_cover=100.0)
-        (should_open, _, conditions), _, _ = self._run(self._reed(100, sr=740.0), weather=dark)
+        _, fe, _ = self._run(self._reed(6), weather=dark, sun=dict(azimuth=300.0, altitude=20.0))
+        fe.assert_not_called()
+
+    def test_a_dark_forecast_consults_the_station_for_a_rescue_but_a_dim_reading_stays_closed(self):
+        # Reversed on 2026-10-05: a dark forecast no longer skips the station,
+        # because a measurement may now rescue it. A dim reading changes nothing.
+        dark = dict(self.BASE, shortwave_radiation=50.0, uv_index=0.5, dni=0.0, cloud_cover=100.0)
+        (should_open, _, conditions), fe, _ = self._run(self._reed(6), weather=dark)
+        fe.assert_called_once()
         self.assertFalse(should_open)
         self.assertFalse(conditions["sunny"])
+
+    def test_a_perfect_measurement_now_rescues_a_dark_forecast(self):
+        # The deliberate reversal of the old close-only rule (2026-10-05).
+        dark = dict(self.BASE, shortwave_radiation=50.0, uv_index=0.5, dni=0.0, cloud_cover=100.0)
+        (should_open, reason, conditions), _, _ = self._run(self._reed(100, sr=740.0), weather=dark)
+        self.assertTrue(should_open, reason)
+        self.assertTrue(conditions["sunny"])
+        self.assertIn("MEASURED SUNSHINE RESCUE", reason)
 
     def test_both_vetoes_are_reported(self):
         out = []
@@ -6093,6 +6115,133 @@ class TestSunshineVeto(unittest.TestCase):
         self.assertTrue(should_open, reason)
         fe.assert_not_called()
         fm.assert_not_called()
+
+class TestMeasuredSunshineRescue20261005(unittest.TestCase):
+    """
+    The 2026-10-05 incident: the operator opened the awning by hand and the 14:00
+    run closed it again, because every forecast still said solid cloud while the
+    nearest research station measured the sun well out.
+
+    Fixture is the real 14:00 reading: best_match GHI 338 / UV 3.8 / DNI 0 /
+    cloud 100% (low 77, mid 0, high 100). REED measured 494 W/m² = 67% of clear
+    sky, CAMP 95%; KRDU's deck had broken from BKN014 to SCT022 BKN200 at 13:43.
+    Reuses TestSunshineVeto's harness.
+    """
+
+    NOW = datetime(2026, 10, 5, 14, 0, 0, tzinfo=timezone.utc)
+    SUN = dict(azimuth=200.9, altitude=47.2)
+    BASE = dict(
+        shortwave_radiation=338.0, uv_index=3.8, dni=0.0,
+        cloud_cover=100.0, cloud_cover_low=77.0, cloud_cover_mid=0.0, cloud_cover_high=100.0,
+        wind_speed=3.3, temperature=67.3,
+        sunrise="2026-10-05T07:13:00", sunset="2026-10-05T18:53:00",
+    )
+    _reed = staticmethod(TestSunshineVeto._reed)
+    _metar = staticmethod(TestSunshineVeto._metar)
+
+    def _run(self, econet=None, metar=None, **kwargs):
+        # The shared harness injects the 10-03 smoothed GHI/DNI (558/600) whenever
+        # no weather is passed, which would make this dark afternoon read sunny.
+        # Passing our own weather leaves the smoothed fields absent, so the gate
+        # falls back to the instantaneous GHI 338 / DNI 0 (the 14:00 median was
+        # 218 / 0 — the same verdict).
+        kwargs.setdefault("weather", self.BASE)
+        return TestSunshineVeto._run(self, econet, metar, **kwargs)
+
+    # The 13:43 METAR (SCT022 BKN200): its only BKN layer sits at 20,000 ft, far above the 3,000 ft line.
+    CLEARED = dict(ceiling_ft=20000.0, cover="BKN")
+
+    def test_incident_opens_on_a_67_percent_reading_and_names_the_rescue(self):
+        (should_open, reason, conditions), fe, _ = self._run(self._reed(67, sr=494.0, clear=741.0), self._metar(**self.CLEARED))
+        self.assertTrue(should_open, reason)
+        self.assertTrue(conditions["sunny"])
+        self.assertIn("MEASURED SUNSHINE RESCUE", reason)
+        self.assertIn("REED", reason)
+        fe.assert_called_once()
+
+    def test_an_observed_low_deck_still_closes_a_rescued_verdict(self):
+        # 12:15-13:30 the same day: the deck was real (BKN014/BKN018). An
+        # observation outranks a rescue.
+        out = []
+        (should_open, reason, _), _, _ = self._run(
+            self._reed(67, sr=494.0, clear=741.0), self._metar(ceiling_ft=1400.0, cover="BKN"), out=out
+        )
+        self.assertFalse(should_open)
+        self.assertIn("OBSERVED CEILING VETO", reason)
+        self.assertIn("MEASURED SUNSHINE RESCUE", reason)
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out[0].startswith("Low cloud deck"))
+
+    def test_a_reading_between_the_two_bars_neither_rescues_nor_vetoes(self):
+        out = []
+        (should_open, reason, _), _, _ = self._run(self._reed(55, sr=408.0, clear=741.0), self._metar(**self.CLEARED), out=out)
+        self.assertFalse(should_open)
+        self.assertNotIn("RESCUE", reason)
+        self.assertNotIn("VETO", reason)
+        self.assertEqual(out, [])
+
+    def test_the_open_bar_is_inclusive_at_exactly_60(self):
+        (should_open, reason, _), _, _ = self._run(self._reed(60, sr=444.0, clear=740.0), self._metar(**self.CLEARED))
+        self.assertTrue(should_open, reason)
+        (should_open, _, _), _, _ = self._run(self._reed(59, sr=437.0, clear=740.0), self._metar(**self.CLEARED))
+        self.assertFalse(should_open)
+
+    def test_the_open_bar_is_configurable(self):
+        (should_open, _, _), _, _ = self._run(self._reed(67, sr=494.0, clear=741.0), self._metar(**self.CLEARED), min_sun_percent_open=70.0)
+        self.assertFalse(should_open)
+
+    def test_no_reading_or_a_dim_reading_means_no_rescue(self):
+        for label, reading in {
+            "no reading": None,
+            "dawn/dusk clear-sky under 150": self._reed(90, sr=100.0, clear=110.0),
+        }.items():
+            with self.subTest(case=label):
+                (should_open, reason, _), _, _ = self._run(reading, self._metar(**self.CLEARED))
+                self.assertFalse(should_open)
+                self.assertNotIn("RESCUE", reason)
+
+    def test_off_or_closed_gates_never_fetch(self):
+        _, fe, _ = self._run(self._reed(95, sr=700.0), stations=None)
+        fe.assert_not_called()
+        _, fe, _ = self._run(self._reed(95, sr=700.0), sun=dict(azimuth=300.0, altitude=20.0))
+        fe.assert_not_called()
+
+    def test_a_rescue_cannot_open_into_rain_or_wind(self):
+        reading, metar = self._reed(95, sr=700.0, clear=741.0), self._metar(**self.CLEARED)
+        for label, weather in {
+            "rain": dict(self.BASE, precipitation=0.5),
+            "wind": dict(self.BASE, wind_speed=20.0),
+            "cold": dict(self.BASE, temperature=40.0),
+        }.items():
+            with self.subTest(case=label):
+                (should_open, _, conditions), _, _ = self._run(reading, metar, weather=weather)
+                self.assertFalse(should_open)
+                self.assertTrue(conditions["sunny"])  # the rescue fired; the other gate closed it
+
+    def test_a_rescue_cannot_open_at_night_or_with_the_sun_off_the_window(self):
+        reading, metar = self._reed(95, sr=700.0, clear=741.0), self._metar(**self.CLEARED)
+        (should_open, _, _), _, _ = self._run(reading, metar, sun=dict(azimuth=300.0, altitude=20.0))
+        self.assertFalse(should_open)
+
+    def test_station_wind_joins_the_gate_once_rescued(self):
+        # The station is fetched for the rescue, so its wind counts too.
+        (should_open, reason, _), _, _ = self._run(
+            self._reed(95, sr=700.0, clear=741.0, ws=20.0, gust=30.0), self._metar(**self.CLEARED)
+        )
+        self.assertFalse(should_open)
+        self.assertIn("windy", reason.lower())
+
+    def test_each_source_is_fetched_once_per_run(self):
+        _, fe, fm = self._run(self._reed(67, sr=494.0, clear=741.0), self._metar(**self.CLEARED))
+        self.assertEqual((fe.call_count, fm.call_count), (1, 1))
+
+    def test_a_forecast_that_already_says_sunny_is_not_rescued_or_relabelled(self):
+        sunny = dict(self.BASE, shortwave_radiation=600.0, uv_index=6.0, dni=600.0, cloud_cover=10.0,
+                     cloud_cover_low=5.0, cloud_cover_mid=0.0, cloud_cover_high=0.0)
+        (should_open, reason, _), _, _ = self._run(self._reed(95, sr=700.0, clear=741.0), self._metar(**self.CLEARED), weather=sunny)
+        self.assertTrue(should_open, reason)
+        self.assertNotIn("MEASURED SUNSHINE RESCUE", reason)
+
 
 
 class TestSunshineCompositionRoot(unittest.TestCase):

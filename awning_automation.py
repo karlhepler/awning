@@ -469,6 +469,11 @@ _KT_TO_MPH = 1.15078
 # days (USCRN Durham measured / pvlib clear-sky): hours wanted CLOSED read 26-37%,
 # hours wanted OPEN read 63-104% (11 hours, small sample). 50 splits them.
 DEFAULT_MIN_SUN_PERCENT = 50.0
+# Measured-sunshine RESCUE bar — see should_open_awning(). Deliberately above the
+# close bar so one reading cannot both rescue and veto, and so a reading hovering
+# near 50% does not flip the awning every run. Sits in the gap between the
+# operator's labelled closed hours (26-37%) and open hours (63-104%).
+DEFAULT_MIN_SUN_PERCENT_OPEN = 60.0
 _ECONET_URL = "https://econet.climate.ncsu.edu/m/current/currentconditions.php"
 _ECONET_TIMEOUT_S = 5
 # The station relays every ~5 minutes, so a healthy reading is under ~10 minutes old.
@@ -928,7 +933,7 @@ def get_sky_observation_config() -> tuple[Optional[str], float]:
     return (station or None), ceiling_ft
 
 
-def get_sun_observation_config() -> tuple[list, float]:
+def get_sun_observation_config() -> tuple[list, float, float]:
     """
     Read the measured-sunshine settings from the environment.
 
@@ -936,6 +941,8 @@ def get_sun_observation_config() -> tuple[list, float]:
     preference, e.g. "REED,LAKE,CAMP" (the first with a fresh reading wins).
     Unset or blank turns the feature off. MIN_SUN_PERCENT_CLEAR_SKY (default 50):
     below this share of the clear-sky value the sun counts as blocked.
+    MIN_SUN_PERCENT_OPEN (default 60): at or above this share the measurement
+    rescues a "not sunny" forecast verdict; must be >= the close bar.
     """
     raw = os.getenv("ECONET_STATIONS", "")
     stations = [t.strip().upper() for t in raw.split(",") if t.strip()]
@@ -958,7 +965,24 @@ def get_sun_observation_config() -> tuple[list, float]:
             f"MIN_SUN_PERCENT_CLEAR_SKY must be > 0 and <= 100, got: {min_percent}. "
             f"0 would never veto; use an empty ECONET_STATIONS to turn the feature off."
         )
-    return stations, min_percent
+
+    raw_open = os.getenv("MIN_SUN_PERCENT_OPEN", str(DEFAULT_MIN_SUN_PERCENT_OPEN)).strip()
+    try:
+        open_percent = float(raw_open)
+    except ValueError as e:
+        raise ConfigurationError(
+            f"Invalid MIN_SUN_PERCENT_OPEN format: {e}. Must be a number."
+        ) from e
+    if not (0 < open_percent <= 100):
+        raise ConfigurationError(
+            f"MIN_SUN_PERCENT_OPEN must be > 0 and <= 100, got: {open_percent}."
+        )
+    if open_percent < min_percent:
+        raise ConfigurationError(
+            f"MIN_SUN_PERCENT_OPEN ({open_percent}) must be >= MIN_SUN_PERCENT_CLEAR_SKY "
+            f"({min_percent}); otherwise one reading could rescue and veto in the same run."
+        )
+    return stations, min_percent, open_percent
 
 
 def get_wind_gust_threshold() -> float:
@@ -2393,6 +2417,7 @@ def should_open_awning(
     min_sun_percent: float = DEFAULT_MIN_SUN_PERCENT,
     _sky_veto: Optional[list] = None,
     _wind_alert: Optional[list] = None,
+    min_sun_percent_open: float = DEFAULT_MIN_SUN_PERCENT_OPEN,
 ) -> tuple[bool, str, dict]:
     """
     Determine if awning should be open based on ALL conditions.
@@ -2490,9 +2515,14 @@ def should_open_awning(
             append here; its detail rides in the returned reason string.
         econet_stations: ECONet station ids in order of preference (e.g.
             ["REED", "LAKE", "CAMP"]). When set, a fresh MEASURED reading with
-            sunshine below min_sun_percent of clear sky vetoes "sunny" (close-only,
-            like the airport veto), and its wind joins the wind gate. None/empty
-            disables it. See fetch_econet() for the 2026-10-03 incident.
+            sunshine below min_sun_percent of clear sky vetoes "sunny" (like the
+            airport veto), a reading at or above min_sun_percent_open RESCUES a
+            "not sunny" forecast verdict, and its wind joins the wind gate.
+            None/empty disables it. See fetch_econet() for the 2026-10-03
+            incident and the measured rescue in this function for 2026-10-05.
+        min_sun_percent_open: Share of the clear-sky value at or above which a
+            fresh measurement overturns a "not sunny" forecast verdict. Must be
+            >= min_sun_percent (enforced by get_sun_observation_config()).
         min_sun_percent: Share of the clear-sky value below which measured
             sunshine counts as blocked (default 50).
         _sky_veto: Optional list; if provided and an observed-sky veto fired
@@ -2751,6 +2781,46 @@ def should_open_awning(
 
     sunny_forecast = sunny_primary or sunny_rescued or sunny_rescued_observed
 
+    # Measured-sunshine RESCUE — the one place a measurement can OPEN the awning.
+    #
+    # Every rescue above reads forecast models, so none of them can notice a
+    # model that keeps predicting cloud after the sky has cleared. On 2026-10-05
+    # the operator opened the awning by hand and the 14:00 run closed it again:
+    # best_match said GHI 100-340 / DNI 0 / cloud 100%, ECMWF and ICON said DNI
+    # 58-94 (far under any bar), while REED measured 494 W/m² = 67% of clear sky,
+    # CAMP 95%, and the airport deck had broken from BKN014 to SCT022 at 13:43.
+    # Mirror image of 2026-10-03, where the forecast missed cloud.
+    #
+    # This deliberately reverses the "measurements can only close" rule for the
+    # ECONet signal (operator's decision, 2026-10-05). It is bounded:
+    #   * consulted only when the forecast says "not sunny" and the sun gates are
+    #     open, so it never adds a request on a run that already opens or at night;
+    #   * the bar (min_sun_percent_open, 60) is above the close bar (50), enforced
+    #     in config, so one reading can never both rescue and veto;
+    #   * it runs BEFORE the airport ceiling veto below, so an observed low deck
+    #     still closes the awning — an observation outranks a rescue;
+    #   * rain, wind and temperature are separate conditions and are untouched.
+    # Fail-open: absent, stale, null or too-dim readings mean no rescue.
+    sunny_rescued_measured = False
+    sun_rescue_status = None
+    econet_obs = None
+    if econet_stations and not sunny_forecast and is_day and sun_high_enough and sun_facing_se:
+        econet_obs = observations()[1]
+        rescue_verdict, rescue_line = evaluate_sunshine(econet_obs, min_sun_percent_open)
+        if rescue_verdict is None:
+            sun_rescue_status = f"{rescue_line} → no rescue"
+        else:
+            where = f"{econet_obs['station']} ({econet_obs['age_min']:.0f} min old)"
+            sunny_rescued_measured = rescue_verdict
+            sun_rescue_status = (
+                f"{where}: {econet_obs['sr']:.0f} W/m² = {econet_obs['percent']:.0f}% of "
+                f"clear sky ({econet_obs['clear_sky']:.0f}) "
+                f"{'>=' if rescue_verdict else '<'} {min_sun_percent_open:.0f}% → "
+                f"{'MEASURED RESCUE ENGAGED' if rescue_verdict else 'no rescue'}"
+            )
+
+    sunny_candidate = sunny_forecast or sunny_rescued_measured
+
     # Observed-ceiling veto — close-only, the mirror image of the rescue above.
     #
     # Every layer and both rescue tiers read MODEL output. On 2026-10-03 the
@@ -2760,13 +2830,14 @@ def should_open_awning(
     # runs last and overrides the rescue too. It only ever clears `sunny`; it
     # has no path to set it, so it cannot cause an open.
     #
-    # Fetched only when it could change the outcome: the forecast already says
-    # sunny and the sun gates are open (same skip shape as the crosscheck).
+    # Fetched only when it could change the outcome: the verdict is sunny (from
+    # the forecast or the measured rescue) and the sun gates are open (same skip
+    # shape as the crosscheck).
     sky_vetoed = False
     sky_obs = None
     if not metar_station:
         sky_status = "disabled"
-    elif not sunny_forecast:
+    elif not sunny_candidate:
         sky_status = "skipped(not_sunny)"
     elif not (is_day and sun_high_enough and sun_facing_se):
         sky_status = "skipped(sun_gates_closed)"
@@ -2796,16 +2867,19 @@ def should_open_awning(
                     f"ceiling {ceiling_ft:.0f} ft >= {metar_ceiling_ft:.0f} → no veto"
                 )
 
-    # Measured sunshine (NC State ECONet) — the same close-only invariant as the
-    # airport veto above: a fresh reading showing the sun blocked makes the verdict
-    # "not sunny"; anything else (absent, stale, dim light, sun reaching the
-    # ground) leaves the forecast verdict alone. It can never cause an open.
+    # Measured sunshine (NC State ECONet) as a VETO: a fresh reading showing the
+    # sun blocked makes a "sunny" verdict "not sunny"; anything else (absent,
+    # stale, dim light, sun reaching the ground) leaves the verdict alone. The
+    # opposite direction is the measured rescue above. When that rescue engaged
+    # there is nothing to veto — its bar is >= the veto bar, so this same reading
+    # cannot fall below it.
     sun_vetoed = False
-    econet_obs = None
     if not econet_stations:
         sun_status = "disabled"
+    elif sunny_rescued_measured:
+        sun_status = sun_rescue_status
     elif not sunny_forecast:
-        sun_status = "skipped(not_sunny)"
+        sun_status = sun_rescue_status or "skipped(not_sunny)"
     elif not (is_day and sun_high_enough and sun_facing_se):
         sun_status = "skipped(sun_gates_closed)"
     else:
@@ -2819,7 +2893,7 @@ def should_open_awning(
                     f"{econet_obs['sr']:.0f} W/m² ({econet_obs['percent']:.0f}% of clear sky)"
                 )
 
-    is_sunny = sunny_forecast and not (sky_vetoed or sun_vetoed)
+    is_sunny = sunny_candidate and not (sky_vetoed or sun_vetoed)
 
     # Wind: the WORSE of the model and whichever observations were fetched above.
     # Observations are only fetched when the forecast could still open the awning,
@@ -2957,6 +3031,13 @@ def should_open_awning(
                 f"(model ok: {model_trace}, overcast ok: {overcast_trace}; "
                 f"primary consistency disagreed: {obs_trace})"
             )
+
+    if sunny_rescued_measured and econet_obs is not None:
+        sunny_trace = (
+            f"MEASURED SUNSHINE RESCUE: {econet_obs['station']} measures "
+            f"{econet_obs['sr']:.0f} W/m² = {econet_obs['percent']:.0f}% of clear sky "
+            f">= {min_sun_percent_open:.0f}% (forecast disagreed: {sunny_trace})"
+        )
 
     if sky_vetoed and sky_obs is not None:
         sunny_trace = (
@@ -3281,7 +3362,7 @@ def main() -> None:
         wind_threshold, altitude_threshold, min_ghi, min_uv_index, min_dni, max_cloud_cover, min_temperature_f, overcast_threshold, min_dni_cirrus, rain_probability_threshold, radar_veto_dni, radar_veto_cloud_pct, min_dni_direct, sun_azimuth_min, sun_azimuth_max, sunny_crosscheck_enabled = get_thresholds()
         metar_station, metar_ceiling_ft = get_sky_observation_config()
         wind_gust_threshold = get_wind_gust_threshold()
-        econet_stations, min_sun_percent = get_sun_observation_config()
+        econet_stations, min_sun_percent, min_sun_percent_open = get_sun_observation_config()
         logger.info(
             f"Thresholds: model=(GHI >= {min_ghi:.0f} W/m² "
             f"OR [UV >= {min_uv_index:.1f} AND cloud < {max_cloud_cover:.0f}%] "
@@ -3302,8 +3383,9 @@ def main() -> None:
                 if metar_station else "sky_veto=(off), "
             )
             + (
-                f"sun_veto=({'>'.join(econet_stations)} < {min_sun_percent:.0f}% of clear sky)"
-                if econet_stations else "sun_veto=(off)"
+                f"sun_obs=({'>'.join(econet_stations)}: veto < {min_sun_percent:.0f}% / "
+                f"rescue >= {min_sun_percent_open:.0f}% of clear sky)"
+                if econet_stations else "sun_obs=(off)"
             )
         )
 
@@ -3381,6 +3463,7 @@ def main() -> None:
             wind_gust_threshold=wind_gust_threshold,
             econet_stations=econet_stations,
             min_sun_percent=min_sun_percent,
+            min_sun_percent_open=min_sun_percent_open,
             _attribution=rain_attribution_out,
             _sky_veto=sky_veto_out,
             _wind_alert=wind_alert_out,
