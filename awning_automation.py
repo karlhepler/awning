@@ -3129,41 +3129,44 @@ def build_close_reason(
     than printing the forecast's healthy GHI/DNI under "Not enough sun" (the
     2026-10-03 close would otherwise have announced GHI 601, DNI 645, cloud 15%).
 
+    Every message says "Close sent", not "Awning closed": the radio link to the
+    motor is one-way, so a transmitted command is all we can vouch for.
+
     Priority order: rain > wind > cold > not sunny > nighttime > sun position.
     """
     if not conditions["no_rain"]:
         if rain_attribution:
-            return f"🌧️ Awning closed: Rain signal — {rain_attribution}"
+            return f"🌧️ Close sent: Rain signal — {rain_attribution}"
         precip = round(precipitation, 1)
-        return f"🌧️ Awning closed: Rain starting ({precip} mm/h)"
+        return f"🌧️ Close sent: Rain starting ({precip} mm/h)"
 
     if not conditions["calm"]:
         if wind_alert:
-            return f"💨 Awning closed: Too windy ({wind_alert})"
+            return f"💨 Close sent: Too windy ({wind_alert})"
         wind_mph = int(round(wind_speed))
-        return f"💨 Awning closed: Too windy ({wind_mph} mph)"
+        return f"💨 Close sent: Too windy ({wind_mph} mph)"
 
     if not conditions["above_freezing"]:
         temp_f = int(round(temperature))
-        return f"❄️ Awning closed: Too cold ({temp_f}°F)"
+        return f"❄️ Close sent: Too cold ({temp_f}°F)"
 
     if not conditions["sunny"]:
         if sky_veto:
-            return f"☁️ Awning closed: {sky_veto}"
+            return f"☁️ Close sent: {sky_veto}"
         return (
-            f"☁️ Awning closed: Not enough sun "
+            f"☁️ Close sent: Not enough sun "
             f"(GHI {ghi:.0f} W/m², UV {uv_index:.1f}, "
             f"DNI {dni:.0f} W/m², cloud {cloud_cover:.0f}%)"
         )
 
     if not conditions["daytime"]:
-        return "🌙 Awning closed: Nighttime"
+        return "🌙 Close sent: Nighttime"
 
     if not conditions["sun_high"] or not conditions["sun_facing_window"]:
-        return "🌅 Awning closed: Sun moved past window"
+        return "🌅 Close sent: Sun moved past window"
 
     # Fallback (shouldn't happen)
-    return "🌙 Awning closed: Conditions changed"
+    return "🌙 Close sent: Conditions changed"
 
 
 def _format_friendly_telegram_message(
@@ -3206,7 +3209,10 @@ def _format_friendly_telegram_message(
         # Opening message - simple and positive
         temp_f = int(round(temperature))
         wind_mph = int(round(wind_speed))
-        return f"☀️ Awning opened - sunny & calm ({temp_f}°F, {wind_mph} mph wind)"
+        # "sent", not "opened": the radio link to the motor is one-way, so all
+        # we know is that Bond transmitted Open — not that the awning moved
+        # (2026-10-09: this message arrived while the awning stayed shut).
+        return f"☀️ Open sent - sunny & calm ({temp_f}°F, {wind_mph} mph wind)"
 
     return build_close_reason(
         conditions, wind_speed, precipitation, temperature,

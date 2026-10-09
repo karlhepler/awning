@@ -3177,6 +3177,42 @@ class TestDefaultConstantsSingleSource(unittest.TestCase):
         self.assertEqual(sun_azimuth_max, awning_automation.DEFAULT_SUN_AZIMUTH_MAX_DEG)
 
 
+class TestNotificationClaimsOnlyWhatIsKnown(unittest.TestCase):
+    """
+    The radio link to the motor is one-way, so a notification can only say a
+    command was SENT. 2026-10-09: "Awning opened" arrived at 08:45 while the
+    awning stayed shut — Bond flips its own state when it transmits, and that
+    flip is all the message was based on.
+    """
+
+    _ALL_OK = {
+        "sunny": True, "calm": True, "no_rain": True, "above_freezing": True,
+        "daytime": True, "sun_high": True, "sun_facing_window": True,
+    }
+    _READINGS = dict(
+        wind_speed=5.4, precipitation=0.0, temperature=63.7,
+        ghi=163.0, uv_index=0.6, dni=0.0, cloud_cover=100.0,
+    )
+
+    def test_open_message_says_sent_not_opened(self):
+        from awning_automation import _format_friendly_telegram_message
+
+        msg = _format_friendly_telegram_message(True, self._ALL_OK, **self._READINGS)
+
+        self.assertIn("Open sent", msg)
+        self.assertNotIn("opened", msg.lower())
+
+    def test_every_close_message_says_sent_not_closed(self):
+        from awning_automation import build_close_reason
+
+        for failing in self._ALL_OK:
+            with self.subTest(failing=failing):
+                conditions = dict(self._ALL_OK, **{failing: False})
+                msg = build_close_reason(conditions, **self._READINGS)
+                self.assertIn("Close sent", msg)
+                self.assertNotIn("Awning closed", msg)
+
+
 class TestCloseNotificationAttribution(unittest.TestCase):
     """
     The Telegram close message must name the rain signal that actually fired.
