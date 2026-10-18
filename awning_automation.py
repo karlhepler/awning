@@ -6,6 +6,9 @@ Automatically opens/closes awning based on weather conditions.
 - Opens awning if ALL 7 conditions are met: sunny, calm, no rain, above 45°F,
   daytime, sun high enough, and sun facing window (SUN_AZIMUTH_MIN_DEG-SUN_AZIMUTH_MAX_DEG,
   default 60°-249° for a southeast-facing window: sun from sunrise to late afternoon)
+  AND the sun is above the porch shade line (PORCH_SHADE_LINE): the house shadow
+  reaches the porch at a smaller azimuth when the sun is lower, so direction alone
+  cannot track the seasons
 - Closes awning if ANY condition fails
 
 Sunshine detection uses a two-layer gate plus a hard cloud-cover ceiling:
@@ -435,6 +438,17 @@ def load_location_config(env_file: Optional[Path] = None) -> tuple[float, float]
 DEFAULT_MIN_DNI_DIRECT_WM2 = 450.0
 DEFAULT_SUN_AZIMUTH_MIN_DEG = 60.0
 DEFAULT_SUN_AZIMUTH_MAX_DEG = 249.0
+
+# Porch shade line — (azimuth°, altitude°) points the sun must be ABOVE for light
+# to reach the porch. The house's shadow depends on the sun's direction AND its
+# height, so a fixed azimuth cutoff cannot hold across seasons: the same 249°
+# that is right in August (sun 48° up) keeps the awning open until 17:30 in
+# October (sun 13° up), long after the porch is shaded. Two operator
+# observations, positions from pvlib:
+#   2026-08-14 16:01  shadow reaches porch   az 249.5°, alt 48.0°
+#   2026-10-18 ~15:55 shade (open at 15:45, shaded by 16:00)  az 230.7°, alt 28.6°
+# The line runs through them and extends past both ends at the end segment's slope.
+DEFAULT_PORCH_SHADE_LINE = ((230.7, 28.6), (249.5, 48.0))
 
 # Cross-model sun confirmation — see the 2026-08-14 incident notes on
 # fetch_crosscheck_irradiance(). The models are named here once and the suffixed
@@ -983,6 +997,57 @@ def get_sun_observation_config() -> tuple[list, float, float]:
             f"({min_percent}); otherwise one reading could rescue and veto in the same run."
         )
     return stations, min_percent, open_percent
+
+
+def get_porch_shade_config() -> tuple:
+    """
+    Read PORCH_SHADE_LINE (optional) from the environment.
+
+    Format: comma-separated "azimuth:altitude" pairs in degrees, e.g.
+    "230.7:28.6,249.5:48.0". Each pair is one dated operator observation of the
+    sun position at which the porch goes into shade. Unset or blank uses
+    DEFAULT_PORCH_SHADE_LINE. Kept apart from get_thresholds() for the same
+    reason as get_sky_observation_config(): that tuple is unpacked positionally.
+
+    Returns:
+        Tuple of (azimuth, altitude) points sorted by azimuth, at least two.
+    """
+    raw = os.getenv("PORCH_SHADE_LINE", "").strip()
+    if not raw:
+        return DEFAULT_PORCH_SHADE_LINE
+
+    points = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            az_str, alt_str = token.split(":")
+            az, alt = float(az_str), float(alt_str)
+        except ValueError as e:
+            raise ConfigurationError(
+                f"Invalid PORCH_SHADE_LINE entry {token!r}. Use azimuth:altitude "
+                f"pairs in degrees, e.g. 230.7:28.6,249.5:48.0."
+            ) from e
+        if not (0 <= az <= 360) or not (0 <= alt <= 90):
+            raise ConfigurationError(
+                f"PORCH_SHADE_LINE entry {token!r} out of range: azimuth must be "
+                f"0-360 and altitude 0-90."
+            )
+        points.append((az, alt))
+
+    if len(points) < 2:
+        raise ConfigurationError(
+            "PORCH_SHADE_LINE needs at least two azimuth:altitude points to define a line."
+        )
+    points.sort()
+    azimuths = [p[0] for p in points]
+    if len(set(azimuths)) != len(azimuths):
+        raise ConfigurationError(
+            "PORCH_SHADE_LINE has two points with the same azimuth; each azimuth "
+            "must appear once."
+        )
+    return tuple(points)
 
 
 def get_wind_gust_threshold() -> float:
@@ -1815,6 +1880,32 @@ def is_sun_facing_window(
     return min_deg <= azimuth <= max_deg
 
 
+def porch_shade_line_altitude(azimuth: float, line: tuple = DEFAULT_PORCH_SHADE_LINE) -> float:
+    """
+    Altitude (degrees) the sun must exceed at this azimuth for light to reach the porch.
+
+    Linear between the line's points; beyond either end it continues at that end
+    segment's slope. `line` is a sequence of (azimuth, altitude) points sorted by
+    azimuth with at least two entries (get_porch_shade_config() guarantees this).
+    """
+    if azimuth <= line[0][0]:
+        (a0, h0), (a1, h1) = line[0], line[1]
+    elif azimuth >= line[-1][0]:
+        (a0, h0), (a1, h1) = line[-2], line[-1]
+    else:
+        for (a0, h0), (a1, h1) in zip(line, line[1:]):
+            if a0 <= azimuth <= a1:
+                break
+    return h0 + (h1 - h0) * (azimuth - a0) / (a1 - a0)
+
+
+def is_sun_above_shade_line(
+    azimuth: float, altitude: float, line: tuple = DEFAULT_PORCH_SHADE_LINE
+) -> bool:
+    """True if the sun is high enough, at this azimuth, to clear the house's shadow."""
+    return altitude > porch_shade_line_altitude(azimuth, line)
+
+
 def is_daytime(current_time: datetime, sunrise_str: str, sunset_str: str) -> bool:
     """
     Check if current time is between sunrise and sunset.
@@ -2418,6 +2509,7 @@ def should_open_awning(
     _sky_veto: Optional[list] = None,
     _wind_alert: Optional[list] = None,
     min_sun_percent_open: float = DEFAULT_MIN_SUN_PERCENT_OPEN,
+    porch_shade_line: tuple = DEFAULT_PORCH_SHADE_LINE,
 ) -> tuple[bool, str, dict]:
     """
     Determine if awning should be open based on ALL conditions.
@@ -2675,7 +2767,9 @@ def should_open_awning(
     above_freezing = temperature > min_temperature_f
     is_day = is_daytime(current_time, sunrise, sunset)
     sun_high_enough = altitude >= altitude_threshold
-    sun_facing_se = is_sun_facing_window(azimuth, sun_azimuth_min, sun_azimuth_max)
+    sun_in_arc = is_sun_facing_window(azimuth, sun_azimuth_min, sun_azimuth_max)
+    sun_above_shade = is_sun_above_shade_line(azimuth, altitude, porch_shade_line)
+    sun_facing_se = sun_in_arc and sun_above_shade
 
     # Cross-model sun confirmation — rescue-only, never a close.
     #
@@ -3074,10 +3168,16 @@ def should_open_awning(
         )
     if not sun_high_enough:
         reasons.append(f"Sun too low ({altitude:.1f}° < {altitude_threshold}°)")
-    if not sun_facing_se:
+    if not sun_in_arc:
         reasons.append(
             f"Sun not facing window (azimuth {azimuth:.1f}°, "
             f"need {sun_azimuth_min:.0f}°-{sun_azimuth_max:.0f}°)"
+        )
+    elif not sun_above_shade:
+        reasons.append(
+            f"Porch in house shadow (sun {azimuth:.1f}° at {altitude:.1f}°, "
+            f"needs > {porch_shade_line_altitude(azimuth, porch_shade_line):.1f}° "
+            f"at that azimuth)"
         )
 
     if should_open:
@@ -3369,6 +3469,7 @@ def main() -> None:
         metar_station, metar_ceiling_ft = get_sky_observation_config()
         wind_gust_threshold = get_wind_gust_threshold()
         econet_stations, min_sun_percent, min_sun_percent_open = get_sun_observation_config()
+        porch_shade_line = get_porch_shade_config()
         logger.info(
             f"Thresholds: model=(GHI >= {min_ghi:.0f} W/m² "
             f"OR [UV >= {min_uv_index:.1f} AND cloud < {max_cloud_cover:.0f}%] "
@@ -3379,6 +3480,7 @@ def main() -> None:
             f"Temp > {min_temperature_f:.0f}°F, "
             f"Sun altitude >= {altitude_threshold}°, "
             f"Sun facing window ({sun_azimuth_min:.0f}°-{sun_azimuth_max:.0f}°), "
+            f"porch_shade_line=({' -> '.join(f'{a:g}°/{h:g}°' for a, h in porch_shade_line)} az/alt), "
             f"radar_veto=(DNI >= {radar_veto_dni:.0f} W/m² AND cloud < {radar_veto_cloud_pct:.0f}%), "
             f"sunny_crosscheck=({'on' if sunny_crosscheck_enabled else 'off'}, "
             f"{'+'.join(_CROSSCHECK_MODELS)} all DNI >= {min_dni_direct:.0f} W/m² full "
@@ -3470,6 +3572,7 @@ def main() -> None:
             econet_stations=econet_stations,
             min_sun_percent=min_sun_percent,
             min_sun_percent_open=min_sun_percent_open,
+            porch_shade_line=porch_shade_line,
             _attribution=rain_attribution_out,
             _sky_veto=sky_veto_out,
             _wind_alert=wind_alert_out,

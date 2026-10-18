@@ -6648,5 +6648,126 @@ class TestLogRetention(unittest.TestCase):
             self.assertFalse(old.exists(), "a sane window still prunes old logs")
 
 
+class TestIsSunAboveShadeLine(unittest.TestCase):
+    """The shade line is linear between points and continues at the end slope."""
+
+    LINE = ((230.0, 30.0), (250.0, 50.0))  # slope exactly 1.0
+
+    def test_altitude_on_segment_is_interpolated(self):
+        self.assertAlmostEqual(
+            awning_automation.porch_shade_line_altitude(240.0, self.LINE), 40.0
+        )
+
+    def test_above_passes_below_and_on_the_line_fail(self):
+        f = awning_automation.is_sun_above_shade_line
+        self.assertTrue(f(240.0, 40.1, self.LINE))
+        self.assertFalse(f(240.0, 40.0, self.LINE), "on the line is shade")
+        self.assertFalse(f(240.0, 39.9, self.LINE))
+
+    def test_extends_past_both_ends_at_the_end_slope(self):
+        alt = awning_automation.porch_shade_line_altitude
+        self.assertAlmostEqual(alt(260.0, self.LINE), 60.0)
+        self.assertAlmostEqual(alt(200.0, self.LINE), 0.0)
+
+    def test_morning_azimuths_always_pass(self):
+        # Morning sun at the lowest altitude the sun-high gate allows.
+        for az in (60.0, 87.9, 102.0, 150.0):
+            self.assertTrue(
+                awning_automation.is_sun_above_shade_line(az, 12.0),
+                f"default line must not block morning sun at az {az}",
+            )
+
+    def test_three_point_line_uses_the_neighbouring_segment(self):
+        line = ((200.0, 20.0), (230.0, 30.0), (250.0, 70.0))
+        alt = awning_automation.porch_shade_line_altitude
+        self.assertAlmostEqual(alt(215.0, line), 25.0)
+        self.assertAlmostEqual(alt(240.0, line), 50.0)
+
+
+class TestGetPorchShadeConfig(unittest.TestCase):
+    def _read(self, value):
+        env = {} if value is None else {"PORCH_SHADE_LINE": value}
+        with unittest.mock.patch.dict(os.environ, env, clear=False):
+            if value is None:
+                os.environ.pop("PORCH_SHADE_LINE", None)
+            return awning_automation.get_porch_shade_config()
+
+    def test_unset_and_blank_use_the_default(self):
+        self.assertEqual(self._read(None), awning_automation.DEFAULT_PORCH_SHADE_LINE)
+        self.assertEqual(self._read("  "), awning_automation.DEFAULT_PORCH_SHADE_LINE)
+
+    def test_override_is_parsed_and_sorted_by_azimuth(self):
+        self.assertEqual(
+            self._read("249.5:48, 230.7:28.6 ,200:20"),
+            ((200.0, 20.0), (230.7, 28.6), (249.5, 48.0)),
+        )
+
+    def test_bad_values_raise_configuration_error(self):
+        for bad in ("230:30", "230:30,abc", "230:30,240", "230:30,240:50:1",
+                    "230:30,400:50", "230:30,240:95", "230:30,230:40"):
+            with self.assertRaises(ConfigurationError, msg=bad):
+                self._read(bad)
+
+
+class TestPorchShadeLine20261018(unittest.TestCase):
+    """
+    2026-10-18: the porch was in shade from the 16:00 run, yet the awning sent
+    Open every 15 minutes until 17:30. The old gate was one fixed azimuth cutoff
+    (249°), right for August's 48° sun and wrong for October's 25° sun, whose
+    longer shadow reaches the porch at a smaller azimuth.
+
+    Sun positions are the real cron-log readings; the 12° altitude gate is the
+    deployed .env value, so the shade line is the only gate that can differ.
+    Neither test passes porch_shade_line, so a change to the default constant
+    fails here.
+    """
+
+    def _result(self, azimuth, altitude):
+        return should_open_awning(
+            weather=_weather(
+                shortwave_radiation=700.0,
+                uv_index=6.0,
+                dni=780.0,
+                cloud_cover=0.0,
+                cloud_cover_low=0.0,
+                cloud_cover_mid=0.0,
+                cloud_cover_high=0.0,
+                temperature=60.0,
+                wind_speed=6.0,
+            ),
+            sun_position=_sun(azimuth=azimuth, altitude=altitude),
+            current_time=_DAYTIME,
+            **{**_THRESHOLDS, "altitude_threshold": 12.0},
+        )
+
+    def test_oct18_1545_still_on_the_porch_stays_open(self):
+        should_open, reason, _ = self._result(228.6, 30.1)
+        self.assertTrue(should_open, reason)
+
+    def test_oct18_afternoon_runs_after_shade_arrived_close(self):
+        # 16:00, 16:15, 16:30, 17:00, 17:30 — all logged OPEN that day.
+        for az, alt in ((231.8, 27.8), (234.9, 25.4), (237.9, 22.8),
+                        (243.4, 17.5), (248.4, 12.0)):
+            with self.subTest(az=az, alt=alt):
+                should_open, reason, conditions = self._result(az, alt)
+                self.assertFalse(should_open, f"az {az} alt {alt}: {reason}")
+                self.assertFalse(conditions["sun_facing_window"])
+                self.assertTrue(conditions["sun_high"], "isolation: only the shade line closes")
+                self.assertIn("Porch in house shadow", reason)
+
+    def test_oct13_slots_follow_the_same_line(self):
+        self.assertTrue(self._result(229.6, 31.8)[0], "15:45 on the porch")
+        self.assertFalse(self._result(233.0, 29.4)[0], "16:00 shaded")
+
+    def test_aug14_afternoon_is_unchanged(self):
+        self.assertTrue(self._result(245.7, 51.0)[0], "15:45 still open")
+        self.assertFalse(self._result(249.3, 48.2)[0], "16:00 closed (249° cap)")
+
+    def test_morning_sun_is_unaffected(self):
+        # 2026-09-28 08:15: the operator's confirmed should-be-open morning.
+        should_open, reason, _ = self._result(102.0, 12.7)
+        self.assertTrue(should_open, reason)
+
+
 if __name__ == "__main__":
     unittest.main()
