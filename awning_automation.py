@@ -3363,6 +3363,93 @@ def should_send_alert(
     return True
 
 
+# Manual override of the schedule: "auto" (no file) follows the weather, "closed"
+# always closes, "open" skips the sun/time conditions but still closes for wind or
+# rain. Lives in logs/.override next to .alert-state.json: deploy.sh never touches
+# logs/, and cleanup_old_logs() only deletes awning-*.log, so it survives both.
+OVERRIDE_MODES = ("auto", "closed", "open")
+OVERRIDE_FILENAME = ".override"
+
+
+def override_path_for(log_path) -> Optional[Path]:
+    """The override file beside the logs, or None when log_path is not a real Path."""
+    return log_path.parent / OVERRIDE_FILENAME if isinstance(log_path, Path) else None
+
+
+def read_override(path: Optional[Path]) -> str:
+    """
+    Read the override mode: "auto", "closed" or "open". Never raises.
+
+    No file (or no path) is "auto". A file that exists but cannot be read or holds
+    anything unrecognised is "closed": a deliberately placed override that nobody
+    can interpret should fail toward a retracted awning, not toward the weather.
+    """
+    if path is None:
+        return "auto"
+    try:
+        value = path.read_text().strip().lower()
+    except FileNotFoundError:
+        return "auto"
+    except Exception as e:
+        logger.warning(f"Could not read override file {path} ({e}) — treating as closed")
+        return "closed"
+    if value in OVERRIDE_MODES:
+        return value
+    logger.warning(f"Unrecognised override {value!r} in {path} — treating as closed")
+    return "closed"
+
+
+def apply_override(
+    mode: str, should_open: bool, reason: str, conditions: dict
+) -> tuple[bool, str]:
+    """
+    Apply the override to the weather's decision. Pure: reads and sends nothing.
+
+    "open" overrides only the sun/time conditions. Wind and rain still close the
+    awning, so a forgotten force-open cannot leave it extended into a storm.
+    `conditions` is left untouched; it must stay all-bool.
+    """
+    if mode == "closed":
+        return False, f"OVERRIDE forced CLOSED (weather alone would say: {reason})"
+    if mode == "open":
+        if conditions["calm"] and conditions["no_rain"]:
+            return True, f"OVERRIDE forced OPEN (weather alone would say: {reason})"
+        return False, f"OVERRIDE forced OPEN, but closing for safety: {reason}"
+    return should_open, reason
+
+
+def set_override(value: str, log_path, env_file: Optional[Path]) -> int:
+    """
+    Write (or, for "auto", remove) the override file. Returns a process exit code.
+
+    Tells the operator on Telegram when configured: the follow-up run only
+    notifies on a state change, and an override set while the awning is already
+    in the right place changes nothing.
+    """
+    value = value.strip().lower()
+    path = override_path_for(log_path)
+    if value not in OVERRIDE_MODES or path is None:
+        logger.error(f"Usage: --set-override={'|'.join(OVERRIDE_MODES)}")
+        return 2
+    try:
+        if value == "auto":
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(value + "\n")
+    except OSError as e:
+        logger.error(f"Could not update override file {path}: {e}")
+        return 1
+    logger.info(f"Override set to {value}")
+
+    if env_file and env_file.exists():
+        load_dotenv(env_file)
+    token, chat_id = load_telegram_config()
+    if token:
+        icon = {"closed": "🔒", "open": "🔓", "auto": "🌤️"}[value]
+        send_telegram_notification(token, chat_id, f"{icon} Override set to {value}")
+    return 0
+
+
 def get_log_retention_days() -> int:
     """
     Read LOG_RETENTION_DAYS, falling back to the default instead of raising.
@@ -3451,6 +3538,12 @@ def main() -> None:
 
     if env_file:
         logger.info(f"Using .env file: {env_file}")
+
+    # --set-override=closed|open|auto: record the mode and stop. It fetches no
+    # weather and sends no command; ./override.sh follows it with a normal run.
+    for arg in sys.argv:
+        if arg.startswith("--set-override="):
+            sys.exit(set_override(arg.split("=", 1)[1], log_path, env_file))
 
     # Initialize telegram config (will be loaded in try block)
     telegram_token, telegram_chat_id = None, None
@@ -3581,6 +3674,20 @@ def main() -> None:
         sky_veto = "; ".join(sky_veto_out) if sky_veto_out else None
         wind_alert = wind_alert_out[0] if wind_alert_out else None
 
+        # Manual override (see apply_override). Weather is still fetched in every
+        # mode: force-open needs wind and rain, and the log keeps its detail.
+        override_file = override_path_for(log_path)
+        override_mode = read_override(override_file)
+        if override_mode == "auto":
+            logger.info("Override: auto (following the weather)")
+        else:
+            try:
+                set_at = datetime.fromtimestamp(override_file.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            except OSError:
+                set_at = "unknown"
+            logger.info(f"Override: {override_mode} (set {set_at})")
+        should_open, reason = apply_override(override_mode, should_open, reason, conditions)
+
         # Log conditions with checkmarks/crosses
         condition_symbols = {
             "sunny": "Sunny" if conditions["sunny"] else "Not sunny",
@@ -3628,20 +3735,28 @@ def main() -> None:
         # Get state after action and notify only if it changed
         state_after = controller.get_state()
         if telegram_token and state_before != state_after:
-            msg = _format_friendly_telegram_message(
-                should_open,
-                conditions,
-                weather["wind_speed_10m"],
-                weather["precipitation"],
-                weather["temperature"],
-                weather["shortwave_radiation"],
-                weather["uv_index"],
-                weather.get("dni", 0.0),
-                weather.get("cloud_cover", 100.0),
-                rain_attribution=rain_attribution,
-                sky_veto=sky_veto,
-                wind_alert=wind_alert,
-            )
+            # The ordinary message would claim "Not enough sun" / "sunny & calm"
+            # when the override decided. A force-open safety close (wind, rain)
+            # keeps the ordinary message, which names that cause.
+            if override_mode == "closed":
+                msg = "🔒 Close sent: Override — forced closed"
+            elif override_mode == "open" and should_open:
+                msg = "🔓 Open sent: Override — forced open"
+            else:
+                msg = _format_friendly_telegram_message(
+                    should_open,
+                    conditions,
+                    weather["wind_speed_10m"],
+                    weather["precipitation"],
+                    weather["temperature"],
+                    weather["shortwave_radiation"],
+                    weather["uv_index"],
+                    weather.get("dni", 0.0),
+                    weather.get("cloud_cover", 100.0),
+                    rain_attribution=rain_attribution,
+                    sky_veto=sky_veto,
+                    wind_alert=wind_alert,
+                )
             send_telegram_notification(telegram_token, telegram_chat_id, msg)
 
         logger.info("Automation complete")

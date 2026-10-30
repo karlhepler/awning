@@ -8,6 +8,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # CLI commands
 nix run . -- open|close|stop|toggle|status|info
 
+# Override the schedule (closed|open|auto; sets it on the Pi, then runs once)
+./override.sh closed
+
 # Weather automation
 nix run .#automation -- --dry-run
 nix run .#automation -- --env-file=/path/to/.env
@@ -190,6 +193,14 @@ Measured over 14 days (420 daytime 15-min slots), smoothing plus the Tier-2 resc
    Both bounds are env-tunable, so the arc can be recalibrated on the device **without redeploying code**.
 
 If ANY condition fails, the awning closes.
+
+**Manual override (`./override.sh closed|open|auto`, added 2026-10-30).** Three states, changeable freely in any direction, no expiry: `auto` (the weather decides, the default), `closed` (always send Close) and `open`. Added so the awning can be kept out of the way for a house pressure-wash without the next cron run undoing it.
+- **`open` skips only the sun/time conditions** (sunny, daytime, sun height, sun facing/porch shade, temperature). **`calm` and `no_rain` still close it** (operator's choice): a forced-open awning that gets forgotten must not be left extended in a storm. When wind or rain passes it opens again by itself.
+- **Where it lives:** the one-word file `logs/.override` beside `.alert-state.json` (on the Pi: `~/.config/awning/logs/.override`). No file means `auto`. `deploy.sh` never touches `logs/` and `cleanup_old_logs()` only deletes `awning-*.log`, so it survives deploys and cleanup. A file that exists but is unreadable or unrecognised is treated as `closed` (fails toward a retracted awning).
+- **How it is applied:** `apply_override()` is pure and runs in `main()` right after `should_open_awning()`. Weather is still fetched in every mode (force-open needs wind and rain; the log keeps its detail). `conditions` is not modified (it must stay all-bool). Every run logs an `Override:` line; `Decision:` is prefixed `OVERRIDE forced CLOSED/OPEN` and keeps what the weather alone would have said. A weather outage still triggers the fail-safe close, even when forced open: without weather there is no wind or rain check.
+- **Setting it:** `awning_automation.py --set-override=closed|open|auto` writes (or, for `auto`, deletes) the file and exits, with no weather fetch and no Bond command. `override.sh` runs that on the Pi over SSH (`lan-run`, key login), checks the file really changed (a Pi still on pre-feature code would ignore the flag and just run normally), then runs the automation once so the awning moves immediately instead of waiting up to 15 minutes.
+- **Telegram:** a state change under `closed` sends `🔒 Close sent: Override — forced closed`; under `open`, `🔓 Open sent: Override — forced open`. A forced-open safety close keeps the ordinary wind/rain message. Setting the override also sends `Override set to …`, since the follow-up run is silent when the awning is already in place.
+- **The heartbeat keeps pinging** during an override (cron is healthy). Tests: `TestOverride`.
 
 **Fail-safe (`_fail_safe_close()`):** if the automation cannot make a trustworthy decision it closes the awning. That now covers the weather API being unavailable **and any unexpected exception raised before a command has been sent** (previously only `WeatherAPIError` did, so an ordinary bug between "got the weather" and "told the awning what to do" left it wherever it was — open, in a storm). It **always sends Close** rather than only when Bond reports open: Bond's state drifts whenever the physical remote is used (one-way RF, see `OPEN_ON_OPEN.md`), and a duplicate Close at the limit switch is harmless. Telegram stays quiet when Bond already said closed, so a long outage does not send 96 identical messages a day. It is deliberately **not** triggered by `ConfigurationError` (a deploy-time typo) or by anything after the command is sent — a Telegram, log-cleanup or heartbeat failure must never undo a correct decision (`actuated` flag). It uses the same `--env-file` as the run. Tests: `TestFailSafeClose`.
 

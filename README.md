@@ -99,6 +99,19 @@ The automation opens the awning only when ALL seven conditions are met:
 
 If any condition fails the awning closes. If the automation cannot get a trustworthy answer (weather service down, or an unexpected error before a command is sent) it closes the awning as a fail-safe. Data comes from [Open-Meteo](https://open-meteo.com) (forecast), [RainViewer](https://www.rainviewer.com) (radar), [aviationweather.gov](https://aviationweather.gov) (airport observations, optional) and [NC State ECONet](https://econet.climate.ncsu.edu) (measured sunshine, wind and rain from nearby research stations, optional; North Carolina only). Details, thresholds and the incidents behind each rule are in `CLAUDE.md`.
 
+### Overriding the schedule
+
+To keep the awning shut (say, while the house is being pressure washed) or hold it open, regardless of the schedule:
+
+```bash
+./override.sh closed   # always closed until you clear it
+./override.sh open     # held open; still closes for wind or rain
+./override.sh auto     # back to the weather and schedule
+./override.sh          # show the current mode
+```
+
+You can switch freely between the three. There is no timer: the setting stays until you change it, so remember `auto` afterwards. The script sets it on the device over SSH and runs the automation once so the awning moves right away. `open` skips the sun, time-of-day and temperature checks only; high wind or rain still close it.
+
 ### Deploying to a Raspberry Pi / Orange Pi
 
 `./deploy.sh` copies the scripts and your `.env` to the device and installs the cron job. It needs your interactive password, so you run it yourself.

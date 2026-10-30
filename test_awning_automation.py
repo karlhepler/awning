@@ -6769,5 +6769,192 @@ class TestPorchShadeLine20261018(unittest.TestCase):
         self.assertTrue(should_open, reason)
 
 
+class TestOverride(unittest.TestCase):
+    """Manual override: closed / auto / open (open still closes for wind and rain)."""
+
+    _THRESHOLDS_TUPLE = (15, 15, 400, 4, 50, 80, 45, 95, 30, 20, 650.0, 15.0, 450.0, 60.0, 249.0, True)
+    _ALL_OK = {
+        "sunny": True, "calm": True, "no_rain": True, "above_freezing": True,
+        "daytime": True, "sun_high": True, "sun_facing_window": True,
+    }
+
+    # -- read_override ------------------------------------------------------
+
+    def _read(self, content=None, path_is_none=False):
+        import tempfile
+        import awning_automation
+        if path_is_none:
+            return awning_automation.read_override(None)
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / ".override"
+            if content is not None:
+                path.write_text(content)
+            return awning_automation.read_override(path)
+
+    def test_no_path_or_no_file_is_auto(self):
+        self.assertEqual(self._read(path_is_none=True), "auto")
+        self.assertEqual(self._read(None), "auto")
+
+    def test_recognised_modes_ignore_case_and_whitespace(self):
+        self.assertEqual(self._read("closed\n"), "closed")
+        self.assertEqual(self._read("  OPEN  "), "open")
+        self.assertEqual(self._read("auto"), "auto")
+
+    def test_garbage_or_empty_file_fails_toward_closed(self):
+        self.assertEqual(self._read("banana"), "closed")
+        self.assertEqual(self._read(""), "closed")
+
+    def test_unreadable_path_fails_toward_closed(self):
+        import tempfile
+        import awning_automation
+        with tempfile.TemporaryDirectory() as d:
+            # A directory where the file should be: read_text raises IsADirectoryError.
+            self.assertEqual(awning_automation.read_override(Path(d)), "closed")
+
+    # -- apply_override -----------------------------------------------------
+
+    def _apply(self, mode, should_open, **failing):
+        import awning_automation
+        conditions = {**self._ALL_OK, **{k: False for k in failing}}
+        return awning_automation.apply_override(mode, should_open, "weather reason", conditions), conditions
+
+    def test_auto_passes_the_weather_through(self):
+        (opened, reason), _ = self._apply("auto", True)
+        self.assertTrue(opened)
+        self.assertEqual(reason, "weather reason")
+        (opened, reason), _ = self._apply("auto", False, sunny=False)
+        self.assertFalse(opened)
+        self.assertEqual(reason, "weather reason")
+
+    def test_closed_closes_a_perfect_day(self):
+        (opened, reason), _ = self._apply("closed", True)
+        self.assertFalse(opened)
+        self.assertIn("forced CLOSED", reason)
+
+    def test_open_opens_when_sun_and_time_conditions_fail(self):
+        for failing in ("sunny", "daytime", "sun_high", "sun_facing_window", "above_freezing"):
+            with self.subTest(failing=failing):
+                (opened, reason), _ = self._apply("open", False, **{failing: False})
+                self.assertTrue(opened)
+                self.assertIn("forced OPEN", reason)
+
+    def test_open_still_closes_for_wind_or_rain(self):
+        for failing in ("calm", "no_rain"):
+            with self.subTest(failing=failing):
+                (opened, reason), _ = self._apply("open", False, **{failing: False})
+                self.assertFalse(opened)
+                self.assertIn("closing for safety", reason)
+
+    def test_conditions_stay_all_bool_and_unchanged(self):
+        (_, _), conditions = self._apply("open", False, sunny=False)
+        self.assertTrue(all(isinstance(v, bool) for v in conditions.values()))
+        self.assertFalse(conditions["sunny"])
+
+    # -- main() composition root -------------------------------------------
+
+    def _weather_for(self, wind_speed=5.0):
+        weather = _weather(shortwave_radiation=500.0, uv_index=6.0, dni=450.0,
+                           precipitation=0.0, wind_speed=wind_speed)
+        weather["time"] = "2026-04-17T13:00:00"
+        return weather
+
+    def _run_main(self, override, *, altitude=40.0, wind_speed=5.0, states=(0, 1), argv=()):
+        """Drive the real main() with the override file set; return (controller, send mock, dir)."""
+        import sys
+        import tempfile
+        from unittest.mock import patch, MagicMock
+        import awning_automation
+
+        controller = MagicMock()
+        controller.get_state.side_effect = list(states)
+        with tempfile.TemporaryDirectory() as d:
+            log_path = Path(d) / "awning-2026-04-17.log"
+            if override is not None:
+                (Path(d) / ".override").write_text(override)
+            with patch.object(sys, "argv", ["awning_automation.py", *argv]), \
+                 patch.dict(os.environ, {"HEARTBEAT_PING_URL": ""}), \
+                 patch.object(awning_automation, "setup_logging", return_value=log_path), \
+                 patch.object(awning_automation, "load_location_config", return_value=(35.778, -78.838)), \
+                 patch.object(awning_automation, "get_thresholds", return_value=self._THRESHOLDS_TUPLE), \
+                 patch.object(awning_automation, "load_telegram_config", return_value=("tok", "chat")), \
+                 patch.object(awning_automation, "collect_weather_measurements", return_value=self._weather_for(wind_speed)), \
+                 patch.object(awning_automation, "calculate_sun_position", return_value={"azimuth": 150.0, "altitude": altitude}), \
+                 patch.object(awning_automation, "is_raining_on_radar", return_value=False), \
+                 patch.object(awning_automation, "create_controller_from_env", return_value=controller), \
+                 patch.object(awning_automation, "send_telegram_notification") as send:
+                awning_automation.main()
+        return controller, send
+
+    def test_no_override_file_behaves_as_before(self):
+        controller, send = self._run_main(None)
+        controller.open.assert_called_once()
+        self.assertIn("Open sent - sunny & calm", send.call_args[0][2])
+
+    def test_forced_closed_closes_a_perfect_day_and_says_why(self):
+        controller, send = self._run_main("closed", states=(1, 0))
+        controller.close.assert_called_once()
+        controller.open.assert_not_called()
+        self.assertEqual(send.call_args[0][2], "🔒 Close sent: Override — forced closed")
+
+    def test_forced_open_opens_with_the_sun_too_low_and_says_why(self):
+        controller, send = self._run_main("open", altitude=5.0)
+        controller.open.assert_called_once()
+        controller.close.assert_not_called()
+        self.assertEqual(send.call_args[0][2], "🔓 Open sent: Override — forced open")
+
+    def test_forced_open_still_closes_in_wind_and_names_the_wind(self):
+        controller, send = self._run_main("open", wind_speed=30.0, states=(1, 0))
+        controller.close.assert_called_once()
+        controller.open.assert_not_called()
+        self.assertIn("Too windy", send.call_args[0][2])
+
+    # -- --set-override ------------------------------------------------------
+
+    def _set(self, value, existing=None):
+        import sys
+        import tempfile
+        from unittest.mock import patch
+        import awning_automation
+
+        with tempfile.TemporaryDirectory() as d:
+            log_path = Path(d) / "awning-2026-04-17.log"
+            override = Path(d) / ".override"
+            if existing is not None:
+                override.write_text(existing)
+            with patch.object(sys, "argv", ["awning_automation.py", f"--set-override={value}"]), \
+                 patch.object(awning_automation, "setup_logging", return_value=log_path), \
+                 patch.object(awning_automation, "load_telegram_config", return_value=("tok", "chat")), \
+                 patch.object(awning_automation, "collect_weather_measurements") as weather, \
+                 patch.object(awning_automation, "create_controller_from_env") as controller, \
+                 patch.object(awning_automation, "send_telegram_notification") as send:
+                with self.assertRaises(SystemExit) as cm:
+                    awning_automation.main()
+            weather.assert_not_called()
+            controller.assert_not_called()
+            content = override.read_text() if override.exists() else None
+        return cm.exception.code, content, send
+
+    def test_set_override_writes_the_mode_without_touching_weather_or_bond(self):
+        code, content, send = self._set("closed")
+        self.assertEqual(code, 0)
+        self.assertEqual(content.strip(), "closed")
+        self.assertIn("closed", send.call_args[0][2])
+
+    def test_set_override_switches_freely_between_modes(self):
+        self.assertEqual(self._set("open", existing="closed")[1].strip(), "open")
+        self.assertEqual(self._set("closed", existing="open")[1].strip(), "closed")
+
+    def test_set_override_auto_removes_the_file(self):
+        code, content, _ = self._set("auto", existing="closed")
+        self.assertEqual(code, 0)
+        self.assertIsNone(content)
+
+    def test_set_override_rejects_an_unknown_mode(self):
+        code, content, send = self._set("banana", existing="open")
+        self.assertEqual(code, 2)
+        self.assertEqual(content, "open", "a rejected value must not change the setting")
+        send.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
