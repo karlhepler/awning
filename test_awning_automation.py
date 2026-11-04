@@ -6769,6 +6769,75 @@ class TestPorchShadeLine20261018(unittest.TestCase):
         self.assertTrue(should_open, reason)
 
 
+class TestPorchShadeLine20261104(unittest.TestCase):
+    """
+    2026-11-04: the awning opened at 14:30 (sun az 221.7, alt 27.5) although the
+    porch was already out of the sun. The two-point line extended its steep
+    slope past 230.7 and kept the sun "on the porch" until ~19 deg of altitude.
+    A third observation (14:30, provisional: judged under cloud) fixes the
+    afternoon; the line must NOT be consulted for morning sun, because its
+    shallow first segment would otherwise delay winter openings by up to 30 min.
+
+    Neither test passes porch_shade_line, so a change to the default fails here.
+    """
+
+    def _result(self, azimuth, altitude):
+        return should_open_awning(
+            weather=_weather(
+                shortwave_radiation=700.0,
+                uv_index=6.0,
+                dni=780.0,
+                cloud_cover=0.0,
+                cloud_cover_low=0.0,
+                cloud_cover_mid=0.0,
+                cloud_cover_high=0.0,
+                temperature=60.0,
+                wind_speed=6.0,
+            ),
+            sun_position=_sun(azimuth=azimuth, altitude=altitude),
+            current_time=_DAYTIME,
+            **{**_THRESHOLDS, "altitude_threshold": 12.0},
+        )
+
+    def test_nov4_1430_closes(self):
+        should_open, reason, conditions = self._result(221.7, 27.5)
+        self.assertFalse(should_open, reason)
+        self.assertFalse(conditions["sun_facing_window"])
+        self.assertTrue(conditions["sun_high"], "isolation: only the shade line closes")
+        self.assertIn("Porch in house shadow", reason)
+
+    def test_nov4_1415_still_on_the_porch_stays_open(self):
+        should_open, reason, _ = self._result(218.2, 29.4)
+        self.assertTrue(should_open, reason)
+
+    def test_nov4_later_afternoon_slots_close(self):
+        for az, alt in ((225.0, 25.4), (228.1, 23.2), (236.7, 16.0)):
+            with self.subTest(az=az, alt=alt):
+                self.assertFalse(self._result(az, alt)[0])
+
+    def test_earlier_observations_are_unchanged(self):
+        self.assertTrue(self._result(228.5, 30.2)[0], "10-18 15:45 open")
+        self.assertFalse(self._result(231.8, 27.8)[0], "10-18 16:00 closed")
+        self.assertTrue(self._result(245.7, 51.0)[0], "08-14 15:45 open")
+        self.assertFalse(self._result(249.3, 48.2)[0], "08-14 16:00 closed")
+
+    def test_winter_morning_is_not_blocked_by_the_shade_line(self):
+        # Dec 21 ~09:00 (az ~134, alt ~14) and Jan 15 morning slots, plus the
+        # lowest sun the altitude gate allows. Extending the shallow first
+        # segment to these azimuths would demand a far higher sun.
+        for az, alt in ((134.0, 14.0), (120.0, 12.5), (150.0, 12.0), (179.9, 12.0)):
+            with self.subTest(az=az, alt=alt):
+                self.assertTrue(
+                    awning_automation.is_sun_above_shade_line(az, alt),
+                    f"morning/noon az {az} must not be blocked by the shade line",
+                )
+
+    def test_noon_sun_at_winter_solstice_has_no_jump_at_the_cutoff(self):
+        # Lowest sun at az 180 is ~30.8 deg; the line there must be below it.
+        line_alt = awning_automation.porch_shade_line_altitude(180.0)
+        self.assertLess(line_alt, 30.8)
+
+
 class TestOverride(unittest.TestCase):
     """Manual override: closed / auto / open (open still closes for wind and rain)."""
 

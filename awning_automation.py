@@ -447,8 +447,19 @@ DEFAULT_SUN_AZIMUTH_MAX_DEG = 249.0
 # observations, positions from pvlib:
 #   2026-08-14 16:01  shadow reaches porch   az 249.5°, alt 48.0°
 #   2026-10-18 ~15:55 shade (open at 15:45, shaded by 16:00)  az 230.7°, alt 28.6°
+#   2026-11-04 14:30  porch already out of the sun when the awning opened (judged
+#                     from light/shadow on the porch under cloud, so the true time
+#                     is "by 14:30" or earlier — provisional)  az 221.7°, alt 27.5°
 # The line runs through them and extends past both ends at the end segment's slope.
-DEFAULT_PORCH_SHADE_LINE = ((230.7, 28.6), (249.5, 48.0))
+DEFAULT_PORCH_SHADE_LINE = ((221.7, 27.5), (230.7, 28.6), (249.5, 48.0))
+
+# The house shadow reaches the porch only in the afternoon, and the line above is
+# fitted to afternoon observations alone. Extending its (shallow) first segment
+# down to morning azimuths would demand a high sun and delay winter openings by
+# up to 30 minutes (checked with pvlib: Dec 21 08:45 -> 09:15). Below this azimuth
+# the line is not consulted. At 180° (solar noon) the sun here is never lower than
+# ~30.8° (winter solstice), above the line at that azimuth, so there is no jump.
+_SHADE_LINE_MIN_AZIMUTH = 180.0
 
 # Cross-model sun confirmation — see the 2026-08-14 incident notes on
 # fetch_crosscheck_irradiance(). The models are named here once and the suffixed
@@ -1902,7 +1913,13 @@ def porch_shade_line_altitude(azimuth: float, line: tuple = DEFAULT_PORCH_SHADE_
 def is_sun_above_shade_line(
     azimuth: float, altitude: float, line: tuple = DEFAULT_PORCH_SHADE_LINE
 ) -> bool:
-    """True if the sun is high enough, at this azimuth, to clear the house's shadow."""
+    """True if the sun is high enough, at this azimuth, to clear the house's shadow.
+
+    Morning sun (azimuth below _SHADE_LINE_MIN_AZIMUTH) always passes: the line is
+    fitted to afternoon observations only.
+    """
+    if azimuth < _SHADE_LINE_MIN_AZIMUTH:
+        return True
     return altitude > porch_shade_line_altitude(azimuth, line)
 
 
