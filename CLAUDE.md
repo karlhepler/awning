@@ -53,6 +53,7 @@ Bond Bridge awning controller - sends HTTP commands to control a motorized awnin
 - `AwningCLI` class - Handles user-facing command execution
 - Uses `rich` library for colorful output
 - Catches exceptions from controller and displays user-friendly error messages
+- `open|close --until T|--forever`, `auto` and `override` do **not** use the controller: they set or show the schedule override on the Pi over SSH via `awning_override.py` (Mac-only, not deployed to the Pi). `parse_until()` there is pure; it turns `5pm` / `17:30` / `3h` into an absolute timestamp with a zone. See "Manual override" below.
 
 **Weather Automation (`awning_automation.py`):**
 - Automatically opens/closes awning based on weather and sun conditions
