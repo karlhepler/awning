@@ -104,13 +104,14 @@ If any condition fails the awning closes. If the automation cannot get a trustwo
 To keep the awning shut (say, while the house is being pressure washed) or hold it open, regardless of the schedule:
 
 ```bash
-./override.sh closed   # always closed until you clear it
-./override.sh open     # held open; still closes for wind or rain
-./override.sh auto     # back to the weather and schedule
-./override.sh          # show the current mode
+nix run . -- close --until 5pm     # closed until 5pm today (or tomorrow, if 5pm has passed)
+nix run . -- close --until 3h      # closed for 3 hours (also 90m, 1h30m, 17:30)
+nix run . -- open --forever        # held open until you clear it
+nix run . -- auto                  # back to the weather and schedule
+nix run . -- override              # show the current hold
 ```
 
-You can switch freely between the three. There is no timer: the setting stays until you change it, so remember `auto` afterwards. The script sets it on the device over SSH and runs the automation once so the awning moves right away. `open` skips the sun, time-of-day and temperature checks only; high wind or rain still close it.
+`--until` and `--forever` go with `open` or `close` (one or the other). When the time is up the awning goes back to following the weather; the device checks every 15 minutes, so it can end up to 15 minutes late. With `--forever` the hold stays until you run `auto`. You can switch freely at any time. The hold is set on the device over SSH, and the automation runs once so the awning moves right away. `open` skips the sun, time-of-day and temperature checks only; high wind or rain still close it. Plain `open` / `close` with no flag just send the command, and the next 15-minute run can undo it.
 
 ### Deploying to a Raspberry Pi / Orange Pi
 

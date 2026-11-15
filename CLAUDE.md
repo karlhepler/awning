@@ -8,8 +8,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # CLI commands
 nix run . -- open|close|stop|toggle|status|info
 
-# Override the schedule (closed|open|auto; sets it on the Pi, then runs once)
-./override.sh closed
+# Hold the awning open/closed on the Pi (sets it there, then runs the automation once)
+nix run . -- close --until 5pm      # also 17:30, 3h, 90m, 1h30m; then back to the weather
+nix run . -- open --forever         # until you run `auto`
+nix run . -- auto                   # clear the hold
+nix run . -- override               # show the current hold
 
 # Weather automation
 nix run .#automation -- --dry-run
@@ -195,11 +198,11 @@ Measured over 14 days (420 daytime 15-min slots), smoothing plus the Tier-2 resc
 
 If ANY condition fails, the awning closes.
 
-**Manual override (`./override.sh closed|open|auto`, added 2026-10-30).** Three states, changeable freely in any direction, no expiry: `auto` (the weather decides, the default), `closed` (always send Close) and `open`. Added so the awning can be kept out of the way for a house pressure-wash without the next cron run undoing it.
+**Manual override (`awning close|open --until T|--forever`, `awning auto`; added 2026-10-30, `--until` added 2026-11-15).** Three states, changeable freely in any direction: `auto` (the weather decides, the default), `closed` (always send Close) and `open`. Added so the awning can be kept out of the way for a house pressure-wash without the next cron run undoing it. `closed`/`open` end either at a given time (`--until`, then back to `auto`) or never (`--forever`); `override.sh` was replaced by these flags. Plain `awning open|close` with no flag still talks straight to Bond and the next cron run can undo it.
 - **`open` skips only the sun/time conditions** (sunny, daytime, sun height, sun facing/porch shade, temperature). **`calm` and `no_rain` still close it** (operator's choice): a forced-open awning that gets forgotten must not be left extended in a storm. When wind or rain passes it opens again by itself.
-- **Where it lives:** the one-word file `logs/.override` beside `.alert-state.json` (on the Pi: `~/.config/awning/logs/.override`). No file means `auto`. `deploy.sh` never touches `logs/` and `cleanup_old_logs()` only deletes `awning-*.log`, so it survives deploys and cleanup. A file that exists but is unreadable or unrecognised is treated as `closed` (fails toward a retracted awning).
+- **Where it lives:** the file `logs/.override` beside `.alert-state.json` (line 1 is the mode; an optional line 2 `until=<ISO timestamp with zone>`; no `until=` line means forever) (on the Pi: `~/.config/awning/logs/.override`). No file means `auto`. `deploy.sh` never touches `logs/` and `cleanup_old_logs()` only deletes `awning-*.log`, so it survives deploys and cleanup. A file that exists but is unreadable, has an unrecognised mode, or has an unreadable `until=` line is treated as `closed` (fails toward a retracted awning). **Expiry** is checked on each cron run, so a hold ends at the first run after its time (up to 15 minutes late); the run that notices removes the file and logs `Override: auto (the override ended …)`. The Mac computes the absolute end time (a clock time means its next occurrence; a length is added to now) and sends it with its zone, so the Pi needs no shared clock settings.
 - **How it is applied:** `apply_override()` is pure and runs in `main()` right after `should_open_awning()`. Weather is still fetched in every mode (force-open needs wind and rain; the log keeps its detail). `conditions` is not modified (it must stay all-bool). Every run logs an `Override:` line; `Decision:` is prefixed `OVERRIDE forced CLOSED/OPEN` and keeps what the weather alone would have said. A weather outage still triggers the fail-safe close, even when forced open: without weather there is no wind or rain check.
-- **Setting it:** `awning_automation.py --set-override=closed|open|auto` writes (or, for `auto`, deletes) the file and exits, with no weather fetch and no Bond command. `override.sh` runs that on the Pi over SSH (`lan-run`, key login), checks the file really changed (a Pi still on pre-feature code would ignore the flag and just run normally), then runs the automation once so the awning moves immediately instead of waiting up to 15 minutes.
+- **Setting it:** `awning_automation.py --set-override=closed|open|auto [--until=<ISO timestamp>]` writes (or, for `auto`, deletes) the file and exits, with no weather fetch and no Bond command; `--show-override` prints the current state and exits. `awning.py` (module `awning_override.py`, Mac only, never deployed) runs those on the Pi over SSH (`lan-run`, key login; host from `PI_HOST`), checks the file really changed (a Pi still on pre-feature code would ignore the flags and just run normally), then runs the automation once so the awning moves immediately instead of waiting up to 15 minutes. **Deploy before first use**: until `./deploy.sh` has run, the Pi ignores `--until` and the check above refuses with a message saying so. Tests: `test_awning_override.py`, `TestHoldFlags` in `test_awning_cli.py`.
 - **Telegram:** a state change under `closed` sends `🔒 Close sent: Override — forced closed`; under `open`, `🔓 Open sent: Override — forced open`. A forced-open safety close keeps the ordinary wind/rain message. Setting the override also sends `Override set to …`, since the follow-up run is silent when the awning is already in place.
 - **The heartbeat keeps pinging** during an override (cron is healthy). Tests: `TestOverride`.
 

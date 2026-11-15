@@ -125,3 +125,71 @@ class TestMain(CliTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHoldFlags(CliTestCase):
+    """`open|close --until T | --forever`, `auto`, `override`: set on the Pi, never on Bond."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = unittest.mock.patch.object(awning.awning_override, "set_override", return_value="Decision: ok")
+        self.set_override = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_close_forever_holds_closed_with_no_end_and_never_touches_bond(self):
+        self.assertIsNone(self.run_cli("close", "--forever"))
+        self.set_override.assert_called_once_with("closed", None)
+        self.controller.close.assert_not_called()
+        self.assertIn("Held closed", self.out)
+
+    def test_open_until_holds_open_until_the_parsed_time(self):
+        self.assertIsNone(self.run_cli("open", "--until", "5pm"))
+        mode, until = self.set_override.call_args[0]
+        self.assertEqual((mode, until.hour, until.minute), ("open", 17, 0))
+        self.controller.open.assert_not_called()
+
+    def test_until_accepts_the_equals_form_and_a_length(self):
+        self.assertIsNone(self.run_cli("close", "--until=2h"))
+        self.assertEqual(self.set_override.call_args[0][0], "closed")
+        self.assertIsNotNone(self.set_override.call_args[0][1])
+
+    def test_plain_open_and_close_are_unchanged(self):
+        self.assertIsNone(self.run_cli("close"))
+        self.controller.close.assert_called_once_with()
+        self.set_override.assert_not_called()
+
+    def test_auto_hands_back_to_the_weather(self):
+        self.assertIsNone(self.run_cli("auto"))
+        self.set_override.assert_called_once_with("auto")
+        self.assertIn("Following the weather", self.out)
+
+    def test_override_shows_the_pi_line(self):
+        with unittest.mock.patch.object(awning.awning_override, "show_override", return_value="closed until Sun 5:00 PM"):
+            self.assertIsNone(self.run_cli("override"))
+        self.assertIn("closed until Sun 5:00 PM", self.out)
+
+    def test_both_flags_together_are_refused(self):
+        self.assertEqual(self.run_cli("close", "--until", "5pm", "--forever"), 1)
+        self.set_override.assert_not_called()
+        self.assertIn("not both", self.out)
+
+    def test_flags_on_other_commands_are_refused(self):
+        for command in ("stop", "toggle", "status", "info", "auto", "override"):
+            with self.subTest(command=command):
+                self.assertEqual(self.run_cli(command, "--forever"), 1)
+        self.set_override.assert_not_called()
+
+    def test_until_with_no_value_or_a_bad_value_is_refused(self):
+        self.assertEqual(self.run_cli("close", "--until"), 1)
+        self.assertEqual(self.run_cli("close", "--until", "soon"), 1)
+        self.set_override.assert_not_called()
+        self.controller.close.assert_not_called()
+
+    def test_an_unknown_extra_argument_is_refused(self):
+        self.assertEqual(self.run_cli("close", "--bogus"), 1)
+
+    def test_a_pi_failure_is_one_line_and_exit_1(self):
+        self.set_override.side_effect = awning.OverrideError("Pi unreachable")
+        self.assertEqual(self.run_cli("close", "--forever"), 1)
+        self.assertIn("Pi unreachable", self.out)
+        self.assertNotIn("Traceback", self.out)

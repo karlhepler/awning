@@ -3384,8 +3384,13 @@ def should_send_alert(
 # always closes, "open" skips the sun/time conditions but still closes for wind or
 # rain. Lives in logs/.override next to .alert-state.json: deploy.sh never touches
 # logs/, and cleanup_old_logs() only deletes awning-*.log, so it survives both.
+#
+# File format: line 1 is the mode; an optional line 2 `until=<ISO timestamp>` ends
+# the override then (back to "auto"). No `until=` line means it never expires.
+# Expiry is checked on each run, so it takes effect at the first run after the time.
 OVERRIDE_MODES = ("auto", "closed", "open")
 OVERRIDE_FILENAME = ".override"
+_OVERRIDE_UNTIL_PREFIX = "until="
 
 
 def override_path_for(log_path) -> Optional[Path]:
@@ -3393,27 +3398,54 @@ def override_path_for(log_path) -> Optional[Path]:
     return log_path.parent / OVERRIDE_FILENAME if isinstance(log_path, Path) else None
 
 
-def read_override(path: Optional[Path]) -> str:
-    """
-    Read the override mode: "auto", "closed" or "open". Never raises.
+def _aware(moment: datetime) -> datetime:
+    """A timestamp with no zone (hand-edited file) is read as this machine's local time."""
+    return moment.astimezone() if moment.tzinfo is None else moment
 
-    No file (or no path) is "auto". A file that exists but cannot be read or holds
-    anything unrecognised is "closed": a deliberately placed override that nobody
-    can interpret should fail toward a retracted awning, not toward the weather.
+
+def read_override_state(
+    path: Optional[Path], now: Optional[datetime] = None
+) -> tuple[str, Optional[datetime]]:
+    """
+    Read the override as (mode, until). Never raises.
+
+    No file (or no path) is ("auto", None). An override whose `until` has passed is
+    ("auto", until). A file that exists but cannot be read, holds an unrecognised
+    mode, or has an `until=` line that is not a timestamp is ("closed", None): a
+    deliberately placed override that nobody can interpret should fail toward a
+    retracted awning, not toward the weather.
     """
     if path is None:
-        return "auto"
+        return "auto", None
     try:
-        value = path.read_text().strip().lower()
+        lines = path.read_text().splitlines()
     except FileNotFoundError:
-        return "auto"
+        return "auto", None
     except Exception as e:
         logger.warning(f"Could not read override file {path} ({e}) — treating as closed")
-        return "closed"
-    if value in OVERRIDE_MODES:
-        return value
-    logger.warning(f"Unrecognised override {value!r} in {path} — treating as closed")
-    return "closed"
+        return "closed", None
+    value = lines[0].strip().lower() if lines else ""
+    if value not in OVERRIDE_MODES:
+        logger.warning(f"Unrecognised override {value!r} in {path} — treating as closed")
+        return "closed", None
+
+    until = None
+    for line in lines[1:]:
+        line = line.strip()
+        if line.startswith(_OVERRIDE_UNTIL_PREFIX):
+            try:
+                until = _aware(datetime.fromisoformat(line[len(_OVERRIDE_UNTIL_PREFIX):]))
+            except ValueError:
+                logger.warning(f"Unreadable override end time {line!r} in {path} — treating as closed")
+                return "closed", None
+    if until is not None and (now or datetime.now().astimezone()) >= until:
+        return "auto", until
+    return value, until
+
+
+def read_override(path: Optional[Path], now: Optional[datetime] = None) -> str:
+    """The override mode alone: "auto", "closed" or "open". See read_override_state."""
+    return read_override_state(path, now)[0]
 
 
 def apply_override(
@@ -3435,9 +3467,14 @@ def apply_override(
     return should_open, reason
 
 
-def set_override(value: str, log_path, env_file: Optional[Path]) -> int:
+def set_override(
+    value: str, log_path, env_file: Optional[Path], until: Optional[datetime] = None
+) -> int:
     """
     Write (or, for "auto", remove) the override file. Returns a process exit code.
+
+    `until` ends the override at that moment; None means it never expires. It is
+    meaningless for "auto", which is the absence of an override.
 
     Tells the operator on Telegram when configured: the follow-up run only
     notifies on a state change, and an override set while the awning is already
@@ -3446,25 +3483,42 @@ def set_override(value: str, log_path, env_file: Optional[Path]) -> int:
     value = value.strip().lower()
     path = override_path_for(log_path)
     if value not in OVERRIDE_MODES or path is None:
-        logger.error(f"Usage: --set-override={'|'.join(OVERRIDE_MODES)}")
+        logger.error(f"Usage: --set-override={'|'.join(OVERRIDE_MODES)} [--until=<ISO timestamp>]")
         return 2
+    until = _aware(until).replace(microsecond=0) if until and value != "auto" else None
     try:
         if value == "auto":
             path.unlink(missing_ok=True)
         else:
-            path.write_text(value + "\n")
+            body = value + "\n"
+            if until is not None:
+                body += f"{_OVERRIDE_UNTIL_PREFIX}{until.isoformat()}\n"
+            path.write_text(body)
     except OSError as e:
         logger.error(f"Could not update override file {path}: {e}")
         return 1
-    logger.info(f"Override set to {value}")
+    ending = f" until {until.strftime('%a %-I:%M %p')}" if until else ""
+    logger.info(f"Override set to {value}{ending}")
 
     if env_file and env_file.exists():
         load_dotenv(env_file)
     token, chat_id = load_telegram_config()
     if token:
         icon = {"closed": "🔒", "open": "🔓", "auto": "🌤️"}[value]
-        send_telegram_notification(token, chat_id, f"{icon} Override set to {value}")
+        send_telegram_notification(token, chat_id, f"{icon} Override set to {value}{ending}")
     return 0
+
+
+def describe_override(path: Optional[Path], now: Optional[datetime] = None) -> str:
+    """One human line for `--show-override`."""
+    mode, until = read_override_state(path, now)
+    if mode == "auto":
+        return "auto (following the weather)" + (
+            f" — the last override ended {until.strftime('%a %-I:%M %p')}" if until else ""
+        )
+    if until is None:
+        return f"{mode} (until you run `awning auto`)"
+    return f"{mode} until {until.strftime('%a %-I:%M %p')}"
 
 
 def get_log_retention_days() -> int:
@@ -3556,11 +3610,25 @@ def main() -> None:
     if env_file:
         logger.info(f"Using .env file: {env_file}")
 
-    # --set-override=closed|open|auto: record the mode and stop. It fetches no
-    # weather and sends no command; ./override.sh follows it with a normal run.
+    # --show-override: print the current mode and stop (no weather, no command).
+    if "--show-override" in sys.argv:
+        print(describe_override(override_path_for(log_path)))
+        sys.exit(0)
+
+    # --set-override=closed|open|auto [--until=<ISO timestamp>]: record the mode and
+    # stop. It fetches no weather and sends no command; `awning close --until ...`
+    # (awning.py) follows it with a normal run.
     for arg in sys.argv:
         if arg.startswith("--set-override="):
-            sys.exit(set_override(arg.split("=", 1)[1], log_path, env_file))
+            until = None
+            for other in sys.argv:
+                if other.startswith("--until="):
+                    try:
+                        until = datetime.fromisoformat(other.split("=", 1)[1])
+                    except ValueError:
+                        logger.error(f"--until must be an ISO timestamp, got: {other}")
+                        sys.exit(2)
+            sys.exit(set_override(arg.split("=", 1)[1], log_path, env_file, until))
 
     # Initialize telegram config (will be loaded in try block)
     telegram_token, telegram_chat_id = None, None
@@ -3694,15 +3762,28 @@ def main() -> None:
         # Manual override (see apply_override). Weather is still fetched in every
         # mode: force-open needs wind and rain, and the log keeps its detail.
         override_file = override_path_for(log_path)
-        override_mode = read_override(override_file)
+        override_mode, override_until = read_override_state(override_file)
         if override_mode == "auto":
-            logger.info("Override: auto (following the weather)")
+            if override_until is not None:
+                # Expired. Remove the file so `--show-override` and the next run agree.
+                try:
+                    override_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                logger.info(
+                    f"Override: auto (the override ended {override_until.strftime('%Y-%m-%d %H:%M')})"
+                )
+            else:
+                logger.info("Override: auto (following the weather)")
         else:
             try:
                 set_at = datetime.fromtimestamp(override_file.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
             except OSError:
                 set_at = "unknown"
-            logger.info(f"Override: {override_mode} (set {set_at})")
+            ends = (
+                f", until {override_until.strftime('%Y-%m-%d %H:%M')}" if override_until else ", no end time"
+            )
+            logger.info(f"Override: {override_mode} (set {set_at}{ends})")
         should_open, reason = apply_override(override_mode, should_open, reason, conditions)
 
         # Log conditions with checkmarks/crosses

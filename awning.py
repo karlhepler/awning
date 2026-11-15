@@ -7,6 +7,8 @@ Command-line interface for controlling an awning device through Bond Bridge.
 
 import json
 import sys
+from datetime import datetime
+from typing import Optional
 
 from rich.console import Console
 from rich.panel import Panel
@@ -18,6 +20,8 @@ from awning_controller import (
     ConfigurationError,
     create_controller_from_env,
 )
+import awning_override
+from awning_override import OverrideError
 
 console = Console()
 
@@ -47,6 +51,10 @@ def show_help() -> None:
     table.add_row("🔄 toggle", "Toggle between open and closed")
     table.add_row("📊 status", "Get current awning state")
     table.add_row("ℹ️  info", "Get device information")
+    table.add_row("🔒 close/open --until T", "Hold it closed/open until T (5pm, 17:30, 3h, 90m), then follow the weather")
+    table.add_row("🔒 close/open --forever", "Hold it closed/open until you run [cyan]auto[/cyan]")
+    table.add_row("🌤️  auto", "Follow the weather and schedule again")
+    table.add_row("📌 override", "Show the current hold")
 
     console.print(table)
     console.print()
@@ -71,7 +79,51 @@ def show_help() -> None:
     console.print("  [dim]$[/dim] awning open")
     console.print("  [dim]$[/dim] awning status")
     console.print("  [dim]$[/dim] nix run . -- close")
+    console.print("  [dim]$[/dim] nix run . -- close --until 5pm")
+    console.print("  [dim]$[/dim] nix run . -- open --forever")
     console.print()
+    console.print(
+        "[dim]--until/--forever are set on the Pi (it decides every 15 minutes), so they need SSH to it. "
+        "A held [bold]open[/bold] still closes for wind or rain.[/dim]"
+    )
+    console.print()
+
+
+def hold(mode: str, until: Optional[datetime]) -> None:
+    """Hold the awning open or closed on the Pi, until `until` (None = until `auto`)."""
+    icon = "🔒" if mode == "closed" else "🔓"
+    ending = f"until {until.strftime('%a %-I:%M %p')}" if until else "until you run `auto`"
+    console.print(f"{icon} [bold cyan]Holding the awning {mode} {ending}...[/bold cyan]")
+    try:
+        decided = awning_override.set_override(mode, until)
+    except OverrideError as e:
+        console.print(f"[bold red]✗ Error:[/bold red] {e}")
+        sys.exit(1)
+    if decided:
+        console.print(f"[dim]{decided}[/dim]")
+    console.print(f"[bold green]✓[/bold green] Held {mode} {ending}")
+
+
+def release_hold() -> None:
+    """Clear any hold: the weather decides again."""
+    console.print("🌤️  [bold cyan]Handing the awning back to the weather...[/bold cyan]")
+    try:
+        decided = awning_override.set_override("auto")
+    except OverrideError as e:
+        console.print(f"[bold red]✗ Error:[/bold red] {e}")
+        sys.exit(1)
+    if decided:
+        console.print(f"[dim]{decided}[/dim]")
+    console.print("[bold green]✓[/bold green] Following the weather")
+
+
+def show_hold() -> None:
+    """Show the current hold."""
+    try:
+        console.print(f"📌 Override: {awning_override.show_override()}")
+    except OverrideError as e:
+        console.print(f"[bold red]✗ Error:[/bold red] {e}")
+        sys.exit(1)
 
 
 class AwningCLI:
@@ -199,6 +251,43 @@ class AwningCLI:
             sys.exit(1)
 
 
+def parse_hold_flags(command: str, args: list[str]) -> tuple[Optional[str], bool]:
+    """
+    Read `--until T` / `--until=T` / `--forever` after the command.
+
+    Returns (until_text, forever). Exits with a one-line error on anything else:
+    only open and close take a flag, and `--until` and `--forever` exclude each other.
+    """
+    until_text: Optional[str] = None
+    forever = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--forever":
+            forever = True
+        elif arg.startswith("--until="):
+            until_text = arg.split("=", 1)[1]
+        elif arg == "--until":
+            if i + 1 >= len(args):
+                console.print("[bold red]✗ Error:[/bold red] --until needs a time, like 5pm or 3h")
+                sys.exit(1)
+            i += 1
+            until_text = args[i]
+        else:
+            console.print(f"[bold red]✗ Error:[/bold red] Invalid number of arguments (unexpected '{arg}')")
+            console.print("  Run [cyan]awning --help[/cyan] for usage information")
+            sys.exit(1)
+        i += 1
+
+    if (until_text is not None or forever) and command not in ("open", "close"):
+        console.print("[bold red]✗ Error:[/bold red] --until and --forever only go with open or close")
+        sys.exit(1)
+    if until_text is not None and forever:
+        console.print("[bold red]✗ Error:[/bold red] Use --until or --forever, not both")
+        sys.exit(1)
+    return until_text, forever
+
+
 def main() -> None:
     """Main entry point for the awning control script."""
     # Check for help flag or no arguments
@@ -208,20 +297,40 @@ def main() -> None:
         show_help()
         sys.exit(0)
 
-    # Simple argument parsing
-    if len(sys.argv) != 2:
-        console.print("[bold red]✗ Error:[/bold red] Invalid number of arguments")
-        console.print("  Run [cyan]awning --help[/cyan] for usage information")
-        sys.exit(1)
-
     command = sys.argv[1]
-    valid_commands = ["open", "close", "stop", "toggle", "status", "info"]
+    valid_commands = ["open", "close", "stop", "toggle", "status", "info", "auto", "override"]
 
     if command not in valid_commands:
         console.print(f"[bold red]✗ Error:[/bold red] Unknown command '{command}'")
         console.print(f"  Valid commands: {', '.join(valid_commands)}")
         console.print("  Run [cyan]awning --help[/cyan] for usage information")
         sys.exit(1)
+
+    until_text, forever = parse_hold_flags(command, sys.argv[2:])
+
+    # A hold, `auto` and `override` are set on the Pi over SSH and never touch the
+    # Bond Bridge from here.
+    hold_until: Optional[datetime] = None
+    if until_text is not None:
+        try:
+            hold_until = awning_override.parse_until(until_text)
+        except OverrideError as e:
+            console.print(f"[bold red]✗ Error:[/bold red] {e}")
+            sys.exit(1)
+    pi_action = None
+    if until_text is not None or forever:
+        pi_action = lambda: hold("closed" if command == "close" else "open", hold_until)
+    elif command == "auto":
+        pi_action = release_hold
+    elif command == "override":
+        pi_action = show_hold
+    if pi_action:
+        try:
+            pi_action()
+        except Exception as e:
+            console.print(f"[bold red]✗ Unexpected error:[/bold red] {type(e).__name__}: {e}")
+            sys.exit(1)
+        return
 
     # Load configuration and create controller
     try:

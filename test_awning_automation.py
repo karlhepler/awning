@@ -10,7 +10,7 @@ import inspect
 import os
 import unittest
 import unittest.mock
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -6979,7 +6979,7 @@ class TestOverride(unittest.TestCase):
 
     # -- --set-override ------------------------------------------------------
 
-    def _set(self, value, existing=None):
+    def _set(self, value, existing=None, extra_argv=()):
         import sys
         import tempfile
         from unittest.mock import patch
@@ -6990,7 +6990,7 @@ class TestOverride(unittest.TestCase):
             override = Path(d) / ".override"
             if existing is not None:
                 override.write_text(existing)
-            with patch.object(sys, "argv", ["awning_automation.py", f"--set-override={value}"]), \
+            with patch.object(sys, "argv", ["awning_automation.py", f"--set-override={value}", *extra_argv]), \
                  patch.object(awning_automation, "setup_logging", return_value=log_path), \
                  patch.object(awning_automation, "load_telegram_config", return_value=("tok", "chat")), \
                  patch.object(awning_automation, "collect_weather_measurements") as weather, \
@@ -7023,6 +7023,96 @@ class TestOverride(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(content, "open", "a rejected value must not change the setting")
         send.assert_not_called()
+
+
+    # -- end time (--until) -------------------------------------------------
+
+    _NOW = datetime(2026, 11, 15, 12, 0).astimezone()
+
+    def _state(self, content, now=None):
+        import tempfile
+        import awning_automation
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / ".override"
+            path.write_text(content)
+            return awning_automation.read_override_state(path, now or self._NOW)
+
+    def test_no_until_line_never_expires(self):
+        self.assertEqual(self._state("closed\n"), ("closed", None))
+        far_future = self._NOW + timedelta(days=3650)
+        self.assertEqual(self._state("open\n", now=far_future), ("open", None))
+
+    def test_override_holds_until_the_end_time_then_reverts_to_auto(self):
+        until = self._NOW + timedelta(hours=2)
+        content = f"closed\nuntil={until.isoformat()}\n"
+        self.assertEqual(self._state(content, now=self._NOW), ("closed", until))
+        self.assertEqual(self._state(content, now=until - timedelta(seconds=1))[0], "closed")
+        mode, ended = self._state(content, now=until)
+        self.assertEqual((mode, ended), ("auto", until), "the end time itself is already over")
+
+    def test_an_expired_open_override_also_reverts_to_auto(self):
+        until = self._NOW - timedelta(minutes=1)
+        self.assertEqual(self._state(f"open\nuntil={until.isoformat()}\n")[0], "auto")
+
+    def test_an_unreadable_end_time_fails_toward_closed(self):
+        self.assertEqual(self._state("open\nuntil=tomorrow-ish\n"), ("closed", None))
+
+    def test_a_zoneless_end_time_is_read_as_local_time(self):
+        naive = (self._NOW + timedelta(hours=1)).replace(tzinfo=None)
+        mode, until = self._state(f"closed\nuntil={naive.isoformat()}\n")
+        self.assertEqual(mode, "closed")
+        self.assertEqual(until, naive.astimezone())
+
+    def test_main_ignores_an_expired_override_and_removes_the_file(self):
+        past = (datetime.now().astimezone() - timedelta(minutes=5)).isoformat()
+        controller, send = self._run_main(f"closed\nuntil={past}\n")
+        controller.open.assert_called_once()  # the weather decides again
+        self.assertIn("Open sent - sunny & calm", send.call_args[0][2])
+
+    def test_main_honours_an_override_that_has_not_ended(self):
+        future = (datetime.now().astimezone() + timedelta(hours=1)).isoformat()
+        controller, send = self._run_main(f"closed\nuntil={future}\n", states=(1, 0))
+        controller.close.assert_called_once()
+        self.assertEqual(send.call_args[0][2], "🔒 Close sent: Override — forced closed")
+
+    def test_set_override_with_until_writes_a_second_line(self):
+        until = "2026-11-15T17:00:00-05:00"
+        code, content, send = self._set("closed", extra_argv=(f"--until={until}",))
+        self.assertEqual(code, 0)
+        self.assertEqual(content.splitlines(), ["closed", f"until={until}"])
+        self.assertIn("until", send.call_args[0][2])
+
+    def test_set_override_without_until_clears_a_previous_end_time(self):
+        existing = "closed\nuntil=2026-11-15T17:00:00-05:00\n"
+        code, content, _ = self._set("open", existing=existing)
+        self.assertEqual(code, 0)
+        self.assertEqual(content.splitlines(), ["open"])
+
+    def test_set_override_rejects_an_unreadable_until_and_changes_nothing(self):
+        code, content, send = self._set("open", existing="closed", extra_argv=("--until=5pm",))
+        self.assertEqual(code, 2)
+        self.assertEqual(content, "closed")
+        send.assert_not_called()
+
+    def test_auto_ignores_until(self):
+        code, content, _ = self._set(
+            "auto", existing="closed", extra_argv=("--until=2026-11-15T17:00:00-05:00",)
+        )
+        self.assertEqual(code, 0)
+        self.assertIsNone(content)
+
+    def test_describe_override_for_each_state(self):
+        import tempfile
+        import awning_automation
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / ".override"
+            self.assertIn("auto", awning_automation.describe_override(path, self._NOW))
+            path.write_text("closed\n")
+            self.assertIn("until you run `awning auto`", awning_automation.describe_override(path, self._NOW))
+            until = self._NOW + timedelta(hours=3)
+            path.write_text(f"open\nuntil={until.isoformat()}\n")
+            text = awning_automation.describe_override(path, self._NOW)
+            self.assertTrue(text.startswith("open until "), text)
 
 
 if __name__ == "__main__":
